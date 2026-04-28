@@ -7,10 +7,12 @@ package device
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/netip"
 	"os"
 	"runtime"
@@ -23,6 +25,7 @@ import (
 	conn "github.com/asciimoth/batchudp"
 	"github.com/asciimoth/batchudp/bindtest"
 	"github.com/asciimoth/gonnect-netstack/vtun"
+	"github.com/asciimoth/gonnect/loopback"
 	"github.com/asciimoth/gonnect/native"
 	gtun "github.com/asciimoth/gonnect/tun"
 )
@@ -223,6 +226,12 @@ func genTestPairWithChannelTUNOffsets(tb testing.TB, mwo, mro int) (pair testPai
 func newDevicePairForTUNs(tb testing.TB, tun0, tun1 gtun.Tun, ips [2]netip.Addr) [2]*Device {
 	tb.Helper()
 
+	return newDevicePairForTUNsAndBinds(tb, tun0, tun1, ips, bindtest.NewChannelBinds())
+}
+
+func newDevicePairForTUNsAndBinds(tb testing.TB, tun0, tun1 gtun.Tun, ips [2]netip.Addr, binds [2]conn.Bind) [2]*Device {
+	tb.Helper()
+
 	key0 := mustPrivateKey(tb, 0)
 	key1 := mustPrivateKey(tb, 1)
 	pub0 := key0.publicKey()
@@ -253,7 +262,6 @@ func newDevicePairForTUNs(tb testing.TB, tun0, tun1 gtun.Tun, ips [2]netip.Addr)
 		uapiCfg("public_key", hex.EncodeToString(pub0[:]), "endpoint", "127.0.0.1:%d"),
 	}
 
-	binds := bindtest.NewChannelBinds()
 	devs := [2]*Device{
 		NewDevice(tun0, binds[0], NewLogger(LogLevelError, "dev0: ")),
 		NewDevice(tun1, binds[1], NewLogger(LogLevelError, "dev1: ")),
@@ -274,6 +282,240 @@ func newDevicePairForTUNs(tb testing.TB, tun0, tun1 gtun.Tun, ips [2]netip.Addr)
 		tb.Cleanup(devs[i].Close)
 	}
 	return devs
+}
+
+type e2eBindMode string
+
+const (
+	e2eBindModeNativeDefault   e2eBindMode = "default-bind-native-network"
+	e2eBindModeLoopbackDefault e2eBindMode = "default-bind-loopback-network"
+	e2eBindModeChannel         e2eBindMode = "channel-bind"
+)
+
+func newEndToEndBinds(tb testing.TB, mode e2eBindMode) [2]conn.Bind {
+	tb.Helper()
+
+	switch mode {
+	case e2eBindModeNativeDefault:
+		var binds [2]conn.Bind
+		for i := range binds {
+			network := (&native.Config{}).Build()
+			tb.Cleanup(func() {
+				_ = network.Down()
+			})
+			binds[i] = conn.NewDefaultBind(network)
+		}
+		return binds
+	case e2eBindModeLoopbackDefault:
+		network := loopback.NewLoopbackNetwok()
+		tb.Cleanup(func() {
+			_ = network.Down()
+		})
+		return [2]conn.Bind{
+			conn.NewDefaultBind(network),
+			conn.NewDefaultBind(network),
+		}
+	case e2eBindModeChannel:
+		return bindtest.NewChannelBinds()
+	default:
+		tb.Fatalf("unsupported bind mode %q", mode)
+		return [2]conn.Bind{}
+	}
+}
+
+func newVTunPair(tb testing.TB, ips [2]netip.Addr, mwo, mro int) [2]*vtun.VTun {
+	tb.Helper()
+
+	var out [2]*vtun.VTun
+	for i, ip := range ips {
+		vt, err := (&vtun.Opts{
+			LocalAddrs:     []netip.Addr{ip},
+			NoLoopbackAddr: true,
+			MWO:            mwo,
+			MRO:            mro,
+		}).Build()
+		if err != nil {
+			tb.Fatalf("build vtun %d: %v", i, err)
+		}
+		tb.Cleanup(func() {
+			_ = vt.Close()
+		})
+		out[i] = vt
+	}
+	return out
+}
+
+func runTCPPingPong(tb testing.TB, clientNet, serverNet *vtun.VTun, serverIP netip.Addr) {
+	tb.Helper()
+
+	ctx := context.Background()
+	listener, err := serverNet.ListenTCP(ctx, "tcp4", net.JoinHostPort(serverIP.String(), "0"))
+	if err != nil {
+		tb.Fatalf("ListenTCP: %v", err)
+	}
+	defer listener.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErr <- fmt.Errorf("accept: %w", err)
+			return
+		}
+		defer conn.Close()
+
+		buf := make([]byte, 256)
+		for i := range 5 {
+			if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				serverErr <- fmt.Errorf("set read deadline round %d: %w", i, err)
+				return
+			}
+			n, err := conn.Read(buf)
+			if err != nil {
+				serverErr <- fmt.Errorf("read round %d: %w", i, err)
+				return
+			}
+			want := fmt.Sprintf("ping %d over tcp", i)
+			if got := string(buf[:n]); got != want {
+				serverErr <- fmt.Errorf("read round %d = %q, want %q", i, got, want)
+				return
+			}
+			if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				serverErr <- fmt.Errorf("set write deadline round %d: %w", i, err)
+				return
+			}
+			if _, err := conn.Write([]byte(fmt.Sprintf("pong %d over tcp", i))); err != nil {
+				serverErr <- fmt.Errorf("write round %d: %w", i, err)
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+
+	client, err := clientNet.DialTCP(ctx, "tcp4", "", listener.Addr().String())
+	if err != nil {
+		tb.Fatalf("DialTCP: %v", err)
+	}
+	defer client.Close()
+
+	buf := make([]byte, 256)
+	for i := range 5 {
+		if err := client.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			tb.Fatalf("client set write deadline round %d: %v", i, err)
+		}
+		if _, err := client.Write([]byte(fmt.Sprintf("ping %d over tcp", i))); err != nil {
+			tb.Fatalf("client write round %d: %v", i, err)
+		}
+		if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			tb.Fatalf("client set read deadline round %d: %v", i, err)
+		}
+		n, err := client.Read(buf)
+		if err != nil {
+			tb.Fatalf("client read round %d: %v", i, err)
+		}
+		if want, got := fmt.Sprintf("pong %d over tcp", i), string(buf[:n]); got != want {
+			tb.Fatalf("client read round %d = %q, want %q", i, got, want)
+		}
+	}
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			tb.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		tb.Fatal("timeout waiting for TCP server")
+	}
+}
+
+func runUDPPingPong(tb testing.TB, clientNet, serverNet *vtun.VTun, serverIP netip.Addr) {
+	tb.Helper()
+
+	ctx := context.Background()
+	serverConn, err := serverNet.ListenUDP(ctx, "udp4", net.JoinHostPort(serverIP.String(), "0"))
+	if err != nil {
+		tb.Fatalf("ListenUDP: %v", err)
+	}
+	defer serverConn.Close()
+
+	clientConn, err := clientNet.DialUDP(ctx, "udp4", "", serverConn.LocalAddr().String())
+	if err != nil {
+		tb.Fatalf("DialUDP: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 256)
+		for i := range 5 {
+			for {
+				if err := serverConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					serverErr <- fmt.Errorf("set read deadline round %d: %w", i, err)
+					return
+				}
+				n, addr, err := serverConn.ReadFrom(buf)
+				if err != nil {
+					serverErr <- fmt.Errorf("read round %d: %w", i, err)
+					return
+				}
+				want := fmt.Sprintf("ping %d over udp", i)
+				if got := string(buf[:n]); got != want {
+					continue
+				}
+				if err := serverConn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					serverErr <- fmt.Errorf("set write deadline round %d: %w", i, err)
+					return
+				}
+				if _, err := serverConn.WriteTo([]byte(fmt.Sprintf("pong %d over udp", i)), addr); err != nil {
+					serverErr <- fmt.Errorf("write round %d: %w", i, err)
+					return
+				}
+				break
+			}
+		}
+		serverErr <- nil
+	}()
+
+	buf := make([]byte, 256)
+	for i := range 5 {
+		wantReply := fmt.Sprintf("pong %d over udp", i)
+		msg := []byte(fmt.Sprintf("ping %d over udp", i))
+		received := false
+		for attempt := range 8 {
+			if err := clientConn.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				tb.Fatalf("client set write deadline round %d attempt %d: %v", i, attempt, err)
+			}
+			if _, err := clientConn.Write(msg); err != nil {
+				tb.Fatalf("client write round %d attempt %d: %v", i, attempt, err)
+			}
+			if err := clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+				tb.Fatalf("client set read deadline round %d attempt %d: %v", i, attempt, err)
+			}
+			n, _, err := clientConn.ReadFrom(buf)
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				tb.Fatalf("client read round %d attempt %d: %v", i, attempt, err)
+			}
+			if got := string(buf[:n]); got == wantReply {
+				received = true
+				break
+			}
+		}
+		if !received {
+			tb.Fatalf("did not receive %q after retries", wantReply)
+		}
+	}
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			tb.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		tb.Fatal("timeout waiting for UDP server")
+	}
 }
 
 func mustPrivateKey(tb testing.TB, seed byte) NoisePrivateKey {
@@ -765,6 +1007,53 @@ func TestVTunOffsetsEndToEnd(t *testing.T) {
 			got = got[:n]
 			if !bytes.Equal(got, want) {
 				t.Fatalf("payload mismatch: got %q want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestWireGuardEndToEndPingPong(t *testing.T) {
+	goroutineLeakCheck(t)
+
+	ips := [2]netip.Addr{
+		netip.MustParseAddr("10.44.0.1"),
+		netip.MustParseAddr("10.44.0.2"),
+	}
+	offsets := []struct {
+		name     string
+		mwo, mro int
+	}{
+		{name: "compatible", mwo: 0, mro: 0},
+		{name: "read-copy", mwo: 0, mro: 32},
+		{name: "write-copy", mwo: 32, mro: 0},
+		{name: "both-copy", mwo: 48, mro: 32},
+	}
+	bindModes := []e2eBindMode{
+		e2eBindModeNativeDefault,
+		e2eBindModeLoopbackDefault,
+		e2eBindModeChannel,
+	}
+	transports := []struct {
+		name string
+		run  func(testing.TB, *vtun.VTun, *vtun.VTun, netip.Addr)
+	}{
+		{name: "tcp", run: runTCPPingPong},
+		{name: "udp", run: runUDPPingPong},
+	}
+
+	for _, bindMode := range bindModes {
+		t.Run(string(bindMode), func(t *testing.T) {
+			for _, offset := range offsets {
+				t.Run(offset.name, func(t *testing.T) {
+					for _, transport := range transports {
+						t.Run(transport.name, func(t *testing.T) {
+							vtuns := newVTunPair(t, ips, offset.mwo, offset.mro)
+							binds := newEndToEndBinds(t, bindMode)
+							newDevicePairForTUNsAndBinds(t, vtuns[0], vtuns[1], ips, binds)
+							transport.run(t, vtuns[0], vtuns[1], ips[1])
+						})
+					}
+				})
 			}
 		})
 	}
