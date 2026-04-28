@@ -38,6 +38,19 @@ type QueueInboundElementsContainer struct {
 	elems []*QueueInboundElement
 }
 
+func buildTUNWriteBuffers(tun *tunState, elems []*QueueInboundElement, bufs [][]byte) [][]byte {
+	bufs = bufs[:0]
+	for _, elem := range elems {
+		if tun.writeNeedsCopy {
+			copy(elem.buffer[tun.writeOffset:], elem.packet)
+			bufs = append(bufs, elem.buffer[:tun.writeOffset+len(elem.packet)])
+			continue
+		}
+		bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
+	}
+	return bufs
+}
+
 // clearPointers clears elem fields that contain pointers.
 // This makes the garbage collector's life easier and
 // avoids accidentally keeping other objects around unnecessarily.
@@ -435,6 +448,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 	device.log.Verbosef("%v - Routine: sequential receiver - started", peer)
 
 	bufs := make([][]byte, 0, maxBatchSize)
+	packets := make([]*QueueInboundElement, 0, maxBatchSize)
 
 	for elemsContainer := range peer.queue.inbound.c {
 		if elemsContainer == nil {
@@ -507,12 +521,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 
-			if device.tun.writeNeedsCopy {
-				copy(elem.buffer[device.tun.writeOffset:], elem.packet)
-				bufs = append(bufs, elem.buffer[:device.tun.writeOffset+len(elem.packet)])
-			} else {
-				bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
-			}
+			packets = append(packets, elem)
 		}
 
 		peer.rxBytes.Add(rxBytesLen)
@@ -525,8 +534,19 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		if dataPacketReceived {
 			peer.timersDataReceived()
 		}
-		if len(bufs) > 0 {
-			_, err := device.tun.device.Write(bufs, device.tun.writeOffset)
+		if len(packets) > 0 {
+			tun := device.currentTUN()
+			var err error
+			if tun != nil {
+				bufs = buildTUNWriteBuffers(tun, packets, bufs)
+				_, err = tun.device.Write(bufs, tun.writeOffset)
+				if err != nil && !device.isClosed() {
+					if nextTun := device.currentTUN(); nextTun != nil && nextTun != tun {
+						bufs = buildTUNWriteBuffers(nextTun, packets, bufs)
+						_, err = nextTun.device.Write(bufs, nextTun.writeOffset)
+					}
+				}
+			}
 			if err != nil && !device.isClosed() {
 				device.log.Errorf("Failed to write packets to TUN device: %v", err)
 			}
@@ -536,6 +556,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			device.PutInboundElement(elem)
 		}
 		bufs = bufs[:0]
+		packets = packets[:0]
 		device.PutInboundElementsContainer(elemsContainer)
 	}
 }

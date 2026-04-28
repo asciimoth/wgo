@@ -152,6 +152,51 @@ func (pair *testPair) Send(tb testing.TB, ping SendDirection, done chan struct{}
 	}
 }
 
+func waitForPacketOnEither(msg []byte, timeout time.Duration, first, second *atomic.Pointer[channelTUN]) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		a := first.Load()
+		if a != nil {
+			select {
+			case got := <-a.Inbound:
+				if !bytes.Equal(msg, got) {
+					return fmt.Errorf("packet mismatch on first tun")
+				}
+				return nil
+			default:
+			}
+		}
+
+		b := second.Load()
+		if b != nil && b != a {
+			select {
+			case got := <-b.Inbound:
+				if !bytes.Equal(msg, got) {
+					return fmt.Errorf("packet mismatch on second tun")
+				}
+				return nil
+			default:
+			}
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+	return fmt.Errorf("packet did not transit")
+}
+
+func waitForAtomicAtLeast(tb testing.TB, counter *atomic.Int64, want int64, timeout time.Duration, name string) {
+	tb.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if counter.Load() >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	tb.Fatalf("%s = %d, want at least %d", name, counter.Load(), want)
+}
+
 // genTestPair creates a testPair.
 func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 	cfg, endpointCfg := genConfigs(tb)
@@ -816,26 +861,22 @@ func (t *fakeTUNDeviceSized) BatchSize() int { return t.size }
 func TestBatchSize(t *testing.T) {
 	d := Device{}
 
-	d.net.bind = &fakeBindSized{1}
-	d.tun.device = &fakeTUNDeviceSized{size: 1}
+	d.batchSize = 1
 	if want, got := 1, d.BatchSize(); got != want {
 		t.Errorf("expected batch size %d, got %d", want, got)
 	}
 
-	d.net.bind = &fakeBindSized{1}
-	d.tun.device = &fakeTUNDeviceSized{size: 128}
+	d.batchSize = 128
 	if want, got := 128, d.BatchSize(); got != want {
 		t.Errorf("expected batch size %d, got %d", want, got)
 	}
 
-	d.net.bind = &fakeBindSized{128}
-	d.tun.device = &fakeTUNDeviceSized{size: 1}
+	d.batchSize = 128
 	if want, got := 128, d.BatchSize(); got != want {
 		t.Errorf("expected batch size %d, got %d", want, got)
 	}
 
-	d.net.bind = &fakeBindSized{128}
-	d.tun.device = &fakeTUNDeviceSized{size: 128}
+	d.batchSize = 128
 	if want, got := 128, d.BatchSize(); got != want {
 		t.Errorf("expected batch size %d, got %d", want, got)
 	}
@@ -882,20 +923,199 @@ func TestNewDeviceTunOffsetStrategy(t *testing.T) {
 
 			dev := NewDevice(tunDev, &fakeBindSized{1}, NewLogger(LogLevelError, ""))
 			t.Cleanup(dev.Close)
+			tunState := dev.currentTUN()
+			if tunState == nil {
+				t.Fatal("expected tun to be attached")
+			}
 
-			if got := dev.tun.readOffset; got != tt.wantReadOffset {
+			if got := tunState.readOffset; got != tt.wantReadOffset {
 				t.Fatalf("readOffset = %d, want %d", got, tt.wantReadOffset)
 			}
-			if got := dev.tun.writeOffset; got != tt.wantWriteOffset {
+			if got := tunState.writeOffset; got != tt.wantWriteOffset {
 				t.Fatalf("writeOffset = %d, want %d", got, tt.wantWriteOffset)
 			}
-			if got := dev.tun.readNeedsCopy; got != tt.wantReadCopy {
+			if got := tunState.readNeedsCopy; got != tt.wantReadCopy {
 				t.Fatalf("readNeedsCopy = %v, want %v", got, tt.wantReadCopy)
 			}
-			if got := dev.tun.writeNeedsCopy; got != tt.wantWriteCopy {
+			if got := tunState.writeNeedsCopy; got != tt.wantWriteCopy {
 				t.Fatalf("writeNeedsCopy = %v, want %v", got, tt.wantWriteCopy)
 			}
 		})
+	}
+}
+
+func TestDeviceReplaceTUN(t *testing.T) {
+	t.Parallel()
+
+	ips := [2]netip.Addr{
+		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
+		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
+	}
+	tuns := [2]*channelTUN{
+		newChannelTUN(),
+		newChannelTUN(),
+	}
+	devs := newDevicePairForTUNs(t, tuns[0].TUN(), tuns[1].TUN(), ips)
+	pair := testPair{
+		{tun: tuns[0], dev: devs[0], ip: ips[0]},
+		{tun: tuns[1], dev: devs[1], ip: ips[1]},
+	}
+
+	pair.Send(t, Ping, nil)
+
+	replacement := newChannelTUNWithOffsets(48, 32)
+	if err := devs[0].ReplaceTUN(replacement.TUN()); err != nil {
+		t.Fatalf("ReplaceTUN: %v", err)
+	}
+	pair[0].tun = replacement
+
+	select {
+	case <-tuns[0].closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old tun was not closed")
+	}
+
+	tunState := devs[0].currentTUN()
+	if tunState == nil {
+		t.Fatal("expected replacement tun to be attached")
+	}
+	if tunState.readOffset != 32 || tunState.writeOffset != 48 {
+		t.Fatalf("unexpected replacement tun offsets: read=%d write=%d", tunState.readOffset, tunState.writeOffset)
+	}
+
+	pair.Send(t, Ping, nil)
+	pair.Send(t, Pong, nil)
+}
+
+func TestDeviceDetachAndAttachTUN(t *testing.T) {
+	t.Parallel()
+
+	ips := [2]netip.Addr{
+		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
+		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
+	}
+	tuns := [2]*channelTUN{
+		newChannelTUN(),
+		newChannelTUN(),
+	}
+	devs := newDevicePairForTUNs(t, tuns[0].TUN(), tuns[1].TUN(), ips)
+	pair := testPair{
+		{tun: tuns[0], dev: devs[0], ip: ips[0]},
+		{tun: tuns[1], dev: devs[1], ip: ips[1]},
+	}
+
+	pair.Send(t, Ping, nil)
+
+	if err := devs[0].DetachTUN(); err != nil {
+		t.Fatalf("DetachTUN: %v", err)
+	}
+	if devs[0].currentTUN() != nil {
+		t.Fatal("expected tun to be detached")
+	}
+
+	select {
+	case <-tuns[0].closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("detached tun was not closed")
+	}
+
+	select {
+	case <-devs[0].Wait():
+		t.Fatal("device closed after detach")
+	default:
+	}
+
+	replacement := newChannelTUNWithOffsets(32, 48)
+	if err := devs[0].AttachTUN(replacement.TUN()); err != nil {
+		t.Fatalf("AttachTUN: %v", err)
+	}
+	pair[0].tun = replacement
+
+	pair.Send(t, Ping, nil)
+	pair.Send(t, Pong, nil)
+}
+
+func TestDeviceReplaceTUNDuringActiveTraffic(t *testing.T) {
+	goroutineLeakCheck(t)
+
+	ips := [2]netip.Addr{
+		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
+		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
+	}
+	tuns := [2]*channelTUN{
+		newChannelTUN(),
+		newChannelTUN(),
+	}
+	devs := newDevicePairForTUNs(t, tuns[0].TUN(), tuns[1].TUN(), ips)
+
+	msg := pingPacket(ips[0], ips[1])
+	replacement := newChannelTUNWithOffsets(48, 32)
+
+	var current atomic.Pointer[channelTUN]
+	var candidate atomic.Pointer[channelTUN]
+	var delivered atomic.Int64
+	var deliveredAfterSwap atomic.Int64
+	var swapped atomic.Bool
+
+	current.Store(tuns[0])
+
+	stop := make(chan struct{})
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			tuns[1].Outbound <- msg
+			if err := waitForPacketOnEither(msg, 2*time.Second, &current, &candidate); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+
+			delivered.Add(1)
+			if swapped.Load() {
+				deliveredAfterSwap.Add(1)
+			}
+		}
+	}()
+
+	waitForAtomicAtLeast(t, &delivered, 10, 5*time.Second, "delivered before swap")
+
+	candidate.Store(replacement)
+	if err := devs[0].ReplaceTUN(replacement.TUN()); err != nil {
+		close(stop)
+		wg.Wait()
+		t.Fatalf("ReplaceTUN: %v", err)
+	}
+	current.Store(replacement)
+	swapped.Store(true)
+
+	select {
+	case <-tuns[0].closed:
+	case <-time.After(5 * time.Second):
+		close(stop)
+		wg.Wait()
+		t.Fatal("old tun was not closed")
+	}
+
+	waitForAtomicAtLeast(t, &deliveredAfterSwap, 10, 5*time.Second, "delivered after swap")
+
+	close(stop)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
 	}
 }
 

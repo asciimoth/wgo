@@ -203,9 +203,10 @@ func (peer *Peer) keepKeyFreshSending() {
 	}
 }
 
-func (device *Device) RoutineReadFromTUN() {
+func (device *Device) RoutineReadFromTUN(tun *tunState) {
 	defer func() {
 		device.log.Verbosef("Routine: TUN reader - stopped")
+		tun.wg.Done()
 		device.state.stopping.Done()
 		device.queue.encryption.wg.Done()
 	}()
@@ -220,7 +221,7 @@ func (device *Device) RoutineReadFromTUN() {
 		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
 		count       = 0
 		sizes       = make([]int, batchSize)
-		offset      = device.tun.readOffset
+		offset      = tun.readOffset
 	)
 
 	for i := range elems {
@@ -239,14 +240,14 @@ func (device *Device) RoutineReadFromTUN() {
 
 	for {
 		// read packets
-		count, readErr = device.tun.device.Read(bufs, sizes, offset)
+		count, readErr = tun.device.Read(bufs, sizes, offset)
 		for i := 0; i < count; i++ {
 			if sizes[i] < 1 {
 				continue
 			}
 
 			elem := elems[i]
-			if device.tun.readNeedsCopy {
+			if tun.readNeedsCopy {
 				copy(bufs[i][MessageTransportHeaderSize:], bufs[i][offset:offset+sizes[i]])
 			}
 			elem.packet = bufs[i][MessageTransportHeaderSize : MessageTransportHeaderSize+sizes[i]]
@@ -306,6 +307,14 @@ func (device *Device) RoutineReadFromTUN() {
 				// coincident with reasonably high throughput.
 				device.log.Verbosef("Dropped some packets from multi-segment read: %v", readErr)
 				continue
+			}
+			select {
+			case <-tun.stop:
+				return
+			default:
+			}
+			if device.currentTUN() != tun {
+				return
 			}
 			if !device.isClosed() {
 				if !errors.Is(readErr, os.ErrClosed) {

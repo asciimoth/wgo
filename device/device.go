@@ -67,6 +67,7 @@ type Device struct {
 	allowedips    AllowedIPs
 	indexTable    IndexTable
 	cookieChecker CookieChecker
+	batchSize     int
 
 	pool struct {
 		inboundElementsContainer  *WaitPool
@@ -83,20 +84,26 @@ type Device struct {
 	}
 
 	tun struct {
-		device gtun.Tun
+		device atomic.Pointer[tunState]
 		mtu    atomic.Int32
-
-		// Transport layout inside device buffers stays fixed at offset 16.
-		// These fields describe only the TUN adapter offsets at the boundary.
-		readOffset     int
-		writeOffset    int
-		readNeedsCopy  bool
-		writeNeedsCopy bool
 	}
 
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
 	log      *Logger
+}
+
+type tunState struct {
+	device gtun.Tun
+
+	// Transport layout inside device buffers stays fixed at offset 16.
+	// These fields describe only the TUN adapter offsets at the boundary.
+	readOffset     int
+	writeOffset    int
+	readNeedsCopy  bool
+	writeNeedsCopy bool
+	stop           chan struct{}
+	wg             sync.WaitGroup
 }
 
 // deviceState represents the state of a Device.
@@ -304,8 +311,31 @@ func validateTunOffsets(tunDevice gtun.Tun) error {
 	return nil
 }
 
-func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger *Logger) *Device {
+func newTunState(tunDevice gtun.Tun) (*tunState, error) {
 	if err := validateTunOffsets(tunDevice); err != nil {
+		return nil, err
+	}
+
+	state := &tunState{
+		device:      tunDevice,
+		readOffset:  MessageTransportHeaderSize,
+		writeOffset: MessageTransportOffsetContent,
+		stop:        make(chan struct{}),
+	}
+	if mro := tunDevice.MRO(); mro > state.readOffset {
+		state.readOffset = mro
+		state.readNeedsCopy = true
+	}
+	if mwo := tunDevice.MWO(); mwo > state.writeOffset {
+		state.writeOffset = mwo
+		state.writeNeedsCopy = true
+	}
+	return state, nil
+}
+
+func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger *Logger) *Device {
+	tunState, err := newTunState(tunDevice)
+	if err != nil {
 		panic(fmt.Sprintf("device.NewDevice: %v", err))
 	}
 
@@ -314,18 +344,12 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger *Logger) *Device {
 	device.closed = make(chan struct{})
 	device.log = logger
 	device.net.bind = bind
-	device.tun.device = tunDevice
-	device.tun.readOffset = MessageTransportHeaderSize
-	if mro := tunDevice.MRO(); mro > device.tun.readOffset {
-		device.tun.readOffset = mro
-		device.tun.readNeedsCopy = true
+	device.batchSize = bind.BatchSize()
+	if tunBatchSize := tunDevice.BatchSize(); device.batchSize < tunBatchSize {
+		device.batchSize = tunBatchSize
 	}
-	device.tun.writeOffset = MessageTransportOffsetContent
-	if mwo := tunDevice.MWO(); mwo > device.tun.writeOffset {
-		device.tun.writeOffset = mwo
-		device.tun.writeNeedsCopy = true
-	}
-	mtu, err := device.tun.device.MTU()
+	device.tun.device.Store(tunState)
+	mtu, err := tunDevice.MTU()
 	if err != nil {
 		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
 		mtu = DefaultMTU
@@ -354,10 +378,7 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger *Logger) *Device {
 		go device.RoutineHandshake(i + 1)
 	}
 
-	device.state.stopping.Add(1)      // RoutineReadFromTUN
-	device.queue.encryption.wg.Add(1) // RoutineReadFromTUN
-	go device.RoutineReadFromTUN()
-	go device.RoutineTUNEventReader()
+	device.startTUN(tunState)
 
 	return device
 }
@@ -367,12 +388,7 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger *Logger) *Device {
 // is the size used to construct memory pools, and is the allowed batch size for
 // the lifetime of the device.
 func (device *Device) BatchSize() int {
-	size := device.net.bind.BatchSize()
-	dSize := device.tun.device.BatchSize()
-	if size < dSize {
-		size = dSize
-	}
-	return size
+	return device.batchSize
 }
 
 func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
@@ -415,7 +431,7 @@ func (device *Device) Close() {
 	device.state.state.Store(uint32(deviceStateClosed))
 	device.log.Verbosef("Device closing")
 
-	device.tun.device.Close()
+	device.stopTUN(device.tun.device.Swap(nil))
 	device.downLocked()
 
 	// Remove peers before closing queues,
@@ -570,4 +586,108 @@ func (device *Device) BindClose() error {
 	err := closeBindLocked(device)
 	device.net.Unlock()
 	return err
+}
+
+func (device *Device) startTUN(tun *tunState) {
+	tun.wg.Add(2)
+	device.state.stopping.Add(2)      // RoutineReadFromTUN + RoutineTUNEventReader
+	device.queue.encryption.wg.Add(1) // RoutineReadFromTUN
+	go device.RoutineReadFromTUN(tun)
+	go device.RoutineTUNEventReader(tun)
+}
+
+func (device *Device) stopTUN(tun *tunState) {
+	if tun == nil {
+		return
+	}
+	close(tun.stop)
+	if err := tun.device.Close(); err != nil && !device.isClosed() {
+		device.log.Verbosef("Failed to close TUN device: %v", err)
+	}
+	tun.wg.Wait()
+}
+
+func (device *Device) currentTUN() *tunState {
+	return device.tun.device.Load()
+}
+
+// ReplaceTUN atomically swaps the active TUN attachment.
+// The old TUN is closed to unblock its reader before the new one takes over.
+func (device *Device) ReplaceTUN(tunDevice gtun.Tun) error {
+	tunState, err := newTunState(tunDevice)
+	if err != nil {
+		return err
+	}
+	if tunDevice.BatchSize() > device.BatchSize() {
+		return fmt.Errorf("replacement tun batch size %d exceeds device batch size %d", tunDevice.BatchSize(), device.BatchSize())
+	}
+	mtu, err := tunDevice.MTU()
+	if err != nil {
+		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
+		mtu = DefaultMTU
+	}
+
+	device.state.Lock()
+	defer device.state.Unlock()
+	if device.isClosed() {
+		_ = tunDevice.Close()
+		return fmt.Errorf("device is closed")
+	}
+
+	old := device.tun.device.Swap(tunState)
+	device.tun.mtu.Store(int32(mtu))
+	device.startTUN(tunState)
+	device.stopTUN(old)
+	device.log.Verbosef("TUN device replaced")
+	return nil
+}
+
+// AttachTUN attaches a TUN to a device that is currently detached.
+func (device *Device) AttachTUN(tunDevice gtun.Tun) error {
+	tunState, err := newTunState(tunDevice)
+	if err != nil {
+		return err
+	}
+	if tunDevice.BatchSize() > device.BatchSize() {
+		return fmt.Errorf("replacement tun batch size %d exceeds device batch size %d", tunDevice.BatchSize(), device.BatchSize())
+	}
+	mtu, err := tunDevice.MTU()
+	if err != nil {
+		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
+		mtu = DefaultMTU
+	}
+
+	device.state.Lock()
+	defer device.state.Unlock()
+	if device.isClosed() {
+		_ = tunDevice.Close()
+		return fmt.Errorf("device is closed")
+	}
+	if device.currentTUN() != nil {
+		_ = tunDevice.Close()
+		return fmt.Errorf("device already has a TUN attached")
+	}
+
+	device.tun.device.Store(tunState)
+	device.tun.mtu.Store(int32(mtu))
+	device.startTUN(tunState)
+	device.log.Verbosef("TUN device attached")
+	return nil
+}
+
+// DetachTUN closes and removes the currently attached TUN, if any.
+func (device *Device) DetachTUN() error {
+	device.state.Lock()
+	defer device.state.Unlock()
+	if device.isClosed() {
+		return fmt.Errorf("device is closed")
+	}
+	old := device.tun.device.Swap(nil)
+	if old == nil {
+		return nil
+	}
+	device.tun.mtu.Store(int32(DefaultMTU))
+	device.stopTUN(old)
+	device.log.Verbosef("TUN device detached")
+	return nil
 }

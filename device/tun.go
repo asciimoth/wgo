@@ -13,12 +13,18 @@ import (
 
 const DefaultMTU = 1420
 
-func (device *Device) RoutineTUNEventReader() {
+func (device *Device) RoutineTUNEventReader(tun *tunState) {
+	defer func() {
+		device.log.Verbosef("Routine: event worker - stopped")
+		tun.wg.Done()
+		device.state.stopping.Done()
+	}()
+
 	device.log.Verbosef("Routine: event worker - started")
 
-	for event := range device.tun.device.Events() {
+	for event := range tun.device.Events() {
 		if event&gtun.EventMTUUpdate != 0 {
-			mtu, err := device.tun.device.MTU()
+			mtu, err := tun.device.MTU()
 			if err != nil {
 				device.log.Errorf("Failed to load updated MTU of device: %v", err)
 				continue
@@ -48,6 +54,4 @@ func (device *Device) RoutineTUNEventReader() {
 			device.Down()
 		}
 	}
-
-	device.log.Verbosef("Routine: event worker - stopped")
 }
