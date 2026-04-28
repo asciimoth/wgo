@@ -7,7 +7,7 @@
 
 package device
 
-import "github.com/asciimoth/wgo/conn"
+import conn "github.com/asciimoth/batchudp"
 
 const (
 	QueueStagedSize            = conn.IdealBatchSize

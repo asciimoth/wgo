@@ -20,7 +20,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/asciimoth/wgo/conn"
+	conn "github.com/asciimoth/batchudp"
 	"github.com/asciimoth/wgo/rwcancel"
 )
 

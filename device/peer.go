@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/asciimoth/wgo/conn"
+	conn "github.com/asciimoth/batchudp"
 )
 
 type Peer struct {

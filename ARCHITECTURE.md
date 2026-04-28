@@ -7,17 +7,28 @@
 Unlike the upstream project, this repository is structured as a reusable library rather than an executable tool. The main architectural boundary is:
 
 - `device`: protocol engine and runtime orchestration
-- `conn`: UDP transport abstraction
 - `ipc`: WireGuard UAPI transport helpers
 - helper packages: small protocol/runtime utilities used by `device`
+- external transport dependencies: `github.com/asciimoth/batchudp` for UDP bind/endpoint abstractions and `github.com/asciimoth/gonnect` for network providers
 
 ## High-Level Model
 
-At runtime, a host application wires together three things:
+At runtime, a host application wires together four things:
 
 1. A `tun.Tun` implementation from `github.com/asciimoth/gonnect/tun`
-2. A `conn.Bind` implementation from `conn`
-3. A `device.Device` from `device.NewDevice(...)`
+2. A `gonnect.Network` implementation used to construct or back UDP transport
+3. A `conn.Bind` implementation from `github.com/asciimoth/batchudp`
+4. A `device.Device` from `device.NewDevice(...)`
+
+For the default native transport, construction typically looks like:
+
+```go
+network := (&native.Config{}).Build()
+defer network.Down()
+
+bind := batchudp.NewDefaultBind(network)
+dev := device.NewDevice(tunDevice, bind, logger)
+```
 
 `device.Device` is the central coordinator. It owns:
 
@@ -54,9 +65,9 @@ Important internal structures:
 - `AllowedIPs` trie in [device/allowedips.go](/home/moth/projects/wgo/device/allowedips.go)
 - queue definitions in [device/channels.go](/home/moth/projects/wgo/device/channels.go)
 
-### `conn`
+### UDP Transport
 
-`conn` abstracts UDP socket handling behind the `Bind` and `Endpoint` interfaces in [conn/conn.go](/home/moth/projects/wgo/conn/conn.go).
+UDP socket handling is no longer implemented inside this repository. `device` depends on the `Bind`, `Endpoint`, and `ReceiveFunc` interfaces from `github.com/asciimoth/batchudp`.
 
 Responsibilities:
 
@@ -65,7 +76,13 @@ Responsibilities:
 - endpoint parsing and cached source/destination metadata
 - OS-specific socket features such as marks, sticky source handling, and UDP offload
 
-`StdNetBind` in [conn/bind_std.go](/home/moth/projects/wgo/conn/bind_std.go) is the cross-platform default implementation. Platform-specific files extend behavior for Linux, Windows, Android, and generic Unix variants.
+In this project:
+
+- transport abstractions are consumed from `batchudp`, not maintained locally
+- the default bind is usually `batchudp.NewDefaultBind(network)`
+- the supplied `gonnect.Network` controls how sockets are opened and how network lifecycle is managed
+
+This keeps `wgo` focused on WireGuard protocol behavior while transport implementation evolves independently in the standalone `batchudp` module.
 
 ### Packet I/O
 
@@ -75,6 +92,7 @@ Concrete providers now come from external packages:
 
 - `github.com/asciimoth/tuntap` for native OS TUN devices
 - `github.com/asciimoth/gonnect-netstack/vtun` for userspace virtual TUNs
+- `github.com/asciimoth/gonnect/native` when the host wants a default OS-backed network for `batchudp`
 - package-local test helpers in `device/*_test.go`
 
 At the TUN boundary, `device` keeps two concepts separate:
@@ -164,7 +182,7 @@ Flow:
 6. Ensure a valid session exists, initiating handshake if needed
 7. Assign nonces sequentially per peer
 8. Encrypt transport packets in parallel worker goroutines
-9. Send ciphertext through `conn.Bind`
+9. Send ciphertext through `batchudp.Bind`
 
 Key design point:
 
@@ -175,7 +193,7 @@ Key design point:
 
 ### Inbound path
 
-The inbound path starts with UDP datagrams read from `conn.ReceiveFunc` instances created by the active bind.
+The inbound path starts with UDP datagrams read from `batchudp.ReceiveFunc` instances created by the active bind.
 
 Flow:
 
@@ -233,17 +251,16 @@ The architecture favors predictable ordering and explicit ownership over fully l
 
 Several packages are split by operating system using Go build tags:
 
-- `conn/*_{linux,unix,windows,android}.go`
 - `ipc/uapi_{linux,unix,bsd,windows,wasm}.go`
 - `device/queueconstants_*` and a few mobile-specific files
 
 This keeps the public package surface stable while isolating OS details such as:
 
 - TUN creation and configuration
-- socket control messages
-- firewall marks
-- route/listener integration
+- route/listener integration inside `device`
 - Windows named pipe support
+
+Most socket-control and UDP platform specialization now lives in the external `batchudp` module rather than in this repository.
 
 ## UAPI and Embedding Boundary
 

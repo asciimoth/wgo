@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	conn "github.com/asciimoth/batchudp"
 	gtun "github.com/asciimoth/gonnect/tun"
-	"github.com/asciimoth/wgo/conn"
 	"github.com/asciimoth/wgo/ratelimiter"
 	"github.com/asciimoth/wgo/rwcancel"
 )

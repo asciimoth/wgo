@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
+	conn "github.com/asciimoth/batchudp"
 	"github.com/asciimoth/tuntap"
-	"github.com/asciimoth/wgo/conn"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"

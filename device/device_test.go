@@ -20,10 +20,11 @@ import (
 	"testing"
 	"time"
 
+	conn "github.com/asciimoth/batchudp"
+	"github.com/asciimoth/batchudp/bindtest"
 	"github.com/asciimoth/gonnect-netstack/vtun"
+	"github.com/asciimoth/gonnect/native"
 	gtun "github.com/asciimoth/gonnect/tun"
-	"github.com/asciimoth/wgo/conn"
-	"github.com/asciimoth/wgo/conn/bindtest"
 )
 
 // uapiCfg returns a string that contains cfg formatted use with IpcSet.
@@ -153,7 +154,13 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 	cfg, endpointCfg := genConfigs(tb)
 	var binds [2]conn.Bind
 	if realSocket {
-		binds[0], binds[1] = conn.NewDefaultBind(), conn.NewDefaultBind()
+		for i := range binds {
+			network := (&native.Config{}).Build()
+			tb.Cleanup(func() {
+				_ = network.Down()
+			})
+			binds[i] = conn.NewDefaultBind(network)
+		}
 	} else {
 		binds = bindtest.NewChannelBinds()
 	}

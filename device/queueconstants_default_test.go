@@ -5,7 +5,7 @@ package device
 import (
 	"testing"
 
-	"github.com/asciimoth/wgo/conn"
+	conn "github.com/asciimoth/batchudp"
 )
 
 func TestDefaultQueueConstants(t *testing.T) {

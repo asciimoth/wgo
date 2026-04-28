@@ -8,7 +8,7 @@ package device
 import (
 	"errors"
 
-	"github.com/asciimoth/wgo/conn"
+	conn "github.com/asciimoth/batchudp"
 )
 
 type DummyDatagram struct {

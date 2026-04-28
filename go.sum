@@ -1,3 +1,5 @@
+github.com/asciimoth/batchudp v0.1.0 h1:3gYbBU2YwBeHeGvsn7P770fbnHBNBTHk1KNaicRVdEs=
+github.com/asciimoth/batchudp v0.1.0/go.mod h1:BXgWIkOhA5vmIwM3T+17apJcjfa/e/xqTKPLbrVf3Ko=
 github.com/asciimoth/bufpool v0.3.0 h1:tQMop/kZ3eOLSorM9i0cqtOIpxWQUroGZ6oNk5DTnQc=
 github.com/asciimoth/bufpool v0.3.0/go.mod h1:JV6H4hpj2bCS5Svr0wNqR+XOZFOOkdXfNZxCjm/3QHw=
 github.com/asciimoth/gonnect v0.10.0 h1:EI6g0cS9OsB16wQmfiVXybsmQAe/toIit+6tCpkjJJo=

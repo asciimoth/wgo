@@ -5,7 +5,7 @@
 
 package device
 
-import "github.com/asciimoth/wgo/conn"
+import conn "github.com/asciimoth/batchudp"
 
 /* Reduce memory consumption for Android */
 

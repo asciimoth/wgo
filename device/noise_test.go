@@ -10,7 +10,8 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/asciimoth/wgo/conn"
+	conn "github.com/asciimoth/batchudp"
+	"github.com/asciimoth/gonnect/native"
 )
 
 func TestCurveWrappers(t *testing.T) {
@@ -38,7 +39,11 @@ func randDevice(t *testing.T) *Device {
 	}
 	tun := newChannelTUN()
 	logger := NewLogger(LogLevelError, "")
-	device := NewDevice(tun.TUN(), conn.NewDefaultBind(), logger)
+	network := (&native.Config{}).Build()
+	t.Cleanup(func() {
+		_ = network.Down()
+	})
+	device := NewDevice(tun.TUN(), conn.NewDefaultBind(network), logger)
 	device.SetPrivateKey(sk)
 	return device
 }
