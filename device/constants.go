@@ -37,6 +37,10 @@ const (
 	MessageBufferSize    = MaxMessageSize + MaxTunOffsetHeadroom
 )
 
+func maxTunHeadroom() int {
+	return MessageBufferSize - MaxContentSize
+}
+
 /* Implementation constants */
 
 const (

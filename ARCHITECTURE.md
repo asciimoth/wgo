@@ -105,7 +105,7 @@ The transport layout remains fixed:
 - transport header starts at offset `0`
 - transport plaintext content starts at offset `16`
 
-TUN offsets are treated as adapter metadata computed during `NewDevice`:
+TUN offsets are treated as adapter metadata computed for each attached `tun.Tun`:
 
 - `readOffset`: offset passed to `tun.Read`
 - `writeOffset`: offset passed to `tun.Write`
@@ -113,6 +113,7 @@ TUN offsets are treated as adapter metadata computed during `NewDevice`:
 - `writeNeedsCopy`: whether outbound plaintext must be shifted right before `tun.Write`
 
 This preserves the existing crypto and packet layout logic while allowing arbitrary non-negative `MRO()`/`MWO()` values as long as they fit device buffer capacity.
+The active TUN can be replaced at runtime without rebuilding the `Device`, so this adapter strategy is attachment-local rather than a permanent property of the device object.
 
 ### `ipc`
 
@@ -137,9 +138,10 @@ These packages are small, focused dependencies of `device` and transport code.
 
 During construction it:
 
-- records the provided TUN and bind implementations
-- validates TUN offsets against buffer-capacity limits
-- computes TUN read/write adapter strategy from `MRO()` and `MWO()`
+- records the provided bind implementation
+- attaches the provided initial TUN
+- validates that TUN's offsets against buffer-capacity limits
+- computes that attachment's read/write adapter strategy from `MRO()` and `MWO()`
 - reads and stores the current MTU
 - initializes peer maps, pools, rate limiter, and key index table
 - creates handshake, encryption, and decryption queues
@@ -147,10 +149,12 @@ During construction it:
   - handshake processing
   - encryption
   - decryption
-  - TUN reads
-  - TUN event handling
+  - TUN reads for the active attachment
+  - TUN event handling for the active attachment
 
 The device starts in the `down` state. Network sockets are opened later by transitioning the device `up`.
+
+The device batch size is fixed for the lifetime of the device from the maximum of the initial bind and initial TUN batch sizes. Replacement TUNs may use a smaller batch size, but they may not exceed the device batch size because queue pools are pre-sized once at construction.
 
 ### State transitions
 
@@ -164,17 +168,23 @@ The device starts in the `down` state. Network sockets are opened later by trans
 
 `Down()` closes the bind and stops peer activity without destroying the device object.
 
-`Close()` is terminal. It closes the TUN, tears down the bind, removes peers, drains queues, stops background activity, and closes the `Wait()` channel.
+TUN lifecycle is managed separately from `up`/`down` state:
+
+- `ReplaceTUN()` swaps the active attachment in place, starts fresh TUN reader/event workers for the new attachment, and closes the old TUN to unblock its read loop
+- `DetachTUN()` removes the active attachment and leaves the device running without TUN delivery until another TUN is attached
+- `AttachTUN()` attaches a TUN to a currently detached device
+
+`Close()` is terminal. It closes the active TUN if present, tears down the bind, removes peers, drains queues, stops background activity, and closes the `Wait()` channel.
 
 ## Data Flow
 
 ### Outbound path
 
-The outbound path starts with packets read from the TUN device by `RoutineReadFromTUN` in [device/send.go](/home/moth/projects/wgo/device/send.go).
+The outbound path starts with packets read from the currently attached TUN by `RoutineReadFromTUN` in [device/send.go](/home/moth/projects/wgo/device/send.go).
 
 Flow:
 
-1. Read one or more plaintext IP packets from `tun.Tun` using `device.tun.readOffset`
+1. Read one or more plaintext IP packets from the active `tun.Tun` using that attachment's `readOffset`
 2. If the TUN requires a larger read offset than the internal transport layout, compact plaintext left to offset `16`
 3. Determine IP version and destination address
 4. Look up the destination in `AllowedIPs`
@@ -204,8 +214,10 @@ Flow:
 5. Decrypt transport packets in parallel
 6. Validate counters and replay windows
 7. Deliver plaintext IP packets to the peer’s sequential inbound consumer
-8. If the TUN requires a larger write offset than the internal transport layout, shift plaintext right before TUN delivery
-9. Write plaintext packets back to `tun.Tun` using `device.tun.writeOffset`
+8. Snapshot the currently attached TUN for delivery
+9. If that TUN requires a larger write offset than the internal transport layout, shift plaintext right before TUN delivery
+10. Write plaintext packets back to `tun.Tun` using that attachment's `writeOffset`
+11. If a TUN swap raced the write and the old attachment was already closed, rebuild the write buffers once against the new current attachment and retry
 
 Handshake packets and transport packets are deliberately separated early so the device can scale crypto work while keeping protocol ordering constraints.
 

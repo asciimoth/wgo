@@ -218,6 +218,7 @@ func (device *Device) RoutineReadFromTUN(tun *tunState) {
 		readErr     error
 		elems       = make([]*QueueOutboundElement, batchSize)
 		bufs        = make([][]byte, batchSize)
+		readBufs    = make([][]byte, batchSize)
 		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
 		count       = 0
 		sizes       = make([]int, batchSize)
@@ -227,6 +228,11 @@ func (device *Device) RoutineReadFromTUN(tun *tunState) {
 	for i := range elems {
 		elems[i] = device.NewOutboundElement()
 		bufs[i] = elems[i].buffer[:]
+		if tun.readUsesLargeBufs {
+			readBufs[i] = make([]byte, tun.readOffset+MaxContentSize)
+		} else {
+			readBufs[i] = bufs[i]
+		}
 	}
 
 	defer func() {
@@ -240,15 +246,19 @@ func (device *Device) RoutineReadFromTUN(tun *tunState) {
 
 	for {
 		// read packets
-		count, readErr = tun.device.Read(bufs, sizes, offset)
+		count, readErr = tun.device.Read(readBufs, sizes, offset)
 		for i := 0; i < count; i++ {
 			if sizes[i] < 1 {
 				continue
 			}
+			if sizes[i] > MaxContentSize {
+				continue
+			}
 
 			elem := elems[i]
+			src := readBufs[i]
 			if tun.readNeedsCopy {
-				copy(bufs[i][MessageTransportHeaderSize:], bufs[i][offset:offset+sizes[i]])
+				copy(bufs[i][MessageTransportHeaderSize:], src[offset:offset+sizes[i]])
 			}
 			elem.packet = bufs[i][MessageTransportHeaderSize : MessageTransportHeaderSize+sizes[i]]
 
@@ -284,6 +294,9 @@ func (device *Device) RoutineReadFromTUN(tun *tunState) {
 			elemsForPeer.elems = append(elemsForPeer.elems, elem)
 			elems[i] = device.NewOutboundElement()
 			bufs[i] = elems[i].buffer[:]
+			if !tun.readUsesLargeBufs {
+				readBufs[i] = bufs[i]
+			}
 		}
 
 		for peer, elemsForPeer := range elemsByPeer {

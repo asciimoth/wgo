@@ -98,12 +98,14 @@ type tunState struct {
 
 	// Transport layout inside device buffers stays fixed at offset 16.
 	// These fields describe only the TUN adapter offsets at the boundary.
-	readOffset     int
-	writeOffset    int
-	readNeedsCopy  bool
-	writeNeedsCopy bool
-	stop           chan struct{}
-	wg             sync.WaitGroup
+	readOffset         int
+	writeOffset        int
+	readNeedsCopy      bool
+	writeNeedsCopy     bool
+	readUsesLargeBufs  bool
+	writeUsesLargeBufs bool
+	stop               chan struct{}
+	wg                 sync.WaitGroup
 }
 
 // deviceState represents the state of a Device.
@@ -297,16 +299,11 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 }
 
 func validateTunOffsets(tunDevice gtun.Tun) error {
-	maxOffset := MessageBufferSize - MaxContentSize
 	if mwo := tunDevice.MWO(); mwo < 0 {
 		return fmt.Errorf("invalid tun minimal write offset %d: must be >= 0", mwo)
-	} else if mwo > maxOffset {
-		return fmt.Errorf("unsupported tun minimal write offset %d: exceeds buffer capacity limit %d", mwo, maxOffset)
 	}
 	if mro := tunDevice.MRO(); mro < 0 {
 		return fmt.Errorf("invalid tun minimal read offset %d: must be >= 0", mro)
-	} else if mro > maxOffset {
-		return fmt.Errorf("unsupported tun minimal read offset %d: exceeds buffer capacity limit %d", mro, maxOffset)
 	}
 	return nil
 }
@@ -325,10 +322,16 @@ func newTunState(tunDevice gtun.Tun) (*tunState, error) {
 	if mro := tunDevice.MRO(); mro > state.readOffset {
 		state.readOffset = mro
 		state.readNeedsCopy = true
+		if mro > maxTunHeadroom() {
+			state.readUsesLargeBufs = true
+		}
 	}
 	if mwo := tunDevice.MWO(); mwo > state.writeOffset {
 		state.writeOffset = mwo
 		state.writeNeedsCopy = true
+		if mwo > maxTunHeadroom() {
+			state.writeUsesLargeBufs = true
+		}
 	}
 	return state, nil
 }

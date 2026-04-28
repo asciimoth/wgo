@@ -885,15 +885,18 @@ func TestBatchSize(t *testing.T) {
 func TestNewDeviceTunOffsetStrategy(t *testing.T) {
 	t.Parallel()
 
+	largeOffset := maxTunHeadroom() + 32
 	tests := []struct {
-		name            string
-		mwo             int
-		mro             int
-		wantReadOffset  int
-		wantWriteOffset int
-		wantReadCopy    bool
-		wantWriteCopy   bool
-		wantPanic       bool
+		name               string
+		mwo                int
+		mro                int
+		wantReadOffset     int
+		wantWriteOffset    int
+		wantReadCopy       bool
+		wantWriteCopy      bool
+		wantReadLargeBufs  bool
+		wantWriteLargeBufs bool
+		wantPanic          bool
 	}{
 		{name: "zero offsets", mwo: 0, mro: 0, wantReadOffset: 16, wantWriteOffset: 16},
 		{name: "exact transport offsets", mwo: 16, mro: 16, wantReadOffset: 16, wantWriteOffset: 16},
@@ -901,10 +904,11 @@ func TestNewDeviceTunOffsetStrategy(t *testing.T) {
 		{name: "read copy", mwo: 16, mro: 32, wantReadOffset: 32, wantWriteOffset: 16, wantReadCopy: true},
 		{name: "write copy", mwo: 32, mro: 16, wantReadOffset: 16, wantWriteOffset: 32, wantWriteCopy: true},
 		{name: "both copy", mwo: 48, mro: 32, wantReadOffset: 32, wantWriteOffset: 48, wantReadCopy: true, wantWriteCopy: true},
+		{name: "large read offset", mwo: 16, mro: largeOffset, wantReadOffset: largeOffset, wantWriteOffset: 16, wantReadCopy: true, wantReadLargeBufs: true},
+		{name: "large write offset", mwo: largeOffset, mro: 16, wantReadOffset: 16, wantWriteOffset: largeOffset, wantWriteCopy: true, wantWriteLargeBufs: true},
+		{name: "both large offsets", mwo: largeOffset, mro: largeOffset, wantReadOffset: largeOffset, wantWriteOffset: largeOffset, wantReadCopy: true, wantWriteCopy: true, wantReadLargeBufs: true, wantWriteLargeBufs: true},
 		{name: "negative write offset", mwo: -1, wantPanic: true},
 		{name: "negative read offset", mro: -1, wantPanic: true},
-		{name: "write offset exceeds buffer headroom", mwo: MessageBufferSize - MaxContentSize + 1, wantPanic: true},
-		{name: "read offset exceeds buffer headroom", mro: MessageBufferSize - MaxContentSize + 1, wantPanic: true},
 	}
 
 	for _, tt := range tests {
@@ -940,6 +944,12 @@ func TestNewDeviceTunOffsetStrategy(t *testing.T) {
 			if got := tunState.writeNeedsCopy; got != tt.wantWriteCopy {
 				t.Fatalf("writeNeedsCopy = %v, want %v", got, tt.wantWriteCopy)
 			}
+			if got := tunState.readUsesLargeBufs; got != tt.wantReadLargeBufs {
+				t.Fatalf("readUsesLargeBufs = %v, want %v", got, tt.wantReadLargeBufs)
+			}
+			if got := tunState.writeUsesLargeBufs; got != tt.wantWriteLargeBufs {
+				t.Fatalf("writeUsesLargeBufs = %v, want %v", got, tt.wantWriteLargeBufs)
+			}
 		})
 	}
 }
@@ -947,6 +957,7 @@ func TestNewDeviceTunOffsetStrategy(t *testing.T) {
 func TestDeviceReplaceTUN(t *testing.T) {
 	t.Parallel()
 
+	largeOffset := maxTunHeadroom() + 32
 	ips := [2]netip.Addr{
 		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
 		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
@@ -963,7 +974,7 @@ func TestDeviceReplaceTUN(t *testing.T) {
 
 	pair.Send(t, Ping, nil)
 
-	replacement := newChannelTUNWithOffsets(48, 32)
+	replacement := newChannelTUNWithOffsets(largeOffset, largeOffset)
 	if err := devs[0].ReplaceTUN(replacement.TUN()); err != nil {
 		t.Fatalf("ReplaceTUN: %v", err)
 	}
@@ -979,7 +990,7 @@ func TestDeviceReplaceTUN(t *testing.T) {
 	if tunState == nil {
 		t.Fatal("expected replacement tun to be attached")
 	}
-	if tunState.readOffset != 32 || tunState.writeOffset != 48 {
+	if tunState.readOffset != largeOffset || tunState.writeOffset != largeOffset {
 		t.Fatalf("unexpected replacement tun offsets: read=%d write=%d", tunState.readOffset, tunState.writeOffset)
 	}
 
@@ -990,6 +1001,7 @@ func TestDeviceReplaceTUN(t *testing.T) {
 func TestDeviceDetachAndAttachTUN(t *testing.T) {
 	t.Parallel()
 
+	largeOffset := maxTunHeadroom() + 32
 	ips := [2]netip.Addr{
 		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
 		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
@@ -1025,11 +1037,19 @@ func TestDeviceDetachAndAttachTUN(t *testing.T) {
 	default:
 	}
 
-	replacement := newChannelTUNWithOffsets(32, 48)
+	replacement := newChannelTUNWithOffsets(largeOffset, largeOffset)
 	if err := devs[0].AttachTUN(replacement.TUN()); err != nil {
 		t.Fatalf("AttachTUN: %v", err)
 	}
 	pair[0].tun = replacement
+
+	tunState := devs[0].currentTUN()
+	if tunState == nil {
+		t.Fatal("expected tun to be attached")
+	}
+	if tunState.readOffset != largeOffset || tunState.writeOffset != largeOffset {
+		t.Fatalf("unexpected attached tun offsets: read=%d write=%d", tunState.readOffset, tunState.writeOffset)
+	}
 
 	pair.Send(t, Ping, nil)
 	pair.Send(t, Pong, nil)
@@ -1038,6 +1058,7 @@ func TestDeviceDetachAndAttachTUN(t *testing.T) {
 func TestDeviceReplaceTUNDuringActiveTraffic(t *testing.T) {
 	goroutineLeakCheck(t)
 
+	largeOffset := maxTunHeadroom() + 32
 	ips := [2]netip.Addr{
 		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
 		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
@@ -1049,7 +1070,7 @@ func TestDeviceReplaceTUNDuringActiveTraffic(t *testing.T) {
 	devs := newDevicePairForTUNs(t, tuns[0].TUN(), tuns[1].TUN(), ips)
 
 	msg := pingPacket(ips[0], ips[1])
-	replacement := newChannelTUNWithOffsets(48, 32)
+	replacement := newChannelTUNWithOffsets(largeOffset, largeOffset)
 
 	var current atomic.Pointer[channelTUN]
 	var candidate atomic.Pointer[channelTUN]
@@ -1122,6 +1143,7 @@ func TestDeviceReplaceTUNDuringActiveTraffic(t *testing.T) {
 func TestTwoDevicePingWithChannelTunOffsets(t *testing.T) {
 	goroutineLeakCheck(t)
 
+	largeOffset := maxTunHeadroom() + 32
 	tests := []struct {
 		name      string
 		mwo, mro  int
@@ -1132,6 +1154,9 @@ func TestTwoDevicePingWithChannelTunOffsets(t *testing.T) {
 		{name: "read copy required", mwo: 0, mro: 32, wantRead: 32, wantWrite: 16},
 		{name: "write copy required", mwo: 32, mro: 0, wantRead: 16, wantWrite: 32},
 		{name: "both copy required", mwo: 48, mro: 32, wantRead: 32, wantWrite: 48},
+		{name: "large read offset", mwo: 0, mro: largeOffset, wantRead: largeOffset, wantWrite: 16},
+		{name: "large write offset", mwo: largeOffset, mro: 0, wantRead: 16, wantWrite: largeOffset},
+		{name: "both large offsets", mwo: largeOffset, mro: largeOffset, wantRead: largeOffset, wantWrite: largeOffset},
 	}
 
 	for _, tt := range tests {
@@ -1162,6 +1187,7 @@ func TestTwoDevicePingWithChannelTunOffsets(t *testing.T) {
 func TestVTunOffsetsEndToEnd(t *testing.T) {
 	goroutineLeakCheck(t)
 
+	largeOffset := maxTunHeadroom() + 32
 	tests := []struct {
 		name     string
 		mwo, mro int
@@ -1170,6 +1196,9 @@ func TestVTunOffsetsEndToEnd(t *testing.T) {
 		{name: "read copy", mwo: 0, mro: 32},
 		{name: "write copy", mwo: 32, mro: 0},
 		{name: "both copy", mwo: 48, mro: 32},
+		{name: "large read offset", mwo: 0, mro: largeOffset},
+		{name: "large write offset", mwo: largeOffset, mro: 0},
+		{name: "both large offsets", mwo: largeOffset, mro: largeOffset},
 	}
 
 	for _, tt := range tests {
@@ -1235,6 +1264,7 @@ func TestVTunOffsetsEndToEnd(t *testing.T) {
 func TestWireGuardEndToEndPingPong(t *testing.T) {
 	goroutineLeakCheck(t)
 
+	largeOffset := maxTunHeadroom() + 32
 	ips := [2]netip.Addr{
 		netip.MustParseAddr("10.44.0.1"),
 		netip.MustParseAddr("10.44.0.2"),
@@ -1247,6 +1277,9 @@ func TestWireGuardEndToEndPingPong(t *testing.T) {
 		{name: "read-copy", mwo: 0, mro: 32},
 		{name: "write-copy", mwo: 32, mro: 0},
 		{name: "both-copy", mwo: 48, mro: 32},
+		{name: "large-read", mwo: 0, mro: largeOffset},
+		{name: "large-write", mwo: largeOffset, mro: 0},
+		{name: "both-large", mwo: largeOffset, mro: largeOffset},
 	}
 	bindModes := []e2eBindMode{
 		e2eBindModeNativeDefault,

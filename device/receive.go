@@ -41,6 +41,12 @@ type QueueInboundElementsContainer struct {
 func buildTUNWriteBuffers(tun *tunState, elems []*QueueInboundElement, bufs [][]byte) [][]byte {
 	bufs = bufs[:0]
 	for _, elem := range elems {
+		if tun.writeUsesLargeBufs {
+			buf := make([]byte, tun.writeOffset+len(elem.packet))
+			copy(buf[tun.writeOffset:], elem.packet)
+			bufs = append(bufs, buf)
+			continue
+		}
 		if tun.writeNeedsCopy {
 			copy(elem.buffer[tun.writeOffset:], elem.packet)
 			bufs = append(bufs, elem.buffer[:tun.writeOffset+len(elem.packet)])
