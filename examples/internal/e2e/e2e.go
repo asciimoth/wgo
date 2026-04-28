@@ -35,12 +35,12 @@ type Pair struct {
 func New() (*Pair, error) {
 	network := loopback.NewLoopbackNetwok()
 
-	firstTun, err := buildVTun(firstIP)
+	firstTun, err := buildVTun(firstIP, 0, 0)
 	if err != nil {
 		_ = network.Down()
 		return nil, fmt.Errorf("build first vtun: %w", err)
 	}
-	secondTun, err := buildVTun(secondIP)
+	secondTun, err := buildVTun(secondIP, 0, 0)
 	if err != nil {
 		_ = firstTun.Close()
 		_ = network.Down()
@@ -65,6 +65,19 @@ func New() (*Pair, error) {
 		return nil, err
 	}
 	return pair, nil
+}
+
+func (p *Pair) SwapSecondVTun(mwo, mro int) error {
+	nextTun, err := buildVTun(p.SecondIP, mwo, mro)
+	if err != nil {
+		return fmt.Errorf("build replacement second vtun: %w", err)
+	}
+	if err := p.secondDev.ReplaceTUN(nextTun); err != nil {
+		_ = nextTun.Close()
+		return fmt.Errorf("replace second vtun: %w", err)
+	}
+	p.SecondNet = nextTun
+	return nil
 }
 
 func (p *Pair) Close() error {
@@ -150,10 +163,12 @@ func (p *Pair) configure() error {
 	return nil
 }
 
-func buildVTun(addr netip.Addr) (*vtun.VTun, error) {
+func buildVTun(addr netip.Addr, mwo, mro int) (*vtun.VTun, error) {
 	tunDev, err := (&vtun.Opts{
 		LocalAddrs:     []netip.Addr{addr},
 		NoLoopbackAddr: true,
+		MWO:            mwo,
+		MRO:            mro,
 	}).Build()
 	if err != nil {
 		return nil, err

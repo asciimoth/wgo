@@ -9,7 +9,13 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/asciimoth/gonnect-netstack/vtun"
 	"github.com/asciimoth/wgo/examples/internal/e2e"
+)
+
+const (
+	swappedClientMWO = 48
+	swappedClientMRO = 32
 )
 
 func main() {
@@ -44,26 +50,19 @@ func main() {
 
 	time.Sleep(250 * time.Millisecond)
 
-	client := http.Client{
-		Transport: &http.Transport{
-			DialContext: pair.SecondNet.Dial,
-		},
-		Timeout: 10 * time.Second,
-	}
-
 	url := fmt.Sprintf("http://%s/", netip.AddrPortFrom(pair.FirstIP, 8080))
-	resp, err := client.Get(url)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	if err := doRequest("initial", pair.SecondNet, url); err != nil {
 		log.Fatal(err)
 	}
 
-	log.Printf("client status=%s body=%q", resp.Status, string(body))
+	log.Printf("swapping client vtun to MWO=%d MRO=%d", swappedClientMWO, swappedClientMRO)
+	if err := pair.SwapSecondVTun(swappedClientMWO, swappedClientMRO); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := doRequest("after swap", pair.SecondNet, url); err != nil {
+		log.Fatal(err)
+	}
 
 	if err := server.Shutdown(context.Background()); err != nil {
 		log.Fatal(err)
@@ -71,4 +70,28 @@ func main() {
 	if err := <-serverDone; err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+}
+
+func doRequest(label string, clientNet *vtun.VTun, url string) error {
+	client := http.Client{
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			DialContext:       clientNet.Dial,
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("%s request: %w", label, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("%s read body: %w", label, err)
+	}
+
+	log.Printf("%s client status=%s body=%q", label, resp.Status, string(body))
+	return nil
 }
