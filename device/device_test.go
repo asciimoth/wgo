@@ -852,6 +852,36 @@ func (b *fakeTransitionBind) ParseEndpoint(s string) (conn.Endpoint, error) {
 }
 func (b *fakeTransitionBind) BatchSize() int { return b.size }
 
+type fakeClosedErrBind struct {
+	size int
+}
+
+func (b *fakeClosedErrBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
+	return nil, port, nil
+}
+func (b *fakeClosedErrBind) Close() error {
+	return fmt.Errorf("wrapped close: %w", net.ErrClosed)
+}
+func (b *fakeClosedErrBind) SetMark(mark uint32) error                     { return nil }
+func (b *fakeClosedErrBind) Send(bufs [][]byte, ep conn.Endpoint) error    { return nil }
+func (b *fakeClosedErrBind) ParseEndpoint(s string) (conn.Endpoint, error) { return nil, nil }
+func (b *fakeClosedErrBind) BatchSize() int                                { return b.size }
+
+type fakePanicSetMarkBind struct {
+	size int
+}
+
+func (b *fakePanicSetMarkBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
+	return nil, port, nil
+}
+func (b *fakePanicSetMarkBind) Close() error { return nil }
+func (b *fakePanicSetMarkBind) SetMark(mark uint32) error {
+	panic("boom")
+}
+func (b *fakePanicSetMarkBind) Send(bufs [][]byte, ep conn.Endpoint) error    { return nil }
+func (b *fakePanicSetMarkBind) ParseEndpoint(s string) (conn.Endpoint, error) { return nil, nil }
+func (b *fakePanicSetMarkBind) BatchSize() int                                { return b.size }
+
 type fakeTUNDeviceSized struct {
 	size int
 	mwo  int
@@ -990,6 +1020,87 @@ func TestNewDeviceTunOffsetStrategy(t *testing.T) {
 				t.Fatalf("writeUsesLargeBufs = %v, want %v", got, tt.wantWriteLargeBufs)
 			}
 		})
+	}
+}
+
+func TestNewDeviceWithoutInitialAttachments(t *testing.T) {
+	t.Parallel()
+
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""))
+	t.Cleanup(dev.Close)
+
+	if dev.currentTUN() != nil {
+		t.Fatal("expected device to start without a tun")
+	}
+	if dev.Bind() != nil {
+		t.Fatal("expected device to start without a bind")
+	}
+	if got := dev.BatchSize(); got < conn.IdealBatchSize {
+		t.Fatalf("BatchSize() = %d, want at least %d", got, conn.IdealBatchSize)
+	}
+	if got := dev.tun.mtu.Load(); got != DefaultMTU {
+		t.Fatalf("mtu = %d, want %d", got, DefaultMTU)
+	}
+
+	tunDev := newChannelTUN()
+	if err := dev.AttachTUN(tunDev.TUN()); err != nil {
+		t.Fatalf("AttachTUN: %v", err)
+	}
+	if dev.currentTUN() == nil {
+		t.Fatal("expected attached tun to be active")
+	}
+
+	bind := &fakeTransitionBind{id: "bind0", size: 1}
+	if err := dev.AttachBind(bind); err != nil {
+		t.Fatalf("AttachBind: %v", err)
+	}
+	if dev.Bind() == nil {
+		t.Fatal("expected attached bind to be active")
+	}
+}
+
+func TestDeviceDownIgnoresClosedBindError(t *testing.T) {
+	t.Parallel()
+
+	tunDev := newChannelTUN()
+	dev := NewDevice(tunDev.TUN(), &fakeClosedErrBind{size: 1}, NewLogger(LogLevelError, ""))
+	t.Cleanup(dev.Close)
+	waitForDeviceUp(t, dev)
+
+	if err := dev.Down(); err != nil {
+		t.Fatalf("Down() returned unexpected error: %v", err)
+	}
+}
+
+func TestDeviceSetFwmarkReturnsErrorOnBindSetMarkPanic(t *testing.T) {
+	t.Parallel()
+
+	tunDev := newChannelTUN()
+	dev := NewDevice(tunDev.TUN(), &fakePanicSetMarkBind{size: 1}, NewLogger(LogLevelError, ""))
+	t.Cleanup(dev.Close)
+	waitForDeviceUp(t, dev)
+
+	err := dev.SetFwmark(23)
+	if err == nil {
+		t.Fatal("SetFwmark() error = nil, want error")
+	}
+}
+
+func TestDeviceAttachBindReturnsErrorOnBindSetMarkPanic(t *testing.T) {
+	t.Parallel()
+
+	tunDev := newChannelTUN()
+	dev := NewDevice(tunDev.TUN(), nil, NewLogger(LogLevelError, ""))
+	t.Cleanup(dev.Close)
+	waitForDeviceUp(t, dev)
+
+	if err := dev.SetFwmark(23); err != nil {
+		t.Fatalf("SetFwmark before attach: %v", err)
+	}
+
+	err := dev.AttachBind(&fakePanicSetMarkBind{size: 1})
+	if err == nil {
+		t.Fatal("AttachBind() error = nil, want error")
 	}
 }
 

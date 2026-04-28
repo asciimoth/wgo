@@ -13,6 +13,7 @@ import (
 	"time"
 
 	conn "github.com/asciimoth/batchudp"
+	ghelpers "github.com/asciimoth/gonnect/helpers"
 	gtun "github.com/asciimoth/gonnect/tun"
 	"github.com/asciimoth/wgo/ratelimiter"
 	"github.com/asciimoth/wgo/rwcancel"
@@ -341,9 +342,15 @@ func newTunState(tunDevice gtun.Tun) (*tunState, error) {
 }
 
 func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
-	tunState, err := newTunState(tunDevice)
-	if err != nil {
-		panic(fmt.Sprintf("device.NewDevice: %v", err))
+	var (
+		tunState *tunState
+		err      error
+	)
+	if tunDevice != nil {
+		tunState, err = newTunState(tunDevice)
+		if err != nil {
+			panic(fmt.Sprintf("device.NewDevice: %v", err))
+		}
 	}
 
 	device := new(Device)
@@ -358,16 +365,20 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
 	if bind != nil && device.batchSize < bind.BatchSize() {
 		device.batchSize = bind.BatchSize()
 	}
-	if tunBatchSize := tunDevice.BatchSize(); device.batchSize < tunBatchSize {
-		device.batchSize = tunBatchSize
+	if tunDevice != nil {
+		if tunBatchSize := tunDevice.BatchSize(); device.batchSize < tunBatchSize {
+			device.batchSize = tunBatchSize
+		}
+		device.tun.device.Store(tunState)
+		mtu, err := tunDevice.MTU()
+		if err != nil {
+			device.log.Errf("Trouble determining MTU, assuming default: %v", err)
+			mtu = DefaultMTU
+		}
+		device.tun.mtu.Store(int32(mtu))
+	} else {
+		device.tun.mtu.Store(int32(DefaultMTU))
 	}
-	device.tun.device.Store(tunState)
-	mtu, err := tunDevice.MTU()
-	if err != nil {
-		device.log.Errf("Trouble determining MTU, assuming default: %v", err)
-		mtu = DefaultMTU
-	}
-	device.tun.mtu.Store(int32(mtu))
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
 	device.rate.limiter.Init()
 	device.indexTable.Init()
@@ -391,7 +402,9 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
 		go device.RoutineHandshake(i + 1)
 	}
 
-	device.startTUN(tunState)
+	if tunState != nil {
+		device.startTUN(tunState)
+	}
 
 	return device
 }
@@ -495,7 +508,7 @@ func closeBindLocked(device *Device) error {
 		netc.netlinkCancel.Cancel()
 	}
 	if netc.bind != nil {
-		err = netc.bind.Close()
+		err = ghelpers.ClosedNetworkErrToNil(netc.bind.Close())
 	}
 	netc.stopping.Wait()
 	return err
@@ -519,7 +532,7 @@ func (device *Device) BindSetMark(mark uint32) error {
 	// update fwmark on existing bind
 	device.net.fwmark = mark
 	if device.isUp() && device.net.bind != nil {
-		if err := device.net.bind.SetMark(mark); err != nil {
+		if err := setBindMark(device.net.bind, mark); err != nil {
 			return err
 		}
 	}
@@ -573,7 +586,7 @@ func (device *Device) BindUpdate() error {
 
 	// set fwmark
 	if netc.fwmark != 0 {
-		err = netc.bind.SetMark(netc.fwmark)
+		err = setBindMark(netc.bind, netc.fwmark)
 		if err != nil {
 			return err
 		}
@@ -597,6 +610,15 @@ func (device *Device) BindUpdate() error {
 
 	device.log.Debugf("UDP bind has been updated")
 	return nil
+}
+
+func setBindMark(bind conn.Bind, mark uint32) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("set bind mark panic: %v", recovered)
+		}
+	}()
+	return bind.SetMark(mark)
 }
 
 func (device *Device) BindClose() error {

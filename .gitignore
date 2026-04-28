@@ -35,12 +35,13 @@ go.work.sum
 /.direnv
 
 # Examples
-example/linux/linux
-example/windows/windows
-example/windows-pair-load/windows-pair-load
-example/linux-pair-load/linux-pair-load
-example/native_tun_pair/native_tun_pair
-example/http_request/http_request
-example/tcp_pingpong/tcp_pingpong
-example/udp_pingpong/udp_pingpong
+examples/linux/linux
+examples/windows/windows
+examples/windows-pair-load/windows-pair-load
+examples/linux-pair-load/linux-pair-load
+examples/native_tun_pair/native_tun_pair
+examples/http_request/http_request
+examples/tcp_pingpong/tcp_pingpong
+examples/udp_pingpong/udp_pingpong
+examples/web_admin/web_admin
 

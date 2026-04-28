@@ -1,0 +1,1128 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	conn "github.com/asciimoth/batchudp"
+	"github.com/asciimoth/gonnect/native"
+	gtun "github.com/asciimoth/gonnect/tun"
+	"github.com/asciimoth/tuntap"
+	"github.com/asciimoth/wgo/device"
+	"golang.org/x/crypto/curve25519"
+)
+
+const defaultMTU = 1420
+
+func main() {
+	app, err := newAdminApp()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := app.Close(); err != nil {
+			log.Printf("cleanup error: %v", err)
+		}
+	}()
+
+	if err := app.Run(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
+}
+
+type adminApp struct {
+	dev    *device.Device
+	server *http.Server
+	plan   pairingPlan
+
+	mu   sync.Mutex
+	tun  *tunAttachment
+	bind *bindAttachment
+}
+
+type tunAttachment struct {
+	name    string
+	localIP netip.Addr
+	peerIP  netip.Addr
+	mtu     int
+	cleanup func() error
+}
+
+type bindAttachment struct {
+	network       *native.Network
+	requestedPort uint16
+}
+
+type appState struct {
+	Device deviceStateSummary `json:"device"`
+	TUN    *tunStateSummary   `json:"tun,omitempty"`
+	Bind   *bindStateSummary  `json:"bind,omitempty"`
+}
+
+type deviceStateSummary struct {
+	PrivateKey string             `json:"private_key"`
+	ListenPort uint16             `json:"listen_port"`
+	Fwmark     uint32             `json:"fwmark"`
+	Peers      []peerStateSummary `json:"peers"`
+}
+
+type peerStateSummary struct {
+	PublicKey                   string   `json:"public_key"`
+	PresharedKey                string   `json:"preshared_key"`
+	ProtocolVersion             int      `json:"protocol_version"`
+	Endpoint                    string   `json:"endpoint"`
+	LastHandshakeTime           string   `json:"last_handshake_time"`
+	TxBytes                     uint64   `json:"tx_bytes"`
+	RxBytes                     uint64   `json:"rx_bytes"`
+	PersistentKeepaliveInterval uint16   `json:"persistent_keepalive_interval"`
+	AllowedIPs                  []string `json:"allowed_ips"`
+}
+
+type tunStateSummary struct {
+	Name    string `json:"name"`
+	LocalIP string `json:"local_ip"`
+	PeerIP  string `json:"peer_ip"`
+	MTU     int    `json:"mtu"`
+}
+
+type bindStateSummary struct {
+	Type          string `json:"type"`
+	RequestedPort uint16 `json:"requested_port"`
+	ListenPort    uint16 `json:"listen_port"`
+}
+
+type deviceUpdateRequest struct {
+	PrivateKey *string `json:"private_key"`
+	ListenPort *uint16 `json:"listen_port"`
+	Fwmark     *uint32 `json:"fwmark"`
+}
+
+type peerApplyRequest struct {
+	PublicKey                   string   `json:"public_key"`
+	PresharedKey                *string  `json:"preshared_key"`
+	Endpoint                    *string  `json:"endpoint"`
+	ProtocolVersion             *int     `json:"protocol_version"`
+	PersistentKeepaliveInterval *uint16  `json:"persistent_keepalive_interval"`
+	AllowedIPs                  []string `json:"allowed_ips"`
+	ReplaceAllowedIPs           bool     `json:"replace_allowed_ips"`
+}
+
+type peerDeleteRequest struct {
+	PublicKey string `json:"public_key"`
+}
+
+type attachTUNRequest struct {
+	Name    string `json:"name"`
+	LocalIP string `json:"local_ip"`
+	PeerIP  string `json:"peer_ip"`
+	MTU     int    `json:"mtu"`
+}
+
+type attachBindRequest struct {
+	ListenPort *uint16 `json:"listen_port"`
+}
+
+type pairingPlan struct {
+	Local  peerPlan
+	Remote peerPlan
+}
+
+type peerPlan struct {
+	Label        string
+	PrivateKey   string
+	PublicKey    string
+	TunName      string
+	LocalIP      netip.Addr
+	PeerIP       netip.Addr
+	AllowedIP    netip.Prefix
+	ListenPort   uint16
+	PingTargetIP netip.Addr
+}
+
+func newAdminApp() (*adminApp, error) {
+	plan, err := newPairingPlan()
+	if err != nil {
+		return nil, err
+	}
+
+	dev := device.NewDevice(nil, nil, device.NewLogger(device.LogLevelError, "example/web-admin: "))
+	if err := dev.Up(); err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("bring device up: %w", err)
+	}
+
+	app := &adminApp{dev: dev, plan: plan}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", app.handleIndex)
+	mux.HandleFunc("/api/state", app.handleState)
+	mux.HandleFunc("/api/device", app.handleDeviceUpdate)
+	mux.HandleFunc("/api/peers/apply", app.handlePeerApply)
+	mux.HandleFunc("/api/peers/delete", app.handlePeerDelete)
+	mux.HandleFunc("/api/peers/delete_all", app.handlePeerDeleteAll)
+	mux.HandleFunc("/api/tun/attach", app.handleAttachTUN)
+	mux.HandleFunc("/api/tun/detach", app.handleDetachTUN)
+	mux.HandleFunc("/api/bind/attach", app.handleAttachBind)
+	mux.HandleFunc("/api/bind/detach", app.handleDetachBind)
+
+	app.server = &http.Server{
+		Addr:              "127.0.0.1:0",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	return app, nil
+}
+
+func (a *adminApp) Run() error {
+	listener, err := net.Listen("tcp4", a.server.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on admin panel address: %w", err)
+	}
+
+	fmt.Println()
+	fmt.Println("wgo web admin")
+	fmt.Println()
+	fmt.Printf("panel:   http://%s\n", listener.Addr())
+	fmt.Println("device:  started without TUN or bind")
+	fmt.Println("notice:  native TUN attach requires root/administrator privileges")
+	fmt.Println()
+	a.printPairingGuide()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- a.server.Serve(listener)
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	select {
+	case err := <-serverErr:
+		return err
+	case sig := <-sigCh:
+		log.Printf("received %s, shutting down", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return a.server.Shutdown(ctx)
+	}
+}
+
+func (a *adminApp) Close() error {
+	a.mu.Lock()
+	bind := a.bind
+	tun := a.tun
+	a.bind = nil
+	a.tun = nil
+	a.mu.Unlock()
+
+	if a.server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = a.server.Shutdown(ctx)
+		cancel()
+	}
+
+	if bind != nil && bind.network != nil {
+		_ = bind.network.Down()
+	}
+
+	a.dev.Close()
+
+	var err error
+	if tun != nil && tun.cleanup != nil {
+		err = tun.cleanup()
+	}
+	return err
+}
+
+func (a *adminApp) handleIndex(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(w, indexHTML)
+}
+
+func (a *adminApp) handleState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handleDeviceUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req deviceUpdateRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if req.PrivateKey != nil {
+		key, err := parsePrivateKey(*req.PrivateKey)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := a.dev.SetPrivateKey(key); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if req.ListenPort != nil {
+		if err := a.dev.SetListenPort(*req.ListenPort); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if req.Fwmark != nil {
+		if err := a.dev.SetFwmark(*req.Fwmark); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handlePeerApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req peerApplyRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	publicKey, err := parsePublicKey(req.PublicKey)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if a.dev.LookupPeer(publicKey) == nil {
+		if _, err := a.dev.NewPeer(publicKey); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if req.PresharedKey != nil {
+		psk, err := parsePresharedKey(*req.PresharedKey)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := a.dev.SetPeerPresharedKey(publicKey, psk); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if req.ProtocolVersion != nil {
+		if err := a.dev.SetPeerProtocolVersion(publicKey, *req.ProtocolVersion); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if req.Endpoint != nil && strings.TrimSpace(*req.Endpoint) != "" {
+		if err := a.dev.SetPeerEndpoint(publicKey, strings.TrimSpace(*req.Endpoint)); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if req.PersistentKeepaliveInterval != nil {
+		if err := a.dev.SetPeerPersistentKeepaliveInterval(publicKey, *req.PersistentKeepaliveInterval); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if req.ReplaceAllowedIPs {
+		prefixes, err := parsePrefixes(req.AllowedIPs)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := a.dev.ReplacePeerAllowedIPs(publicKey, prefixes); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handlePeerDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req peerDeleteRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	publicKey, err := parsePublicKey(req.PublicKey)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	a.dev.RemovePeer(publicKey)
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handlePeerDeleteAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	a.dev.RemoveAllPeers()
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handleAttachTUN(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req attachTUNRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if err := a.attachTUN(req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handleDetachTUN(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := a.detachTUN(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handleAttachBind(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req attachBindRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := a.attachBind(req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handleDetachBind(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := a.detachBind(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) attachTUN(req attachTUNRequest) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.tun != nil {
+		return fmt.Errorf("a native TUN is already attached")
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+
+	localIP, err := netip.ParseAddr(strings.TrimSpace(req.LocalIP))
+	if err != nil {
+		return fmt.Errorf("parse local_ip: %w", err)
+	}
+	peerIP, err := netip.ParseAddr(strings.TrimSpace(req.PeerIP))
+	if err != nil {
+		return fmt.Errorf("parse peer_ip: %w", err)
+	}
+
+	mtu := req.MTU
+	if mtu == 0 {
+		mtu = defaultMTU
+	}
+	if mtu < 576 {
+		return fmt.Errorf("mtu must be at least 576")
+	}
+
+	tunDev, ifName, cleanup, err := createConfiguredTUN(name, localIP, peerIP, mtu)
+	if err != nil {
+		return err
+	}
+	if err := a.dev.AttachTUN(tunDev); err != nil {
+		_ = tunDev.Close()
+		if cleanup != nil {
+			_ = cleanup()
+		}
+		return err
+	}
+
+	a.tun = &tunAttachment{
+		name:    ifName,
+		localIP: localIP,
+		peerIP:  peerIP,
+		mtu:     mtu,
+		cleanup: cleanup,
+	}
+	return nil
+}
+
+func (a *adminApp) detachTUN() error {
+	a.mu.Lock()
+	if a.tun == nil {
+		a.mu.Unlock()
+		return nil
+	}
+	tun := a.tun
+	a.tun = nil
+	a.mu.Unlock()
+
+	if err := a.dev.DetachTUN(); err != nil {
+		a.mu.Lock()
+		a.tun = tun
+		a.mu.Unlock()
+		return err
+	}
+	if tun.cleanup != nil {
+		return tun.cleanup()
+	}
+	return nil
+}
+
+func (a *adminApp) attachBind(req attachBindRequest) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.bind != nil {
+		return fmt.Errorf("a bind is already attached")
+	}
+
+	var port uint16
+	if req.ListenPort != nil {
+		port = *req.ListenPort
+	}
+	if err := a.dev.SetListenPort(port); err != nil {
+		return err
+	}
+
+	network := (&native.Config{}).Build()
+	bind := conn.NewDefaultBind(network)
+	if err := a.dev.AttachBind(bind); err != nil {
+		_ = network.Down()
+		return err
+	}
+
+	a.bind = &bindAttachment{
+		network:       network,
+		requestedPort: port,
+	}
+	return nil
+}
+
+func (a *adminApp) detachBind() error {
+	a.mu.Lock()
+	if a.bind == nil {
+		a.mu.Unlock()
+		return nil
+	}
+	bind := a.bind
+	a.bind = nil
+	a.mu.Unlock()
+
+	if err := a.dev.DetachBind(); err != nil {
+		a.mu.Lock()
+		a.bind = bind
+		a.mu.Unlock()
+		return err
+	}
+	if bind.network != nil {
+		return bind.network.Down()
+	}
+	return nil
+}
+
+func (a *adminApp) snapshot() appState {
+	cfg := a.dev.Config()
+
+	state := appState{
+		Device: deviceStateSummary{
+			PrivateKey: encodePrivateKey(cfg.PrivateKey),
+			ListenPort: cfg.ListenPort,
+			Fwmark:     cfg.Fwmark,
+			Peers:      make([]peerStateSummary, 0, len(cfg.Peers)),
+		},
+	}
+
+	for _, peer := range cfg.Peers {
+		allowedIPs := make([]string, 0, len(peer.AllowedIPs))
+		for _, prefix := range peer.AllowedIPs {
+			allowedIPs = append(allowedIPs, prefix.String())
+		}
+		state.Device.Peers = append(state.Device.Peers, peerStateSummary{
+			PublicKey:                   hex.EncodeToString(peer.PublicKey[:]),
+			PresharedKey:                hex.EncodeToString(peer.PresharedKey[:]),
+			ProtocolVersion:             peer.ProtocolVersion,
+			Endpoint:                    peer.Endpoint,
+			LastHandshakeTime:           peer.LastHandshakeTime.UTC().Format(time.RFC3339Nano),
+			TxBytes:                     peer.TxBytes,
+			RxBytes:                     peer.RxBytes,
+			PersistentKeepaliveInterval: peer.PersistentKeepaliveInterval,
+			AllowedIPs:                  allowedIPs,
+		})
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.tun != nil {
+		state.TUN = &tunStateSummary{
+			Name:    a.tun.name,
+			LocalIP: a.tun.localIP.String(),
+			PeerIP:  a.tun.peerIP.String(),
+			MTU:     a.tun.mtu,
+		}
+	}
+	if a.bind != nil {
+		state.Bind = &bindStateSummary{
+			Type:          "native-default",
+			RequestedPort: a.bind.requestedPort,
+			ListenPort:    a.dev.ListenPort(),
+		}
+	}
+
+	return state
+}
+
+func (a *adminApp) printPairingGuide() {
+	local := a.plan.Local
+	remote := a.plan.Remote
+
+	fmt.Println("Pairing Guide")
+	fmt.Printf("Use this instance as %s.\n", local.Label)
+	fmt.Printf("Use another instance as %s.\n", remote.Label)
+	fmt.Println()
+
+	printPeerPlan(local, remote)
+	fmt.Println()
+	printPeerPlan(remote, local)
+	fmt.Println()
+
+	fmt.Println("Endpoints")
+	fmt.Println("  Same machine:")
+	fmt.Printf("    %s peer endpoint: 127.0.0.1:%d\n", local.Label, remote.ListenPort)
+	fmt.Printf("    %s peer endpoint: 127.0.0.1:%d\n", remote.Label, local.ListenPort)
+	fmt.Println("  Different machines:")
+	fmt.Printf("    %s peer endpoint: <remote-host>:%d\n", local.Label, remote.ListenPort)
+	fmt.Printf("    %s peer endpoint: <remote-host>:%d\n", remote.Label, local.ListenPort)
+	fmt.Println()
+
+	fmt.Println("Steps")
+	fmt.Println("  1. Open this panel and the other instance panel.")
+	fmt.Printf("  2. In this panel, configure %s.\n", local.Label)
+	fmt.Printf("  3. In the other panel, configure %s.\n", remote.Label)
+	fmt.Println("  4. On each side: attach TUN, attach bind, create peer.")
+	fmt.Printf("  5. From %s, ping %s.\n", local.Label, local.PingTargetIP)
+	fmt.Printf("  6. From %s, ping %s.\n", remote.Label, remote.PingTargetIP)
+	fmt.Println()
+}
+
+func printPeerPlan(self, peer peerPlan) {
+	fmt.Printf("%s\n", strings.ToUpper(self.Label))
+	fmt.Printf("  private key: %s\n", self.PrivateKey)
+	fmt.Printf("  peer pubkey: %s\n", peer.PublicKey)
+	fmt.Printf("  tun name:    %s\n", self.TunName)
+	fmt.Printf("  tun local:   %s\n", self.LocalIP)
+	fmt.Printf("  tun peer:    %s\n", self.PeerIP)
+	fmt.Printf("  allowed ip:  %s\n", self.AllowedIP)
+	fmt.Printf("  listen port: %d\n", self.ListenPort)
+	fmt.Println("  protocol:    1")
+}
+
+func createConfiguredTUN(name string, localIP, peerIP netip.Addr, mtu int) (gtun.Tun, string, func() error, error) {
+	tunDev, err := tuntap.CreateTUN(name, mtu)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("create native tun: %w", err)
+	}
+
+	ifName, err := tunDev.Name()
+	if err != nil {
+		_ = tunDev.Close()
+		return nil, "", nil, fmt.Errorf("load tun name: %w", err)
+	}
+
+	cleanup, err := configurePlatformTUN(ifName, localIP, peerIP, mtu)
+	if err != nil {
+		_ = tunDev.Close()
+		return nil, "", nil, err
+	}
+
+	return tunDev, ifName, cleanup, nil
+}
+
+func parsePrivateKey(src string) (device.NoisePrivateKey, error) {
+	var key device.NoisePrivateKey
+	if err := key.FromHex(strings.TrimSpace(src)); err != nil {
+		return device.NoisePrivateKey{}, fmt.Errorf("parse private_key: %w", err)
+	}
+	return key, nil
+}
+
+func parsePublicKey(src string) (device.NoisePublicKey, error) {
+	var key device.NoisePublicKey
+	if err := key.FromHex(strings.TrimSpace(src)); err != nil {
+		return device.NoisePublicKey{}, fmt.Errorf("parse public_key: %w", err)
+	}
+	return key, nil
+}
+
+func parsePresharedKey(src string) (device.NoisePresharedKey, error) {
+	var key device.NoisePresharedKey
+	if err := key.FromHex(strings.TrimSpace(src)); err != nil {
+		return device.NoisePresharedKey{}, fmt.Errorf("parse preshared_key: %w", err)
+	}
+	return key, nil
+}
+
+func parsePrefixes(src []string) ([]netip.Prefix, error) {
+	prefixes := make([]netip.Prefix, 0, len(src))
+	for _, item := range src {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(item)
+		if err != nil {
+			return nil, fmt.Errorf("parse allowed_ip %q: %w", item, err)
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, nil
+}
+
+func encodePrivateKey(key device.NoisePrivateKey) string {
+	if key.IsZero() {
+		return ""
+	}
+	return hex.EncodeToString(key[:])
+}
+
+func newPairingPlan() (pairingPlan, error) {
+	localPrivate, localPublic, err := generateKeyPair()
+	if err != nil {
+		return pairingPlan{}, fmt.Errorf("generate local keypair: %w", err)
+	}
+	remotePrivate, remotePublic, err := generateKeyPair()
+	if err != nil {
+		return pairingPlan{}, fmt.Errorf("generate remote keypair: %w", err)
+	}
+
+	portBase, err := randomPortBase()
+	if err != nil {
+		return pairingPlan{}, fmt.Errorf("select suggested listen ports: %w", err)
+	}
+
+	localIP := netip.MustParseAddr("10.88.0.1")
+	remoteIP := netip.MustParseAddr("10.88.0.2")
+
+	return pairingPlan{
+		Local: peerPlan{
+			Label:        "node-a",
+			PrivateKey:   hex.EncodeToString(localPrivate[:]),
+			PublicKey:    hex.EncodeToString(localPublic[:]),
+			TunName:      "wgoadm-a",
+			LocalIP:      localIP,
+			PeerIP:       remoteIP,
+			AllowedIP:    netip.PrefixFrom(remoteIP, remoteIP.BitLen()),
+			ListenPort:   portBase,
+			PingTargetIP: remoteIP,
+		},
+		Remote: peerPlan{
+			Label:        "node-b",
+			PrivateKey:   hex.EncodeToString(remotePrivate[:]),
+			PublicKey:    hex.EncodeToString(remotePublic[:]),
+			TunName:      "wgoadm-b",
+			LocalIP:      remoteIP,
+			PeerIP:       localIP,
+			AllowedIP:    netip.PrefixFrom(localIP, localIP.BitLen()),
+			ListenPort:   portBase + 1,
+			PingTargetIP: localIP,
+		},
+	}, nil
+}
+
+func generateKeyPair() (device.NoisePrivateKey, device.NoisePublicKey, error) {
+	var privateKey device.NoisePrivateKey
+	if _, err := rand.Read(privateKey[:]); err != nil {
+		return device.NoisePrivateKey{}, device.NoisePublicKey{}, err
+	}
+	privateKey[0] &= 248
+	privateKey[31] = (privateKey[31] & 127) | 64
+
+	publicBytes, err := curve25519.X25519(privateKey[:], curve25519.Basepoint)
+	if err != nil {
+		return device.NoisePrivateKey{}, device.NoisePublicKey{}, err
+	}
+
+	var publicKey device.NoisePublicKey
+	copy(publicKey[:], publicBytes)
+	return privateKey, publicKey, nil
+}
+
+func randomPortBase() (uint16, error) {
+	var raw [2]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return 0, err
+	}
+
+	base := 20000 + int(raw[0])<<8 + int(raw[1])
+	base = 20000 + (base % 20000)
+	if base == 65535 {
+		base--
+	}
+	return uint16(base), nil
+}
+
+func decodeJSON(r *http.Request, dst any) error {
+	defer r.Body.Close()
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeError(w http.ResponseWriter, status int, err error) {
+	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+const indexHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wgo web admin</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4efe6;
+  --panel: rgba(255,255,255,0.88);
+  --ink: #16211f;
+  --accent: #0d6b57;
+  --accent-2: #c76b39;
+  --line: rgba(22,33,31,0.12);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "Iosevka Aile", "IBM Plex Sans", sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(199,107,57,0.18), transparent 30%),
+    radial-gradient(circle at top right, rgba(13,107,87,0.18), transparent 34%),
+    linear-gradient(180deg, #f8f5ef, var(--bg));
+  color: var(--ink);
+}
+main {
+  width: min(1100px, calc(100vw - 32px));
+  margin: 24px auto 48px;
+}
+h1, h2 { font-family: "IBM Plex Mono", monospace; }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 18px;
+  backdrop-filter: blur(10px);
+  box-shadow: 0 18px 40px rgba(22,33,31,0.08);
+}
+label, button, input, textarea {
+  display: block;
+  width: 100%;
+}
+label {
+  font-size: 13px;
+  margin-top: 12px;
+}
+input, textarea {
+  margin-top: 6px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,0.9);
+  font: inherit;
+}
+textarea { min-height: 110px; resize: vertical; }
+button {
+  margin-top: 14px;
+  border: 0;
+  border-radius: 999px;
+  padding: 11px 14px;
+  background: var(--accent);
+  color: white;
+  font: inherit;
+  cursor: pointer;
+}
+button.alt { background: var(--accent-2); }
+button.ghost {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+}
+#message {
+  min-height: 24px;
+  margin: 10px 0 20px;
+  font-family: "IBM Plex Mono", monospace;
+}
+</style>
+</head>
+<body>
+<main>
+  <h1>wgo localhost admin</h1>
+  <p>This panel uses typed <code>Device</code> methods directly. Native TUN actions require root or administrator privileges.</p>
+  <div id="message"></div>
+  <div class="grid">
+    <section class="panel">
+      <h2>Device</h2>
+      <label>Private key
+        <input id="private_key" placeholder="64 hex chars">
+      </label>
+      <label>Listen port
+        <input id="listen_port" type="number" min="0" max="65535" placeholder="0 for random">
+      </label>
+      <label>Fwmark
+        <input id="fwmark" type="number" min="0" placeholder="0">
+      </label>
+      <button onclick="saveDevice()">Apply device settings</button>
+    </section>
+
+    <section class="panel">
+      <h2>Peer</h2>
+      <label>Public key
+        <input id="peer_public_key" placeholder="64 hex chars">
+      </label>
+      <label>Preshared key
+        <input id="peer_preshared_key" placeholder="optional 64 hex chars">
+      </label>
+      <label>Endpoint
+        <input id="peer_endpoint" placeholder="127.0.0.1:51820">
+      </label>
+      <label>Protocol version
+        <input id="peer_protocol_version" type="number" min="1" value="1">
+      </label>
+      <label>Persistent keepalive interval
+        <input id="peer_keepalive" type="number" min="0" placeholder="seconds">
+      </label>
+      <label>Allowed IPs
+        <textarea id="peer_allowed_ips" placeholder="10.0.0.2/32&#10;fd00::2/128"></textarea>
+      </label>
+      <button onclick="applyPeer()">Create or update peer</button>
+      <button class="alt" onclick="deletePeer()">Delete peer</button>
+      <button class="ghost" onclick="deleteAllPeers()">Delete all peers</button>
+    </section>
+
+    <section class="panel">
+      <h2>Native TUN</h2>
+      <label>Name
+        <input id="tun_name" value="wgoadm0">
+      </label>
+      <label>Local IP
+        <input id="tun_local_ip" value="10.77.0.1">
+      </label>
+      <label>Peer IP
+        <input id="tun_peer_ip" value="10.77.0.2">
+      </label>
+      <label>MTU
+        <input id="tun_mtu" type="number" min="576" value="1420">
+      </label>
+      <button onclick="attachTun()">Create and attach native TUN</button>
+      <button class="alt" onclick="detachTun()">Detach and destroy TUN</button>
+    </section>
+
+    <section class="panel">
+      <h2>Bind</h2>
+      <label>Listen port
+        <input id="bind_port" type="number" min="0" max="65535" placeholder="empty or 0 for random">
+      </label>
+      <button onclick="attachBind()">Attach native bind</button>
+      <button class="alt" onclick="detachBind()">Detach bind</button>
+    </section>
+
+    <section class="panel" style="grid-column: 1 / -1;">
+      <h2>State</h2>
+      <pre id="state"></pre>
+    </section>
+  </div>
+</main>
+<script>
+const stateEl = document.getElementById('state');
+const messageEl = document.getElementById('message');
+
+function lines(text) {
+  return text.split(/\n|,/).map(v => v.trim()).filter(Boolean);
+}
+
+function numValue(id) {
+  const raw = document.getElementById(id).value.trim();
+  if (raw === '') return null;
+  return Number(raw);
+}
+
+async function post(path, body) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body || {})
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'request failed');
+  }
+  return data;
+}
+
+async function refresh() {
+  const res = await fetch('/api/state');
+  const data = await res.json();
+  stateEl.textContent = JSON.stringify(data, null, 2);
+}
+
+function showMessage(text, isError) {
+  messageEl.textContent = text;
+  messageEl.style.color = isError ? '#9f1d35' : '#0d6b57';
+}
+
+async function run(action) {
+  try {
+    await action();
+    showMessage('ok', false);
+    await refresh();
+  } catch (err) {
+    showMessage(err.message, true);
+  }
+}
+
+function saveDevice() {
+  run(() => post('/api/device', {
+    private_key: document.getElementById('private_key').value.trim() || null,
+    listen_port: numValue('listen_port'),
+    fwmark: numValue('fwmark')
+  }));
+}
+
+function applyPeer() {
+  run(() => post('/api/peers/apply', {
+    public_key: document.getElementById('peer_public_key').value.trim(),
+    preshared_key: document.getElementById('peer_preshared_key').value.trim() || null,
+    endpoint: document.getElementById('peer_endpoint').value.trim() || null,
+    protocol_version: numValue('peer_protocol_version'),
+    persistent_keepalive_interval: numValue('peer_keepalive'),
+    allowed_ips: lines(document.getElementById('peer_allowed_ips').value),
+    replace_allowed_ips: true
+  }));
+}
+
+function deletePeer() {
+  run(() => post('/api/peers/delete', {
+    public_key: document.getElementById('peer_public_key').value.trim()
+  }));
+}
+
+function deleteAllPeers() {
+  run(() => post('/api/peers/delete_all', {}));
+}
+
+function attachTun() {
+  run(() => post('/api/tun/attach', {
+    name: document.getElementById('tun_name').value.trim(),
+    local_ip: document.getElementById('tun_local_ip').value.trim(),
+    peer_ip: document.getElementById('tun_peer_ip').value.trim(),
+    mtu: numValue('tun_mtu') || 1420
+  }));
+}
+
+function detachTun() {
+  run(() => post('/api/tun/detach', {}));
+}
+
+function attachBind() {
+  run(() => post('/api/bind/attach', {
+    listen_port: numValue('bind_port')
+  }));
+}
+
+function detachBind() {
+  run(() => post('/api/bind/detach', {}));
+}
+
+refresh();
+</script>
+</body>
+</html>`
+
+func init() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+}

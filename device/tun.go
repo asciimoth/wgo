@@ -22,7 +22,26 @@ func (device *Device) RoutineTUNEventReader(tun *tunState) {
 
 	device.log.Debugf("Routine: event worker - started")
 
-	for event := range tun.device.Events() {
+	for {
+		var (
+			event gtun.Event
+			ok    bool
+		)
+		select {
+		case <-tun.stop:
+			return
+		case event, ok = <-tun.device.Events():
+			if !ok {
+				return
+			}
+		}
+
+		select {
+		case <-tun.stop:
+			return
+		default:
+		}
+
 		if event&gtun.EventMTUUpdate != 0 {
 			mtu, err := tun.device.MTU()
 			if err != nil {

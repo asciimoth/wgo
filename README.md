@@ -51,4 +51,8 @@ fmt.Println("listen port:", cfg.ListenPort)
 fmt.Println("peer endpoint:", cfg.Peers[0].Endpoint)
 ```
 
-For a complete runnable example using the typed methods, see [examples/internal/e2e/e2e.go](/home/moth/projects/wgo/examples/internal/e2e/e2e.go) and [examples/http_request/main.go](/home/moth/projects/wgo/examples/http_request/main.go).
+For complete runnable examples using the typed methods, see:
+
+- [examples/internal/e2e/e2e.go](/home/moth/projects/wgo/examples/internal/e2e/e2e.go)
+- [examples/http_request/main.go](/home/moth/projects/wgo/examples/http_request/main.go)
+- [examples/web_admin/main.go](/home/moth/projects/wgo/examples/web_admin/main.go) for a localhost web admin panel that starts with no attached TUN or bind and can attach native resources at runtime
