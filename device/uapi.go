@@ -121,7 +121,7 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 
 	defer func() {
 		if err != nil {
-			device.log.Errorf("%v", err)
+			device.log.Errf("%v", err)
 		}
 	}()
 
@@ -180,7 +180,7 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set private_key: %w", err)
 		}
-		device.log.Verbosef("UAPI: Updating private key")
+		device.log.Debugf("UAPI: Updating private key")
 		if err := device.SetPrivateKey(sk); err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set private_key: %w", err)
 		}
@@ -192,7 +192,7 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		}
 
 		// update port and rebind
-		device.log.Verbosef("UAPI: Updating listen port")
+		device.log.Debugf("UAPI: Updating listen port")
 		if err := device.setListenPortLocked(uint16(port)); err != nil {
 			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to set listen_port: %w", err)
 		}
@@ -203,7 +203,7 @@ func (device *Device) handleDeviceLine(key, value string) error {
 			return ipcErrorf(ipc.IpcErrorInvalid, "invalid fwmark: %w", err)
 		}
 
-		device.log.Verbosef("UAPI: Updating fwmark")
+		device.log.Debugf("UAPI: Updating fwmark")
 		if err := device.setFwmarkLocked(uint32(mark)); err != nil {
 			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to update fwmark: %w", err)
 		}
@@ -212,7 +212,7 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		if value != "true" {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set replace_peers, invalid value: %v", value)
 		}
-		device.log.Verbosef("UAPI: Removing all peers")
+		device.log.Debugf("UAPI: Removing all peers")
 		device.RemoveAllPeers()
 
 	default:
@@ -271,7 +271,7 @@ func (device *Device) handlePublicKeyLine(peer *ipcSetPeer, value string) error 
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to create new peer: %w", err)
 		}
-		device.log.Verbosef("%v - UAPI: Created", peer.Peer)
+		device.log.Debugf("%v - UAPI: Created", peer.Peer)
 	}
 	return nil
 }
@@ -295,14 +295,14 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set remove, invalid value: %v", value)
 		}
 		if !peer.dummy {
-			device.log.Verbosef("%v - UAPI: Removing", peer.Peer)
+			device.log.Debugf("%v - UAPI: Removing", peer.Peer)
 			device.RemovePeer(peer.handshake.remoteStatic)
 		}
 		peer.Peer = &Peer{}
 		peer.dummy = true
 
 	case "preshared_key":
-		device.log.Verbosef("%v - UAPI: Updating preshared key", peer.Peer)
+		device.log.Debugf("%v - UAPI: Updating preshared key", peer.Peer)
 		var presharedKey NoisePresharedKey
 		err := presharedKey.FromHex(value)
 		if err != nil {
@@ -316,7 +316,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		}
 
 	case "endpoint":
-		device.log.Verbosef("%v - UAPI: Updating endpoint", peer.Peer)
+		device.log.Debugf("%v - UAPI: Updating endpoint", peer.Peer)
 		if peer.dummy {
 			return nil
 		}
@@ -325,7 +325,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		}
 
 	case "persistent_keepalive_interval":
-		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval", peer.Peer)
+		device.log.Debugf("%v - UAPI: Updating persistent keepalive interval", peer.Peer)
 
 		secs, err := strconv.ParseUint(value, 10, 16)
 		if err != nil {
@@ -342,7 +342,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		peer.pkaOn = old == 0 && secs != 0
 
 	case "replace_allowed_ips":
-		device.log.Verbosef("%v - UAPI: Removing all allowedips", peer.Peer)
+		device.log.Debugf("%v - UAPI: Removing all allowedips", peer.Peer)
 		if value != "true" {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to replace allowedips, invalid value: %v", value)
 		}
@@ -361,7 +361,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 			verb = "Removing"
 			value = value[1:]
 		}
-		device.log.Verbosef("%v - UAPI: %s allowedip", peer.Peer, verb)
+		device.log.Debugf("%v - UAPI: %s allowedip", peer.Peer, verb)
 		prefix, err := netip.ParsePrefix(value)
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set allowed ip: %w", err)
@@ -444,7 +444,7 @@ func (device *Device) IpcHandle(socket net.Conn) {
 			}
 			err = device.IpcGetOperation(buffered.Writer)
 		default:
-			device.log.Errorf("invalid UAPI operation: %v", op)
+			device.log.Errf("invalid UAPI operation: %v", op)
 			return
 		}
 
@@ -455,7 +455,7 @@ func (device *Device) IpcHandle(socket net.Conn) {
 			status = ipcErrorf(ipc.IpcErrorUnknown, "other UAPI error: %w", err)
 		}
 		if status != nil {
-			device.log.Errorf("%v", status)
+			device.log.Errf("%v", status)
 			fmt.Fprintf(buffered, "errno=%d\n\n", status.ErrorCode())
 		} else {
 			fmt.Fprintf(buffered, "errno=0\n\n")

@@ -15,22 +15,22 @@ const DefaultMTU = 1420
 
 func (device *Device) RoutineTUNEventReader(tun *tunState) {
 	defer func() {
-		device.log.Verbosef("Routine: event worker - stopped")
+		device.log.Debugf("Routine: event worker - stopped")
 		tun.wg.Done()
 		device.state.stopping.Done()
 	}()
 
-	device.log.Verbosef("Routine: event worker - started")
+	device.log.Debugf("Routine: event worker - started")
 
 	for event := range tun.device.Events() {
 		if event&gtun.EventMTUUpdate != 0 {
 			mtu, err := tun.device.MTU()
 			if err != nil {
-				device.log.Errorf("Failed to load updated MTU of device: %v", err)
+				device.log.Errf("Failed to load updated MTU of device: %v", err)
 				continue
 			}
 			if mtu < 0 {
-				device.log.Errorf("MTU not updated to negative value: %v", mtu)
+				device.log.Errf("MTU not updated to negative value: %v", mtu)
 				continue
 			}
 			var tooLarge string
@@ -40,17 +40,17 @@ func (device *Device) RoutineTUNEventReader(tun *tunState) {
 			}
 			old := device.tun.mtu.Swap(int32(mtu))
 			if int(old) != mtu {
-				device.log.Verbosef("MTU updated: %v%s", mtu, tooLarge)
+				device.log.Debugf("MTU updated: %v%s", mtu, tooLarge)
 			}
 		}
 
 		if event&gtun.EventUp != 0 {
-			device.log.Verbosef("Interface up requested")
+			device.log.Debugf("Interface up requested")
 			device.Up()
 		}
 
 		if event&gtun.EventDown != 0 {
-			device.log.Verbosef("Interface down requested")
+			device.log.Debugf("Interface down requested")
 			device.Down()
 		}
 	}

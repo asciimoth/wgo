@@ -6,43 +6,129 @@
 package device
 
 import (
+	"fmt"
 	"log"
 	"os"
 )
 
-// A Logger provides logging for a Device.
-// The functions are Printf-style functions.
-// They must be safe for concurrent use.
-// They do not require a trailing newline in the format.
-// If nil, that level of logging will be silent.
-type Logger struct {
-	Verbosef func(format string, args ...any)
-	Errorf   func(format string, args ...any)
+// Logger provides logging for a Device.
+// Implementations must be safe for concurrent use.
+type Logger interface {
+	Debug(args ...any)
+	Debugf(format string, args ...any)
+	Info(args ...any)
+	Infof(format string, args ...any)
+	Warn(args ...any)
+	Warnf(format string, args ...any)
+	Err(args ...any)
+	Errf(format string, args ...any)
+	Fatal(args ...any)
+	Fatalf(format string, args ...any)
 }
 
 // Log levels for use with NewLogger.
+type LogLevel int
+
 const (
-	LogLevelSilent = iota
+	LogLevelSilent LogLevel = iota
 	LogLevelError
-	LogLevelVerbose
+	LogLevelWarn
+	LogLevelInfo
+	LogLevelDebug
 )
 
-// Function for use in Logger for discarding logged lines.
-func DiscardLogf(format string, args ...any) {}
+// Backward-compatible alias for the old verbose level.
+const LogLevelVerbose = LogLevelDebug
 
-// NewLogger constructs a Logger that writes to stdout.
+// NopLogger discards all log output.
+type NopLogger struct{}
+
+func (NopLogger) Debug(args ...any)                 {}
+func (NopLogger) Debugf(format string, args ...any) {}
+func (NopLogger) Info(args ...any)                  {}
+func (NopLogger) Infof(format string, args ...any)  {}
+func (NopLogger) Warn(args ...any)                  {}
+func (NopLogger) Warnf(format string, args ...any)  {}
+func (NopLogger) Err(args ...any)                   {}
+func (NopLogger) Errf(format string, args ...any)   {}
+func (NopLogger) Fatal(args ...any)                 {}
+func (NopLogger) Fatalf(format string, args ...any) {}
+
+// DefaultLogger writes log lines to stdout with a severity prefix.
+type DefaultLogger struct {
+	level   LogLevel
+	loggers map[LogLevel]*log.Logger
+}
+
+// NewLogger constructs the default stdout logger.
 // It logs at the specified log level and above.
 // It decorates log lines with the log level, date, time, and prepend.
-func NewLogger(level int, prepend string) *Logger {
-	logger := &Logger{DiscardLogf, DiscardLogf}
-	logf := func(prefix string) func(string, ...any) {
-		return log.New(os.Stdout, prefix+": "+prepend, log.Ldate|log.Ltime).Printf
+func NewLogger(level LogLevel, prepend string) Logger {
+	makeLogger := func(prefix string) *log.Logger {
+		return log.New(os.Stdout, prefix+": "+prepend, log.Ldate|log.Ltime)
 	}
-	if level >= LogLevelVerbose {
-		logger.Verbosef = logf("DEBUG")
+	return &DefaultLogger{
+		level: level,
+		loggers: map[LogLevel]*log.Logger{
+			LogLevelError: makeLogger("ERROR"),
+			LogLevelWarn:  makeLogger("WARN"),
+			LogLevelInfo:  makeLogger("INFO"),
+			LogLevelDebug: makeLogger("DEBUG"),
+		},
 	}
-	if level >= LogLevelError {
-		logger.Errorf = logf("ERROR")
+}
+
+func loggerOrNop(logger Logger) Logger {
+	if logger == nil {
+		return NopLogger{}
 	}
 	return logger
+}
+
+func (l *DefaultLogger) enabled(level LogLevel) bool {
+	return l != nil && l.level >= level && level != LogLevelSilent
+}
+
+func (l *DefaultLogger) output(level LogLevel, message string) {
+	if !l.enabled(level) {
+		return
+	}
+	_ = l.loggers[level].Output(3, message)
+}
+
+func (l *DefaultLogger) outputf(level LogLevel, format string, args ...any) {
+	if !l.enabled(level) {
+		return
+	}
+	_ = l.loggers[level].Output(3, fmt.Sprintf(format, args...))
+}
+
+func (l *DefaultLogger) Debug(args ...any) { l.output(LogLevelDebug, fmt.Sprint(args...)) }
+func (l *DefaultLogger) Debugf(format string, args ...any) {
+	l.outputf(LogLevelDebug, format, args...)
+}
+
+func (l *DefaultLogger) Info(args ...any) { l.output(LogLevelInfo, fmt.Sprint(args...)) }
+func (l *DefaultLogger) Infof(format string, args ...any) {
+	l.outputf(LogLevelInfo, format, args...)
+}
+
+func (l *DefaultLogger) Warn(args ...any) { l.output(LogLevelWarn, fmt.Sprint(args...)) }
+func (l *DefaultLogger) Warnf(format string, args ...any) {
+	l.outputf(LogLevelWarn, format, args...)
+}
+
+func (l *DefaultLogger) Err(args ...any) { l.output(LogLevelError, fmt.Sprint(args...)) }
+func (l *DefaultLogger) Errf(format string, args ...any) {
+	l.outputf(LogLevelError, format, args...)
+}
+
+func (l *DefaultLogger) Fatal(args ...any) {
+	l.output(LogLevelError, fmt.Sprint(args...))
+	os.Exit(1)
+}
+
+func (l *DefaultLogger) Fatalf(format string, args ...any) {
+	l.outputf(LogLevelError, format, args...)
+	os.Exit(1)
 }

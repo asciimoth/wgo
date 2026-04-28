@@ -90,7 +90,7 @@ type Device struct {
 
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
-	log      *Logger
+	log      Logger
 }
 
 type tunState struct {
@@ -159,7 +159,7 @@ func (device *Device) changeState(want deviceState) (err error) {
 	old := device.deviceState()
 	if old == deviceStateClosed {
 		// once closed, always closed
-		device.log.Verbosef("Interface closed, ignored requested state %s", want)
+		device.log.Debugf("Interface closed, ignored requested state %s", want)
 		return nil
 	}
 	switch want {
@@ -179,7 +179,7 @@ func (device *Device) changeState(want deviceState) (err error) {
 			err = errDown
 		}
 	}
-	device.log.Verbosef("Interface state was %s, requested %s, now %s", old, want, device.deviceState())
+	device.log.Debugf("Interface state was %s, requested %s, now %s", old, want, device.deviceState())
 	return
 }
 
@@ -187,11 +187,11 @@ func (device *Device) changeState(want deviceState) (err error) {
 // The caller must hold device.state.mu and is responsible for updating device.state.state.
 func (device *Device) upLocked() error {
 	if err := device.BindUpdate(); err != nil {
-		device.log.Errorf("Unable to update bind: %v", err)
+		device.log.Errf("Unable to update bind: %v", err)
 		return err
 	}
 	if device.net.bind == nil {
-		device.log.Verbosef("Interface is up without an attached bind")
+		device.log.Debugf("Interface is up without an attached bind")
 		return nil
 	}
 
@@ -216,7 +216,7 @@ func (device *Device) upLocked() error {
 func (device *Device) downLocked() error {
 	err := device.BindClose()
 	if err != nil {
-		device.log.Errorf("Bind close failed: %v", err)
+		device.log.Errf("Bind close failed: %v", err)
 	}
 
 	device.peers.RLock()
@@ -340,7 +340,7 @@ func newTunState(tunDevice gtun.Tun) (*tunState, error) {
 	return state, nil
 }
 
-func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger *Logger) *Device {
+func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
 	tunState, err := newTunState(tunDevice)
 	if err != nil {
 		panic(fmt.Sprintf("device.NewDevice: %v", err))
@@ -349,7 +349,7 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger *Logger) *Device {
 	device := new(Device)
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
-	device.log = logger
+	device.log = loggerOrNop(logger)
 	device.net.bind = bind
 	device.batchSize = 256
 	if device.batchSize < conn.IdealBatchSize {
@@ -364,7 +364,7 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger *Logger) *Device {
 	device.tun.device.Store(tunState)
 	mtu, err := tunDevice.MTU()
 	if err != nil {
-		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
+		device.log.Errf("Trouble determining MTU, assuming default: %v", err)
 		mtu = DefaultMTU
 	}
 	device.tun.mtu.Store(int32(mtu))
@@ -442,7 +442,7 @@ func (device *Device) Close() {
 		return
 	}
 	device.state.state.Store(uint32(deviceStateClosed))
-	device.log.Verbosef("Device closing")
+	device.log.Debugf("Device closing")
 
 	device.stopTUN(device.tun.device.Swap(nil))
 	device.downLocked()
@@ -461,7 +461,7 @@ func (device *Device) Close() {
 
 	device.rate.limiter.Close()
 
-	device.log.Verbosef("Device closed")
+	device.log.Debugf("Device closed")
 	close(device.closed)
 }
 
@@ -549,7 +549,7 @@ func (device *Device) BindUpdate() error {
 	}
 	if device.net.bind == nil {
 		device.net.port = 0
-		device.log.Verbosef("Bind update skipped: no bind attached")
+		device.log.Debugf("Bind update skipped: no bind attached")
 		return nil
 	}
 
@@ -595,7 +595,7 @@ func (device *Device) BindUpdate() error {
 		go device.RoutineReceiveIncoming(batchSize, fn)
 	}
 
-	device.log.Verbosef("UDP bind has been updated")
+	device.log.Debugf("UDP bind has been updated")
 	return nil
 }
 
@@ -639,7 +639,7 @@ func (device *Device) stopTUN(tun *tunState) {
 	}
 	close(tun.stop)
 	if err := tun.device.Close(); err != nil && !device.isClosed() {
-		device.log.Verbosef("Failed to close TUN device: %v", err)
+		device.log.Debugf("Failed to close TUN device: %v", err)
 	}
 	tun.wg.Wait()
 }
@@ -660,7 +660,7 @@ func (device *Device) ReplaceTUN(tunDevice gtun.Tun) error {
 	}
 	mtu, err := tunDevice.MTU()
 	if err != nil {
-		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
+		device.log.Errf("Trouble determining MTU, assuming default: %v", err)
 		mtu = DefaultMTU
 	}
 
@@ -675,7 +675,7 @@ func (device *Device) ReplaceTUN(tunDevice gtun.Tun) error {
 	device.tun.mtu.Store(int32(mtu))
 	device.startTUN(tunState)
 	device.stopTUN(old)
-	device.log.Verbosef("TUN device replaced")
+	device.log.Debugf("TUN device replaced")
 	return nil
 }
 
@@ -690,7 +690,7 @@ func (device *Device) AttachTUN(tunDevice gtun.Tun) error {
 	}
 	mtu, err := tunDevice.MTU()
 	if err != nil {
-		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
+		device.log.Errf("Trouble determining MTU, assuming default: %v", err)
 		mtu = DefaultMTU
 	}
 
@@ -708,7 +708,7 @@ func (device *Device) AttachTUN(tunDevice gtun.Tun) error {
 	device.tun.device.Store(tunState)
 	device.tun.mtu.Store(int32(mtu))
 	device.startTUN(tunState)
-	device.log.Verbosef("TUN device attached")
+	device.log.Debugf("TUN device attached")
 	return nil
 }
 
@@ -725,7 +725,7 @@ func (device *Device) DetachTUN() error {
 	}
 	device.tun.mtu.Store(int32(DefaultMTU))
 	device.stopTUN(old)
-	device.log.Verbosef("TUN device detached")
+	device.log.Debugf("TUN device detached")
 	return nil
 }
 
@@ -763,7 +763,7 @@ func (device *Device) ReplaceBind(bind conn.Bind) error {
 		}
 	}
 
-	device.log.Verbosef("Bind replaced")
+	device.log.Debugf("Bind replaced")
 	return nil
 }
 
@@ -798,7 +798,7 @@ func (device *Device) AttachBind(bind conn.Bind) error {
 		}
 	}
 
-	device.log.Verbosef("Bind attached")
+	device.log.Debugf("Bind attached")
 	return nil
 }
 
@@ -818,6 +818,6 @@ func (device *Device) DetachBind() error {
 	}
 
 	device.swapBindLocked(nil)
-	device.log.Verbosef("Bind detached")
+	device.log.Debugf("Bind detached")
 	return nil
 }
