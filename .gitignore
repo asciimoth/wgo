@@ -39,4 +39,8 @@ example/linux/linux
 example/windows/windows
 example/windows-pair-load/windows-pair-load
 example/linux-pair-load/linux-pair-load
+example/native_tun_pair/native_tun_pair
+example/http_request/http_request
+example/tcp_pingpong/tcp_pingpong
+example/udp_pingpong/udp_pingpong
 
