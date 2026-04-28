@@ -190,6 +190,10 @@ func (device *Device) upLocked() error {
 		device.log.Errorf("Unable to update bind: %v", err)
 		return err
 	}
+	if device.net.bind == nil {
+		device.log.Verbosef("Interface is up without an attached bind")
+		return nil
+	}
 
 	// The IPC set operation waits for peers to be created before calling Start() on them,
 	// so if there's a concurrent IPC set request happening, we should wait for it to complete.
@@ -347,7 +351,13 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger *Logger) *Device {
 	device.closed = make(chan struct{})
 	device.log = logger
 	device.net.bind = bind
-	device.batchSize = bind.BatchSize()
+	device.batchSize = 256
+	if device.batchSize < conn.IdealBatchSize {
+		device.batchSize = conn.IdealBatchSize
+	}
+	if bind != nil && device.batchSize < bind.BatchSize() {
+		device.batchSize = bind.BatchSize()
+	}
 	if tunBatchSize := tunDevice.BatchSize(); device.batchSize < tunBatchSize {
 		device.batchSize = tunBatchSize
 	}
@@ -537,6 +547,11 @@ func (device *Device) BindUpdate() error {
 	if !device.isUp() {
 		return nil
 	}
+	if device.net.bind == nil {
+		device.net.port = 0
+		device.log.Verbosef("Bind update skipped: no bind attached")
+		return nil
+	}
 
 	// bind to new port
 	var err error
@@ -589,6 +604,25 @@ func (device *Device) BindClose() error {
 	err := closeBindLocked(device)
 	device.net.Unlock()
 	return err
+}
+
+func (device *Device) rebindPeerEndpointsLocked(bind conn.Bind) error {
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+
+	for _, peer := range device.peers.keyMap {
+		if err := peer.rebindEndpoint(bind); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (device *Device) swapBindLocked(bind conn.Bind) {
+	device.net.bind = bind
+	if bind == nil {
+		device.net.port = 0
+	}
 }
 
 func (device *Device) startTUN(tun *tunState) {
@@ -692,5 +726,98 @@ func (device *Device) DetachTUN() error {
 	device.tun.mtu.Store(int32(DefaultMTU))
 	device.stopTUN(old)
 	device.log.Verbosef("TUN device detached")
+	return nil
+}
+
+// ReplaceBind atomically swaps the active bind attachment.
+// If the device is up, active peer sessions are restarted around the transition.
+func (device *Device) ReplaceBind(bind conn.Bind) error {
+	if bind == nil {
+		return device.DetachBind()
+	}
+	if bind.BatchSize() > device.BatchSize() {
+		return fmt.Errorf("replacement bind batch size %d exceeds device batch size %d", bind.BatchSize(), device.BatchSize())
+	}
+
+	device.state.Lock()
+	defer device.state.Unlock()
+	if device.isClosed() {
+		return fmt.Errorf("device is closed")
+	}
+
+	wasUp := device.isUp()
+	if wasUp {
+		if err := device.downLocked(); err != nil {
+			return err
+		}
+	}
+
+	device.swapBindLocked(bind)
+	if err := device.rebindPeerEndpointsLocked(bind); err != nil {
+		return err
+	}
+
+	if wasUp {
+		if err := device.upLocked(); err != nil {
+			return err
+		}
+	}
+
+	device.log.Verbosef("Bind replaced")
+	return nil
+}
+
+// AttachBind attaches a bind to a device that is currently detached.
+func (device *Device) AttachBind(bind conn.Bind) error {
+	if bind == nil {
+		return fmt.Errorf("bind is nil")
+	}
+	if bind.BatchSize() > device.BatchSize() {
+		return fmt.Errorf("replacement bind batch size %d exceeds device batch size %d", bind.BatchSize(), device.BatchSize())
+	}
+
+	device.state.Lock()
+	defer device.state.Unlock()
+	if device.isClosed() {
+		return fmt.Errorf("device is closed")
+	}
+	if device.net.bind != nil {
+		return fmt.Errorf("device already has a bind attached")
+	}
+
+	device.swapBindLocked(bind)
+	if err := device.rebindPeerEndpointsLocked(bind); err != nil {
+		device.swapBindLocked(nil)
+		return err
+	}
+
+	if device.isUp() {
+		if err := device.upLocked(); err != nil {
+			device.swapBindLocked(nil)
+			return err
+		}
+	}
+
+	device.log.Verbosef("Bind attached")
+	return nil
+}
+
+// DetachBind closes and removes the currently attached bind, if any.
+// If the device is up, active peer sessions are stopped until another bind is attached.
+func (device *Device) DetachBind() error {
+	device.state.Lock()
+	defer device.state.Unlock()
+	if device.isClosed() {
+		return fmt.Errorf("device is closed")
+	}
+
+	if device.isUp() {
+		if err := device.downLocked(); err != nil {
+			return err
+		}
+	}
+
+	device.swapBindLocked(nil)
+	device.log.Verbosef("Bind detached")
 	return nil
 }

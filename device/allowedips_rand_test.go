@@ -84,30 +84,38 @@ func TestTrieRandom(t *testing.T) {
 	var allowedIPs AllowedIPs
 
 	rng := rand.New(rand.NewSource(1))
+	numberOfAddresses := NumberOfAddresses
+	numberOfTests := NumberOfTests
+	if raceEnabled {
+		// Keep the randomized cross-check meaningful without letting the
+		// O(prefixes) reference implementation dominate long -race runs.
+		numberOfAddresses /= 2
+		numberOfTests /= 10
+	}
 
 	for n := 0; n < NumberOfPeers; n++ {
 		peers = append(peers, &Peer{})
 	}
 
-	for n := 0; n < NumberOfAddresses; n++ {
+	for n := 0; n < numberOfAddresses; n++ {
 		var addr4 [4]byte
 		rng.Read(addr4[:])
-		cidr := uint8(rand.Intn(32) + 1)
-		index := rand.Intn(NumberOfPeers)
+		cidr := uint8(rng.Intn(32) + 1)
+		index := rng.Intn(NumberOfPeers)
 		allowedIPs.Insert(netip.PrefixFrom(netip.AddrFrom4(addr4), int(cidr)), peers[index])
 		slow4 = slow4.Insert(addr4[:], cidr, peers[index])
 
 		var addr6 [16]byte
 		rng.Read(addr6[:])
-		cidr = uint8(rand.Intn(128) + 1)
-		index = rand.Intn(NumberOfPeers)
+		cidr = uint8(rng.Intn(128) + 1)
+		index = rng.Intn(NumberOfPeers)
 		allowedIPs.Insert(netip.PrefixFrom(netip.AddrFrom16(addr6), int(cidr)), peers[index])
 		slow6 = slow6.Insert(addr6[:], cidr, peers[index])
 	}
 
 	var p int
 	for p = 0; ; p++ {
-		for n := 0; n < NumberOfTests; n++ {
+		for n := 0; n < numberOfTests; n++ {
 			var addr4 [4]byte
 			rng.Read(addr4[:])
 			peer1 := slow4.Lookup(addr4[:])

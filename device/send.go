@@ -186,10 +186,15 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 
 	packet := make([]byte, MessageCookieReplySize)
 	_ = reply.marshal(packet)
+	device.net.RLock()
+	bind := device.net.bind
+	device.net.RUnlock()
+	if bind == nil {
+		return nil
+	}
 	// TODO: allocation could be avoided
-	device.net.bind.Send([][]byte{packet}, initiatingElem.endpoint)
+	return bind.Send([][]byte{packet}, initiatingElem.endpoint)
 
-	return nil
 }
 
 func (peer *Peer) keepKeyFreshSending() {

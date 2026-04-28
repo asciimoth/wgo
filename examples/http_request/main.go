@@ -64,6 +64,15 @@ func main() {
 		log.Fatal(err)
 	}
 
+	log.Printf("swapping WireGuard binds to native default binds")
+	if err := pair.SwapBindsToNative(); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := doRequest("after native bind swap", pair.SecondNet, url); err != nil {
+		log.Fatal(err)
+	}
+
 	if err := server.Shutdown(context.Background()); err != nil {
 		log.Fatal(err)
 	}

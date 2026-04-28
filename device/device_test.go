@@ -813,6 +813,45 @@ func (b *fakeBindSized) Send(bufs [][]byte, ep conn.Endpoint) error    { return 
 func (b *fakeBindSized) ParseEndpoint(s string) (conn.Endpoint, error) { return nil, nil }
 func (b *fakeBindSized) BatchSize() int                                { return b.size }
 
+type fakeBindEndpoint struct {
+	bindID string
+	dst    string
+}
+
+func (e fakeBindEndpoint) ClearSrc()           {}
+func (e fakeBindEndpoint) SrcToString() string { return "" }
+func (e fakeBindEndpoint) DstToString() string { return e.dst }
+func (e fakeBindEndpoint) DstToBytes() []byte  { return []byte(e.dst) }
+func (e fakeBindEndpoint) DstIP() netip.Addr   { return netip.MustParseAddr("127.0.0.1") }
+func (e fakeBindEndpoint) SrcIP() netip.Addr   { return netip.Addr{} }
+
+type fakeTransitionBind struct {
+	id        string
+	size      int
+	openCount atomic.Int32
+}
+
+func (b *fakeTransitionBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
+	b.openCount.Add(1)
+	return nil, port, nil
+}
+
+func (b *fakeTransitionBind) Close() error { return nil }
+func (b *fakeTransitionBind) SetMark(mark uint32) error {
+	return nil
+}
+func (b *fakeTransitionBind) Send(bufs [][]byte, ep conn.Endpoint) error {
+	typed, ok := ep.(fakeBindEndpoint)
+	if !ok || typed.bindID != b.id {
+		return conn.ErrWrongEndpointType
+	}
+	return nil
+}
+func (b *fakeTransitionBind) ParseEndpoint(s string) (conn.Endpoint, error) {
+	return fakeBindEndpoint{bindID: b.id, dst: s}, nil
+}
+func (b *fakeTransitionBind) BatchSize() int { return b.size }
+
 type fakeTUNDeviceSized struct {
 	size int
 	mwo  int
@@ -1053,6 +1092,115 @@ func TestDeviceDetachAndAttachTUN(t *testing.T) {
 
 	pair.Send(t, Ping, nil)
 	pair.Send(t, Pong, nil)
+}
+
+func TestDeviceDetachAndAttachBind(t *testing.T) {
+	t.Parallel()
+
+	ips := [2]netip.Addr{
+		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
+		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
+	}
+	tuns := [2]*channelTUN{
+		newChannelTUN(),
+		newChannelTUN(),
+	}
+	binds := bindtest.NewChannelBinds()
+	key0 := mustPrivateKey(t, 0)
+	key1 := mustPrivateKey(t, 1)
+	pub0 := key0.publicKey()
+	pub1 := key1.publicKey()
+	devs := newDevicePairForTUNsAndBinds(t, tuns[0].TUN(), tuns[1].TUN(), ips, binds)
+
+	for i := range devs {
+		if err := devs[i].DetachBind(); err != nil {
+			t.Fatalf("DetachBind(%d): %v", i, err)
+		}
+		if devs[i].Bind() != nil {
+			t.Fatalf("expected device %d bind to be detached", i)
+		}
+		select {
+		case <-devs[i].Wait():
+			t.Fatalf("device %d closed after bind detach", i)
+		default:
+		}
+	}
+
+	replacementBinds := bindtest.NewChannelBinds()
+	for i := range devs {
+		if err := devs[i].AttachBind(replacementBinds[i]); err != nil {
+			t.Fatalf("AttachBind(%d): %v", i, err)
+		}
+	}
+	endpointCfgs := [2]string{
+		uapiCfg("public_key", hex.EncodeToString(pub1[:]), "endpoint", fmt.Sprintf("127.0.0.1:%d", devs[1].net.port)),
+		uapiCfg("public_key", hex.EncodeToString(pub0[:]), "endpoint", fmt.Sprintf("127.0.0.1:%d", devs[0].net.port)),
+	}
+	for i := range devs {
+		if err := devs[i].IpcSet(endpointCfgs[i]); err != nil {
+			t.Fatalf("IpcSet endpoint after AttachBind(%d): %v", i, err)
+		}
+	}
+	peers := [2]*Peer{
+		devs[0].LookupPeer(pub1),
+		devs[1].LookupPeer(pub0),
+	}
+	for i, peer := range peers {
+		if peer == nil {
+			t.Fatalf("expected peer %d after bind attach", i)
+		}
+		if !peer.isRunning.Load() {
+			t.Fatalf("expected peer %d to be running after bind attach", i)
+		}
+		peer.endpoint.Lock()
+		endpoint := peer.endpoint.val
+		peer.endpoint.Unlock()
+		if endpoint == nil {
+			t.Fatalf("expected peer %d endpoint to be configured after bind attach", i)
+		}
+	}
+}
+
+func TestDeviceReplaceBindReparsesPeerEndpoints(t *testing.T) {
+	t.Parallel()
+
+	tunDev := &fakeTUNDeviceSized{size: 1}
+	tunDev.ensureInit()
+
+	bind0 := &fakeTransitionBind{id: "bind0", size: 1}
+	bind1 := &fakeTransitionBind{id: "bind1", size: 1}
+	dev := NewDevice(tunDev, bind0, NewLogger(LogLevelError, ""))
+	t.Cleanup(dev.Close)
+
+	key0 := mustPrivateKey(t, 0)
+	key1 := mustPrivateKey(t, 1)
+	dev.SetPrivateKey(key0)
+
+	peer, err := dev.NewPeer(key1.publicKey())
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	peer.endpoint.Lock()
+	peer.endpoint.val = fakeBindEndpoint{bindID: bind0.id, dst: "127.0.0.1:51820"}
+	peer.endpoint.Unlock()
+
+	if err := dev.ReplaceBind(bind1); err != nil {
+		t.Fatalf("ReplaceBind: %v", err)
+	}
+
+	peer.endpoint.Lock()
+	endpoint, ok := peer.endpoint.val.(fakeBindEndpoint)
+	peer.endpoint.Unlock()
+	if !ok {
+		t.Fatal("expected fake bind endpoint after bind replacement")
+	}
+	if endpoint.bindID != bind1.id {
+		t.Fatalf("endpoint bind id = %q, want %q", endpoint.bindID, bind1.id)
+	}
+
+	if err := peer.SendBuffers([][]byte{{1, 2, 3}}); err != nil {
+		t.Fatalf("SendBuffers with rebound endpoint: %v", err)
+	}
 }
 
 func TestDeviceReplaceTUNDuringActiveTraffic(t *testing.T) {

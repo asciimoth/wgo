@@ -12,6 +12,7 @@ import (
 	conn "github.com/asciimoth/batchudp"
 	"github.com/asciimoth/gonnect-netstack/vtun"
 	"github.com/asciimoth/gonnect/loopback"
+	"github.com/asciimoth/gonnect/native"
 	"github.com/asciimoth/wgo/device"
 	"golang.org/x/crypto/curve25519"
 )
@@ -27,9 +28,15 @@ type Pair struct {
 	FirstIP   netip.Addr
 	SecondIP  netip.Addr
 
-	firstDev  *device.Device
-	secondDev *device.Device
-	network   *loopback.LoopbackNetwork
+	firstDev        *device.Device
+	secondDev       *device.Device
+	firstPublicKey  string
+	secondPublicKey string
+	networks        []networkDowner
+}
+
+type networkDowner interface {
+	Down() error
 }
 
 func New() (*Pair, error) {
@@ -57,7 +64,7 @@ func New() (*Pair, error) {
 		SecondIP:  secondIP,
 		firstDev:  device.NewDevice(firstTun, firstBind, device.NewLogger(device.LogLevelError, "example/first: ")),
 		secondDev: device.NewDevice(secondTun, secondBind, device.NewLogger(device.LogLevelError, "example/second: ")),
-		network:   network,
+		networks:  []networkDowner{network},
 	}
 
 	if err := pair.configure(); err != nil {
@@ -80,6 +87,27 @@ func (p *Pair) SwapSecondVTun(mwo, mro int) error {
 	return nil
 }
 
+func (p *Pair) SwapBindsToNative() error {
+	network := (&native.Config{}).Build()
+	firstBind := conn.NewDefaultBind(network)
+	secondBind := conn.NewDefaultBind(network)
+
+	if err := p.firstDev.ReplaceBind(firstBind); err != nil {
+		_ = network.Down()
+		return fmt.Errorf("replace first bind: %w", err)
+	}
+	if err := p.secondDev.ReplaceBind(secondBind); err != nil {
+		_ = network.Down()
+		return fmt.Errorf("replace second bind: %w", err)
+	}
+	p.networks = append(p.networks, network)
+	if err := p.configureEndpoints(); err != nil {
+		return fmt.Errorf("reconfigure endpoints after native bind swap: %w", err)
+	}
+
+	return nil
+}
+
 func (p *Pair) Close() error {
 	if p.firstDev != nil {
 		p.firstDev.Close()
@@ -87,10 +115,16 @@ func (p *Pair) Close() error {
 	if p.secondDev != nil {
 		p.secondDev.Close()
 	}
-	if p.network != nil {
-		return p.network.Down()
+	var firstErr error
+	for _, network := range p.networks {
+		if network == nil {
+			continue
+		}
+		if err := network.Down(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return nil
+	return firstErr
 }
 
 func (p *Pair) configure() error {
@@ -102,6 +136,8 @@ func (p *Pair) configure() error {
 	if err != nil {
 		return fmt.Errorf("generate second keypair: %w", err)
 	}
+	p.firstPublicKey = firstPublic
+	p.secondPublicKey = secondPublic
 
 	configs := []struct {
 		dev         *device.Device
@@ -144,6 +180,14 @@ func (p *Pair) configure() error {
 		}
 	}
 
+	if err := p.configureEndpoints(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (p *Pair) configureEndpoints() error {
 	firstPort, err := listenPort(p.firstDev)
 	if err != nil {
 		return fmt.Errorf("read first listen port: %w", err)
@@ -153,10 +197,10 @@ func (p *Pair) configure() error {
 		return fmt.Errorf("read second listen port: %w", err)
 	}
 
-	if err := p.firstDev.IpcSet(uapiConfig("public_key", secondPublic, "endpoint", fmt.Sprintf("127.0.0.1:%d", secondPort))); err != nil {
+	if err := p.firstDev.IpcSet(uapiConfig("public_key", p.secondPublicKey, "endpoint", fmt.Sprintf("127.0.0.1:%d", secondPort))); err != nil {
 		return fmt.Errorf("configure first endpoint: %w", err)
 	}
-	if err := p.secondDev.IpcSet(uapiConfig("public_key", firstPublic, "endpoint", fmt.Sprintf("127.0.0.1:%d", firstPort))); err != nil {
+	if err := p.secondDev.IpcSet(uapiConfig("public_key", p.firstPublicKey, "endpoint", fmt.Sprintf("127.0.0.1:%d", firstPort))); err != nil {
 		return fmt.Errorf("configure second endpoint: %w", err)
 	}
 

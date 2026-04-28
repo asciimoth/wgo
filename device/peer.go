@@ -8,6 +8,7 @@ package device
 import (
 	"container/list"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -120,6 +121,9 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	if peer.device.isClosed() {
 		return nil
 	}
+	if peer.device.net.bind == nil {
+		return fmt.Errorf("no bind attached")
+	}
 
 	peer.endpoint.Lock()
 	endpoint := peer.endpoint.val
@@ -142,6 +146,26 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 		peer.txBytes.Add(totalLen)
 	}
 	return err
+}
+
+func (peer *Peer) rebindEndpoint(bind conn.Bind) error {
+	peer.endpoint.Lock()
+	defer peer.endpoint.Unlock()
+
+	if peer.endpoint.val == nil {
+		return nil
+	}
+	if bind == nil {
+		return nil
+	}
+
+	endpoint, err := bind.ParseEndpoint(peer.endpoint.val.DstToString())
+	if err != nil {
+		return err
+	}
+	peer.endpoint.val = endpoint
+	peer.endpoint.clearSrcOnTx = false
+	return nil
 }
 
 func (peer *Peer) String() string {

@@ -17,7 +17,7 @@ At runtime, a host application wires together four things:
 
 1. A `tun.Tun` implementation from `github.com/asciimoth/gonnect/tun`
 2. A `gonnect.Network` implementation used to construct or back UDP transport
-3. A `conn.Bind` implementation from `github.com/asciimoth/batchudp`
+3. An optional `conn.Bind` implementation from `github.com/asciimoth/batchudp`
 4. A `device.Device` from `device.NewDevice(...)`
 
 For the default native transport, construction typically looks like:
@@ -138,7 +138,7 @@ These packages are small, focused dependencies of `device` and transport code.
 
 During construction it:
 
-- records the provided bind implementation
+- records the provided bind implementation, which may be `nil` if the device should start detached from UDP transport
 - attaches the provided initial TUN
 - validates that TUN's offsets against buffer-capacity limits
 - computes that attachment's read/write adapter strategy from `MRO()` and `MWO()`
@@ -154,7 +154,7 @@ During construction it:
 
 The device starts in the `down` state. Network sockets are opened later by transitioning the device `up`.
 
-The device batch size is fixed for the lifetime of the device from the maximum of the initial bind and initial TUN batch sizes. Replacement TUNs may use a smaller batch size, but they may not exceed the device batch size because queue pools are pre-sized once at construction.
+The device batch size is fixed for the lifetime of the device from the maximum of `256`, `batchudp.IdealBatchSize`, the initial bind batch size (if any), and the initial TUN batch size. Replacement binds or TUNs may use a smaller batch size, but they may not exceed the device batch size because queue pools are pre-sized once at construction.
 
 ### State transitions
 
@@ -173,6 +173,19 @@ TUN lifecycle is managed separately from `up`/`down` state:
 - `ReplaceTUN()` swaps the active attachment in place, starts fresh TUN reader/event workers for the new attachment, and closes the old TUN to unblock its read loop
 - `DetachTUN()` removes the active attachment and leaves the device running without TUN delivery until another TUN is attached
 - `AttachTUN()` attaches a TUN to a currently detached device
+
+Bind lifecycle is also managed separately from `up`/`down` state:
+
+- `ReplaceBind()` swaps the active bind in place; if the device is up, peer sessions are restarted and endpoints are reparsed for the new bind implementation
+- `DetachBind()` removes the active bind and leaves the device running without UDP transport until another bind is attached
+- `AttachBind()` attaches a bind to a currently detached device
+
+Detached-bind behavior:
+
+- a device may be `up` while no bind is attached
+- in that state no UDP receive routines exist
+- outbound transport sends fail fast and packets are effectively dropped
+- peer `endpoint=` UAPI updates are rejected while detached because endpoint parsing is bind-specific
 
 `Close()` is terminal. It closes the active TUN if present, tears down the bind, removes peers, drains queues, stops background activity, and closes the `Wait()` channel.
 
@@ -218,6 +231,24 @@ Flow:
 9. If that TUN requires a larger write offset than the internal transport layout, shift plaintext right before TUN delivery
 10. Write plaintext packets back to `tun.Tun` using that attachment's `writeOffset`
 11. If a TUN swap raced the write and the old attachment was already closed, rebuild the write buffers once against the new current attachment and retry
+
+## Bind Transition Notes
+
+The current runtime bind transition model is intentionally simple and disruptive:
+
+- swapping or detaching a bind while the device is up stops peers and then starts them again once transport is available
+- active keypairs and in-flight sessions are not preserved across bind transitions
+- packets sent during a transition, or while detached, may be lost
+- peer endpoints are reparsed from `Endpoint.DstToString()` on bind replacement because endpoint values are owned by the bind implementation
+
+This is enough to keep the `Device`, attached TUN, and UAPI server alive across transport changes, but it is not designed to provide seamless session migration.
+
+## Current Limitations
+
+- replacement binds and replacement TUNs still cannot exceed the device's fixed lifetime batch size
+- endpoint preservation across bind replacement depends on the new bind successfully parsing the old endpoint's string form
+- `ReplaceBind()` is safe but not transactional; if rebinding or reopening fails, the device remains alive but the previous running bind/session state is not restored automatically
+- `AttachBind()` does not recreate remote peer knowledge of a new listen port; if the new bind opens on a different port, remote peers may need an endpoint refresh or a new handshake path to reach it
 
 Handshake packets and transport packets are deliberately separated early so the device can scale crypto work while keeping protocol ordering constraints.
 
