@@ -6,15 +6,16 @@
 package device
 
 import (
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	gtun "github.com/asciimoth/gonnect/tun"
 	"github.com/asciimoth/wgo/conn"
 	"github.com/asciimoth/wgo/ratelimiter"
 	"github.com/asciimoth/wgo/rwcancel"
-	"github.com/asciimoth/wgo/tun"
 )
 
 type Device struct {
@@ -82,7 +83,7 @@ type Device struct {
 	}
 
 	tun struct {
-		device tun.Device
+		device gtun.Tun
 		mtu    atomic.Int32
 	}
 
@@ -281,7 +282,21 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	return nil
 }
 
-func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
+func validateTunOffsets(tunDevice gtun.Tun) error {
+	if mwo := tunDevice.MWO(); mwo > MessageTransportHeaderSize {
+		return fmt.Errorf("unsupported tun minimal write offset %d: must be <= %d", mwo, MessageTransportHeaderSize)
+	}
+	if mro := tunDevice.MRO(); mro != 0 {
+		return fmt.Errorf("unsupported tun minimal read offset %d: must be 0", mro)
+	}
+	return nil
+}
+
+func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger *Logger) *Device {
+	if err := validateTunOffsets(tunDevice); err != nil {
+		panic(fmt.Sprintf("device.NewDevice: %v", err))
+	}
+
 	device := new(Device)
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})

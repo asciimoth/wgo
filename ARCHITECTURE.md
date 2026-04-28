@@ -8,7 +8,6 @@ Unlike the upstream project, this repository is structured as a reusable library
 
 - `device`: protocol engine and runtime orchestration
 - `conn`: UDP transport abstraction
-- `tun`: packet I/O abstraction for virtual network devices
 - `ipc`: WireGuard UAPI transport helpers
 - helper packages: small protocol/runtime utilities used by `device`
 
@@ -16,7 +15,7 @@ Unlike the upstream project, this repository is structured as a reusable library
 
 At runtime, a host application wires together three things:
 
-1. A `tun.Device` implementation from `tun`
+1. A `tun.Tun` implementation from `github.com/asciimoth/gonnect/tun`
 2. A `conn.Bind` implementation from `conn`
 3. A `device.Device` from `device.NewDevice(...)`
 
@@ -68,22 +67,15 @@ Responsibilities:
 
 `StdNetBind` in [conn/bind_std.go](/home/moth/projects/wgo/conn/bind_std.go) is the cross-platform default implementation. Platform-specific files extend behavior for Linux, Windows, Android, and generic Unix variants.
 
-### `tun`
+### Packet I/O
 
-`tun` defines the virtual interface contract through `tun.Device` in [tun/tun.go](/home/moth/projects/wgo/tun/tun.go).
+`device` depends on the `tun.Tun` contract from `github.com/asciimoth/gonnect/tun`.
 
-Responsibilities:
+Concrete providers now come from external packages:
 
-- reading L3 packets from a virtual interface
-- writing decrypted packets back to the virtual interface
-- surfacing MTU and link events
-- OS-specific implementations for Linux, Darwin, FreeBSD, OpenBSD, and Windows
-
-This package also includes:
-
-- checksum/offload helpers
-- `tun/netstack`, an in-memory TUN backed by gVisor netstack for embedding/testing
-- `tun/tuntest`, test support utilities
+- `github.com/asciimoth/tuntap` for native OS TUN devices
+- `github.com/asciimoth/gonnect-netstack/vtun` for userspace virtual TUNs
+- package-local test helpers in `device/*_test.go`
 
 ### `ipc`
 
@@ -143,7 +135,7 @@ The outbound path starts with packets read from the TUN device by `RoutineReadFr
 
 Flow:
 
-1. Read one or more plaintext IP packets from `tun.Device`
+1. Read one or more plaintext IP packets from `tun.Tun`
 2. Determine IP version and destination address
 3. Look up the destination in `AllowedIPs`
 4. Stage packets on the selected peer
@@ -171,7 +163,7 @@ Flow:
 5. Decrypt transport packets in parallel
 6. Validate counters and replay windows
 7. Deliver plaintext IP packets to the peer’s sequential inbound consumer
-8. Write plaintext packets back to `tun.Device`
+8. Write plaintext packets back to `tun.Tun`
 
 Handshake packets and transport packets are deliberately separated early so the device can scale crypto work while keeping protocol ordering constraints.
 
@@ -215,7 +207,6 @@ The architecture favors predictable ordering and explicit ownership over fully l
 
 Several packages are split by operating system using Go build tags:
 
-- `tun/*_{linux,darwin,freebsd,openbsd,windows}.go`
 - `conn/*_{linux,unix,windows,android}.go`
 - `ipc/uapi_{linux,unix,bsd,windows,wasm}.go`
 - `device/queueconstants_*` and a few mobile-specific files
@@ -250,7 +241,7 @@ For embedders, this means configuration can be driven by:
 
 ## Netstack Mode
 
-`tun/netstack` provides an alternative in-memory TUN implementation backed by gVisor netstack.
+Userspace netstack mode is provided directly by `github.com/asciimoth/gonnect-netstack/vtun`.
 
 This is useful when an application wants:
 
@@ -258,5 +249,4 @@ This is useful when an application wants:
 - embedded client/server behavior without creating a host interface
 - easier testing and local integration scenarios
 
-Architecturally, this works because `device` depends only on the `tun.Device` interface, not on any specific kernel TUN implementation.
-
+Architecturally, this works because `device` depends only on the `tun.Tun` interface, not on any specific kernel TUN implementation.

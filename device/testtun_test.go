@@ -3,7 +3,7 @@
  * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
  */
 
-package tuntest
+package device
 
 import (
 	"encoding/binary"
@@ -11,10 +11,10 @@ import (
 	"net/netip"
 	"os"
 
-	"github.com/asciimoth/wgo/tun"
+	gtun "github.com/asciimoth/gonnect/tun"
 )
 
-func Ping(dst, src netip.Addr) []byte {
+func pingPacket(dst, src netip.Addr) []byte {
 	localPort := uint16(1337)
 	seq := uint16(0)
 
@@ -58,13 +58,11 @@ func genICMPv4(payload []byte, dst, src netip.Addr) []byte {
 	ip := pkt[0:ipv4Size]
 	icmpv4 := pkt[ipv4Size : ipv4Size+icmpv4Size]
 
-	// https://tools.ietf.org/html/rfc792
-	icmpv4[0] = icmpv4Echo // type
-	icmpv4[1] = 0          // code
+	icmpv4[0] = icmpv4Echo
+	icmpv4[1] = 0
 	chksum := ^checksum(icmpv4, checksum(payload, 0))
 	binary.BigEndian.PutUint16(icmpv4[icmpv4ChecksumOffset:], chksum)
 
-	// https://tools.ietf.org/html/rfc760 section 3.1
 	length := uint16(len(pkt))
 	ip[0] = (4 << 4) | (ipv4Size / 4)
 	binary.BigEndian.PutUint16(ip[ipv4TotalLenOffset:], length)
@@ -79,33 +77,33 @@ func genICMPv4(payload []byte, dst, src netip.Addr) []byte {
 	return pkt
 }
 
-type ChannelTUN struct {
-	Inbound  chan []byte // incoming packets, closed on TUN close
-	Outbound chan []byte // outbound packets, blocks forever on TUN close
+type channelTUN struct {
+	Inbound  chan []byte
+	Outbound chan []byte
 
 	closed chan struct{}
-	events chan tun.Event
+	events chan gtun.Event
 	tun    chTun
 }
 
-func NewChannelTUN() *ChannelTUN {
-	c := &ChannelTUN{
+func newChannelTUN() *channelTUN {
+	c := &channelTUN{
 		Inbound:  make(chan []byte),
 		Outbound: make(chan []byte),
 		closed:   make(chan struct{}),
-		events:   make(chan tun.Event, 1),
+		events:   make(chan gtun.Event, 1),
 	}
 	c.tun.c = c
-	c.events <- tun.EventUp
+	c.events <- gtun.EventUp
 	return c
 }
 
-func (c *ChannelTUN) TUN() tun.Device {
+func (c *channelTUN) TUN() gtun.Tun {
 	return &c.tun
 }
 
 type chTun struct {
-	c *ChannelTUN
+	c *channelTUN
 }
 
 func (t *chTun) File() *os.File { return nil }
@@ -121,7 +119,6 @@ func (t *chTun) Read(packets [][]byte, sizes []int, offset int) (int, error) {
 	}
 }
 
-// Write is called by the wireguard device to deliver a packet for routing.
 func (t *chTun) Write(packets [][]byte, offset int) (int, error) {
 	if offset == -1 {
 		close(t.c.closed)
@@ -140,15 +137,12 @@ func (t *chTun) Write(packets [][]byte, offset int) (int, error) {
 	return len(packets), nil
 }
 
-func (t *chTun) BatchSize() int {
-	return 1
-}
-
-const DefaultMTU = 1420
-
-func (t *chTun) MTU() (int, error)        { return DefaultMTU, nil }
-func (t *chTun) Name() (string, error)    { return "loopbackTun1", nil }
-func (t *chTun) Events() <-chan tun.Event { return t.c.events }
+func (t *chTun) BatchSize() int            { return 1 }
+func (t *chTun) MWO() int                  { return 0 }
+func (t *chTun) MRO() int                  { return 0 }
+func (t *chTun) MTU() (int, error)         { return DefaultMTU, nil }
+func (t *chTun) Name() (string, error)     { return "loopbackTun1", nil }
+func (t *chTun) Events() <-chan gtun.Event { return t.c.events }
 func (t *chTun) Close() error {
 	t.Write(nil, -1)
 	return nil

@@ -20,10 +20,9 @@ import (
 	"testing"
 	"time"
 
+	gtun "github.com/asciimoth/gonnect/tun"
 	"github.com/asciimoth/wgo/conn"
 	"github.com/asciimoth/wgo/conn/bindtest"
-	"github.com/asciimoth/wgo/tun"
-	"github.com/asciimoth/wgo/tun/tuntest"
 )
 
 // uapiCfg returns a string that contains cfg formatted use with IpcSet.
@@ -96,7 +95,7 @@ type testPair [2]testPeer
 
 // A testPeer is a peer used for testing.
 type testPeer struct {
-	tun *tuntest.ChannelTUN
+	tun *channelTUN
 	dev *Device
 	ip  netip.Addr
 }
@@ -122,7 +121,7 @@ func (pair *testPair) Send(tb testing.TB, ping SendDirection, done chan struct{}
 		// pong is the new ping
 		p0, p1 = p1, p0
 	}
-	msg := tuntest.Ping(p0.ip, p1.ip)
+	msg := pingPacket(p0.ip, p1.ip)
 	p1.tun.Outbound <- msg
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
@@ -160,7 +159,7 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 	// Bring up a ChannelTun for each config.
 	for i := range pair {
 		p := &pair[i]
-		p.tun = tuntest.NewChannelTUN()
+		p.tun = newChannelTUN()
 		p.ip = netip.AddrFrom4([4]byte{1, 0, 0, byte(i + 1)})
 		level := LogLevelVerbose
 		if _, ok := tb.(*testing.B); ok && !testing.Verbose() {
@@ -368,7 +367,7 @@ func BenchmarkThroughput(b *testing.B) {
 	}()
 
 	// Send packets as fast as we can until we've received enough.
-	ping := tuntest.Ping(pair[0].ip, pair[1].ip)
+	ping := pingPacket(pair[0].ip, pair[1].ip)
 	pingc := pair[1].tun.Outbound
 	var sent uint64
 	for recv.Load() != uint64(b.N) {
@@ -434,6 +433,8 @@ func (b *fakeBindSized) BatchSize() int                                { return 
 
 type fakeTUNDeviceSized struct {
 	size int
+	mwo  int
+	mro  int
 }
 
 func (t *fakeTUNDeviceSized) File() *os.File { return nil }
@@ -441,9 +442,11 @@ func (t *fakeTUNDeviceSized) Read(bufs [][]byte, sizes []int, offset int) (n int
 	return 0, nil
 }
 func (t *fakeTUNDeviceSized) Write(bufs [][]byte, offset int) (int, error) { return 0, nil }
+func (t *fakeTUNDeviceSized) MWO() int                                     { return t.mwo }
+func (t *fakeTUNDeviceSized) MRO() int                                     { return t.mro }
 func (t *fakeTUNDeviceSized) MTU() (int, error)                            { return 0, nil }
 func (t *fakeTUNDeviceSized) Name() (string, error)                        { return "", nil }
-func (t *fakeTUNDeviceSized) Events() <-chan tun.Event                     { return nil }
+func (t *fakeTUNDeviceSized) Events() <-chan gtun.Event                    { return nil }
 func (t *fakeTUNDeviceSized) Close() error                                 { return nil }
 func (t *fakeTUNDeviceSized) BatchSize() int                               { return t.size }
 
@@ -451,26 +454,46 @@ func TestBatchSize(t *testing.T) {
 	d := Device{}
 
 	d.net.bind = &fakeBindSized{1}
-	d.tun.device = &fakeTUNDeviceSized{1}
+	d.tun.device = &fakeTUNDeviceSized{size: 1}
 	if want, got := 1, d.BatchSize(); got != want {
 		t.Errorf("expected batch size %d, got %d", want, got)
 	}
 
 	d.net.bind = &fakeBindSized{1}
-	d.tun.device = &fakeTUNDeviceSized{128}
+	d.tun.device = &fakeTUNDeviceSized{size: 128}
 	if want, got := 128, d.BatchSize(); got != want {
 		t.Errorf("expected batch size %d, got %d", want, got)
 	}
 
 	d.net.bind = &fakeBindSized{128}
-	d.tun.device = &fakeTUNDeviceSized{1}
+	d.tun.device = &fakeTUNDeviceSized{size: 1}
 	if want, got := 128, d.BatchSize(); got != want {
 		t.Errorf("expected batch size %d, got %d", want, got)
 	}
 
 	d.net.bind = &fakeBindSized{128}
-	d.tun.device = &fakeTUNDeviceSized{128}
+	d.tun.device = &fakeTUNDeviceSized{size: 128}
 	if want, got := 128, d.BatchSize(); got != want {
 		t.Errorf("expected batch size %d, got %d", want, got)
 	}
+}
+
+func TestNewDeviceRejectsUnsupportedTunOffsets(t *testing.T) {
+	t.Run("mwo too large", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic for unsupported MWO")
+			}
+		}()
+		NewDevice(&fakeTUNDeviceSized{size: 1, mwo: MessageTransportHeaderSize + 1}, &fakeBindSized{1}, NewLogger(LogLevelError, ""))
+	})
+
+	t.Run("mro non-zero", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic for unsupported MRO")
+			}
+		}()
+		NewDevice(&fakeTUNDeviceSized{size: 1, mro: 1}, &fakeBindSized{1}, NewLogger(LogLevelError, ""))
+	})
 }

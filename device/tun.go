@@ -8,7 +8,7 @@ package device
 import (
 	"fmt"
 
-	"github.com/asciimoth/wgo/tun"
+	gtun "github.com/asciimoth/gonnect/tun"
 )
 
 const DefaultMTU = 1420
@@ -17,7 +17,7 @@ func (device *Device) RoutineTUNEventReader() {
 	device.log.Verbosef("Routine: event worker - started")
 
 	for event := range device.tun.device.Events() {
-		if event&tun.EventMTUUpdate != 0 {
+		if event&gtun.EventMTUUpdate != 0 {
 			mtu, err := device.tun.device.MTU()
 			if err != nil {
 				device.log.Errorf("Failed to load updated MTU of device: %v", err)
@@ -38,12 +38,12 @@ func (device *Device) RoutineTUNEventReader() {
 			}
 		}
 
-		if event&tun.EventUp != 0 {
+		if event&gtun.EventUp != 0 {
 			device.log.Verbosef("Interface up requested")
 			device.Up()
 		}
 
-		if event&tun.EventDown != 0 {
+		if event&gtun.EventDown != 0 {
 			device.log.Verbosef("Interface down requested")
 			device.Down()
 		}

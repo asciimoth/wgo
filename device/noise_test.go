@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/asciimoth/wgo/conn"
-	"github.com/asciimoth/wgo/tun/tuntest"
 )
 
 func TestCurveWrappers(t *testing.T) {
@@ -37,7 +36,7 @@ func randDevice(t *testing.T) *Device {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tun := tuntest.NewChannelTUN()
+	tun := newChannelTUN()
 	logger := NewLogger(LogLevelError, "")
 	device := NewDevice(tun.TUN(), conn.NewDefaultBind(), logger)
 	device.SetPrivateKey(sk)
