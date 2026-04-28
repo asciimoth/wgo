@@ -40,7 +40,8 @@ dev := device.NewDevice(tunDevice, bind, logger)
 - handshake, encryption, and decryption worker queues
 - TUN and UDP I/O lifecycles
 
-The host application is expected to configure the device through the WireGuard configuration protocol implemented in `device/uapi.go`, or through direct package-level APIs such as peer creation and key updates.
+The host application can configure the device either through direct typed `Device` methods or through the WireGuard configuration protocol implemented in `device/uapi.go`.
+For embedded use, the typed `Device` API is the primary surface and UAPI is retained as a compatibility layer.
 
 ## Package Responsibilities
 
@@ -309,7 +310,25 @@ Most socket-control and UDP platform specialization now lives in the external `b
 
 Although this repo is library-first, it still exposes the WireGuard configuration model used by upstream tooling.
 
-The main configuration surface is:
+The primary configuration surface for embedders is the typed `Device` API. Common entry points include:
+
+- `Device.SetPrivateKey(NoisePrivateKey)`
+- `Device.SetListenPort(uint16)`
+- `Device.SetFwmark(uint32)`
+- `Device.NewPeer(NoisePublicKey)`
+- `Device.RemovePeer(NoisePublicKey)`
+- `Device.RemoveAllPeers()`
+- `Device.SetPeerPresharedKey(NoisePublicKey, NoisePresharedKey)`
+- `Device.SetPeerEndpoint(NoisePublicKey, string)`
+- `Device.SetPeerPersistentKeepaliveInterval(NoisePublicKey, uint16)`
+- `Device.SetPeerProtocolVersion(NoisePublicKey, int)`
+- `Device.ReplacePeerAllowedIPs(NoisePublicKey, []netip.Prefix)`
+- `Device.AddPeerAllowedIP(NoisePublicKey, netip.Prefix)`
+- `Device.RemovePeerAllowedIP(NoisePublicKey, netip.Prefix)`
+- `Device.Config()`
+- `Device.PeerConfig(NoisePublicKey)`
+
+The UAPI compatibility surface remains:
 
 - `Device.IpcGetOperation(io.Writer)`
 - `Device.IpcSetOperation(io.Reader)`
@@ -321,9 +340,11 @@ This is an important compatibility layer because it separates:
 
 For embedders, this means configuration can be driven by:
 
+- direct Go API usage with typed setters/getters
 - an existing WireGuard-compatible UAPI client
 - custom application code that speaks the same text protocol
-- direct Go API usage where tighter integration is preferred
+
+In practice, the examples in this repository prefer the direct `Device` methods and use UAPI only where compatibility with existing tooling matters.
 
 ## Netstack Mode
 

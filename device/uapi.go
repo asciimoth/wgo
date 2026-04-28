@@ -49,9 +49,6 @@ var byteBufferPool = &sync.Pool{
 // IpcGetOperation implements the WireGuard configuration protocol "get" operation.
 // See https://www.wireguard.com/xplatform/#configuration-protocol for details.
 func (device *Device) IpcGetOperation(w io.Writer) error {
-	device.ipcMutex.RLock()
-	defer device.ipcMutex.RUnlock()
-
 	buf := byteBufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	defer byteBufferPool.Put(buf)
@@ -71,61 +68,42 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 		buf.WriteByte('\n')
 	}
 
-	func() {
-		// lock required resources
+	cfg := device.Config()
 
-		device.net.RLock()
-		defer device.net.RUnlock()
+	if !cfg.PrivateKey.IsZero() {
+		keyf("private_key", (*[32]byte)(&cfg.PrivateKey))
+	}
 
-		device.staticIdentity.RLock()
-		defer device.staticIdentity.RUnlock()
+	if cfg.ListenPort != 0 {
+		sendf("listen_port=%d", cfg.ListenPort)
+	}
 
-		device.peers.RLock()
-		defer device.peers.RUnlock()
+	if cfg.Fwmark != 0 {
+		sendf("fwmark=%d", cfg.Fwmark)
+	}
 
-		// serialize device related values
-
-		if !device.staticIdentity.privateKey.IsZero() {
-			keyf("private_key", (*[32]byte)(&device.staticIdentity.privateKey))
+	for _, peer := range cfg.Peers {
+		keyf("public_key", (*[32]byte)(&peer.PublicKey))
+		keyf("preshared_key", (*[32]byte)(&peer.PresharedKey))
+		sendf("protocol_version=%d", peer.ProtocolVersion)
+		if peer.Endpoint != "" {
+			sendf("endpoint=%s", peer.Endpoint)
 		}
 
-		if device.net.port != 0 {
-			sendf("listen_port=%d", device.net.port)
+		nano := peer.LastHandshakeTime.UnixNano()
+		secs := nano / time.Second.Nanoseconds()
+		nano %= time.Second.Nanoseconds()
+
+		sendf("last_handshake_time_sec=%d", secs)
+		sendf("last_handshake_time_nsec=%d", nano)
+		sendf("tx_bytes=%d", peer.TxBytes)
+		sendf("rx_bytes=%d", peer.RxBytes)
+		sendf("persistent_keepalive_interval=%d", peer.PersistentKeepaliveInterval)
+
+		for _, prefix := range peer.AllowedIPs {
+			sendf("allowed_ip=%s", prefix.String())
 		}
-
-		if device.net.fwmark != 0 {
-			sendf("fwmark=%d", device.net.fwmark)
-		}
-
-		for _, peer := range device.peers.keyMap {
-			// Serialize peer state.
-			peer.handshake.mutex.RLock()
-			keyf("public_key", (*[32]byte)(&peer.handshake.remoteStatic))
-			keyf("preshared_key", (*[32]byte)(&peer.handshake.presharedKey))
-			peer.handshake.mutex.RUnlock()
-			sendf("protocol_version=1")
-			peer.endpoint.Lock()
-			if peer.endpoint.val != nil {
-				sendf("endpoint=%s", peer.endpoint.val.DstToString())
-			}
-			peer.endpoint.Unlock()
-
-			nano := peer.lastHandshakeNano.Load()
-			secs := nano / time.Second.Nanoseconds()
-			nano %= time.Second.Nanoseconds()
-
-			sendf("last_handshake_time_sec=%d", secs)
-			sendf("last_handshake_time_nsec=%d", nano)
-			sendf("tx_bytes=%d", peer.txBytes.Load())
-			sendf("rx_bytes=%d", peer.rxBytes.Load())
-			sendf("persistent_keepalive_interval=%d", peer.persistentKeepaliveInterval.Load())
-
-			device.allowedips.EntriesForPeer(peer, func(prefix netip.Prefix) bool {
-				sendf("allowed_ip=%s", prefix.String())
-				return true
-			})
-		}
-	}()
+	}
 
 	// send lines (does not require resource locks)
 	if _, err := w.Write(buf.Bytes()); err != nil {
@@ -203,7 +181,9 @@ func (device *Device) handleDeviceLine(key, value string) error {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set private_key: %w", err)
 		}
 		device.log.Verbosef("UAPI: Updating private key")
-		device.SetPrivateKey(sk)
+		if err := device.SetPrivateKey(sk); err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set private_key: %w", err)
+		}
 
 	case "listen_port":
 		port, err := strconv.ParseUint(value, 10, 16)
@@ -213,12 +193,7 @@ func (device *Device) handleDeviceLine(key, value string) error {
 
 		// update port and rebind
 		device.log.Verbosef("UAPI: Updating listen port")
-
-		device.net.Lock()
-		device.net.port = uint16(port)
-		device.net.Unlock()
-
-		if err := device.BindUpdate(); err != nil {
+		if err := device.setListenPortLocked(uint16(port)); err != nil {
 			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to set listen_port: %w", err)
 		}
 
@@ -229,7 +204,7 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		}
 
 		device.log.Verbosef("UAPI: Updating fwmark")
-		if err := device.BindSetMark(uint32(mark)); err != nil {
+		if err := device.setFwmarkLocked(uint32(mark)); err != nil {
 			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to update fwmark: %w", err)
 		}
 
@@ -328,27 +303,26 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 
 	case "preshared_key":
 		device.log.Verbosef("%v - UAPI: Updating preshared key", peer.Peer)
-
-		peer.handshake.mutex.Lock()
-		err := peer.handshake.presharedKey.FromHex(value)
-		peer.handshake.mutex.Unlock()
-
+		var presharedKey NoisePresharedKey
+		err := presharedKey.FromHex(value)
 		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set preshared key: %w", err)
+		}
+		if peer.dummy {
+			return nil
+		}
+		if err := device.setPeerPresharedKeyLocked(peer.handshake.remoteStatic, presharedKey); err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set preshared key: %w", err)
 		}
 
 	case "endpoint":
 		device.log.Verbosef("%v - UAPI: Updating endpoint", peer.Peer)
-		if device.net.bind == nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set endpoint %v: no bind attached", value)
+		if peer.dummy {
+			return nil
 		}
-		endpoint, err := device.net.bind.ParseEndpoint(value)
-		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set endpoint %v: %w", value, err)
+		if err := device.setPeerEndpointLocked(peer.handshake.remoteStatic, value); err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "%w", err)
 		}
-		peer.endpoint.Lock()
-		defer peer.endpoint.Unlock()
-		peer.endpoint.val = endpoint
 
 	case "persistent_keepalive_interval":
 		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval", peer.Peer)
@@ -358,9 +332,13 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set persistent keepalive interval: %w", err)
 		}
 
-		old := peer.persistentKeepaliveInterval.Swap(uint32(secs))
-
-		// Send immediate keepalive if we're turning it on and before it wasn't on.
+		if peer.dummy {
+			return nil
+		}
+		old, err := device.setPeerPersistentKeepaliveIntervalLocked(peer.handshake.remoteStatic, uint16(secs), false)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set persistent keepalive interval: %w", err)
+		}
 		peer.pkaOn = old == 0 && secs != 0
 
 	case "replace_allowed_ips":
@@ -371,7 +349,9 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		if peer.dummy {
 			return nil
 		}
-		device.allowedips.RemoveByPeer(peer.Peer)
+		if err := device.replacePeerAllowedIPsLocked(peer.handshake.remoteStatic, nil); err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to replace allowedips: %w", err)
+		}
 
 	case "allowed_ip":
 		add := true
@@ -390,14 +370,28 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 			return nil
 		}
 		if add {
-			device.allowedips.Insert(prefix, peer.Peer)
+			if err := device.addPeerAllowedIPLocked(peer.handshake.remoteStatic, prefix); err != nil {
+				return ipcErrorf(ipc.IpcErrorInvalid, "failed to set allowed ip: %w", err)
+			}
 		} else {
-			device.allowedips.Remove(prefix, peer.Peer)
+			if err := device.removePeerAllowedIPLocked(peer.handshake.remoteStatic, prefix); err != nil {
+				return ipcErrorf(ipc.IpcErrorInvalid, "failed to set allowed ip: %w", err)
+			}
 		}
 
 	case "protocol_version":
-		if value != "1" {
+		version, err := strconv.Atoi(value)
+		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "invalid protocol version: %v", value)
+		}
+		if peer.dummy {
+			if version != 1 {
+				return ipcErrorf(ipc.IpcErrorInvalid, "invalid protocol version: %v", value)
+			}
+			return nil
+		}
+		if err := device.setPeerProtocolVersionLocked(peer.handshake.remoteStatic, version); err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "%w", err)
 		}
 
 	default:

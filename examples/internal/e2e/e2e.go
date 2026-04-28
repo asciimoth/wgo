@@ -1,12 +1,9 @@
 package e2e
 
 import (
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/netip"
-	"strconv"
-	"strings"
 	"time"
 
 	conn "github.com/asciimoth/batchudp"
@@ -30,8 +27,8 @@ type Pair struct {
 
 	firstDev        *device.Device
 	secondDev       *device.Device
-	firstPublicKey  string
-	secondPublicKey string
+	firstPublicKey  device.NoisePublicKey
+	secondPublicKey device.NoisePublicKey
 	networks        []networkDowner
 }
 
@@ -140,37 +137,41 @@ func (p *Pair) configure() error {
 	p.secondPublicKey = secondPublic
 
 	configs := []struct {
-		dev         *device.Device
-		privateKey  string
-		peerPubKey  string
-		allowedCIDR string
+		dev        *device.Device
+		privateKey device.NoisePrivateKey
+		peerPubKey device.NoisePublicKey
+		allowedIP  netip.Prefix
 	}{
 		{
-			dev:         p.firstDev,
-			privateKey:  firstPrivate,
-			peerPubKey:  secondPublic,
-			allowedCIDR: p.SecondIP.String() + "/32",
+			dev:        p.firstDev,
+			privateKey: firstPrivate,
+			peerPubKey: secondPublic,
+			allowedIP:  netip.PrefixFrom(p.SecondIP, p.SecondIP.BitLen()),
 		},
 		{
-			dev:         p.secondDev,
-			privateKey:  secondPrivate,
-			peerPubKey:  firstPublic,
-			allowedCIDR: p.FirstIP.String() + "/32",
+			dev:        p.secondDev,
+			privateKey: secondPrivate,
+			peerPubKey: firstPublic,
+			allowedIP:  netip.PrefixFrom(p.FirstIP, p.FirstIP.BitLen()),
 		},
 	}
 
 	for _, cfg := range configs {
-		err := cfg.dev.IpcSet(uapiConfig(
-			"private_key", cfg.privateKey,
-			"listen_port", "0",
-			"replace_peers", "true",
-			"public_key", cfg.peerPubKey,
-			"protocol_version", "1",
-			"replace_allowed_ips", "true",
-			"allowed_ip", cfg.allowedCIDR,
-		))
-		if err != nil {
-			return fmt.Errorf("apply device config: %w", err)
+		if err := cfg.dev.SetPrivateKey(cfg.privateKey); err != nil {
+			return fmt.Errorf("set private key: %w", err)
+		}
+		if err := cfg.dev.SetListenPort(0); err != nil {
+			return fmt.Errorf("set listen port: %w", err)
+		}
+		cfg.dev.RemoveAllPeers()
+		if _, err := cfg.dev.NewPeer(cfg.peerPubKey); err != nil {
+			return fmt.Errorf("create peer: %w", err)
+		}
+		if err := cfg.dev.SetPeerProtocolVersion(cfg.peerPubKey, 1); err != nil {
+			return fmt.Errorf("set peer protocol version: %w", err)
+		}
+		if err := cfg.dev.ReplacePeerAllowedIPs(cfg.peerPubKey, []netip.Prefix{cfg.allowedIP}); err != nil {
+			return fmt.Errorf("set peer allowed ips: %w", err)
 		}
 	}
 
@@ -188,19 +189,13 @@ func (p *Pair) configure() error {
 }
 
 func (p *Pair) configureEndpoints() error {
-	firstPort, err := listenPort(p.firstDev)
-	if err != nil {
-		return fmt.Errorf("read first listen port: %w", err)
-	}
-	secondPort, err := listenPort(p.secondDev)
-	if err != nil {
-		return fmt.Errorf("read second listen port: %w", err)
-	}
+	firstPort := p.firstDev.ListenPort()
+	secondPort := p.secondDev.ListenPort()
 
-	if err := p.firstDev.IpcSet(uapiConfig("public_key", p.secondPublicKey, "endpoint", fmt.Sprintf("127.0.0.1:%d", secondPort))); err != nil {
+	if err := p.firstDev.SetPeerEndpoint(p.secondPublicKey, fmt.Sprintf("127.0.0.1:%d", secondPort)); err != nil {
 		return fmt.Errorf("configure first endpoint: %w", err)
 	}
-	if err := p.secondDev.IpcSet(uapiConfig("public_key", p.firstPublicKey, "endpoint", fmt.Sprintf("127.0.0.1:%d", firstPort))); err != nil {
+	if err := p.secondDev.SetPeerEndpoint(p.firstPublicKey, fmt.Sprintf("127.0.0.1:%d", firstPort)); err != nil {
 		return fmt.Errorf("configure second endpoint: %w", err)
 	}
 
@@ -227,47 +222,18 @@ func buildVTun(addr netip.Addr, mwo, mro int) (*vtun.VTun, error) {
 	}
 }
 
-func deterministicKeyPair(seed byte) (privateHex, publicHex string, err error) {
-	privateKey := make([]byte, 32)
+func deterministicKeyPair(seed byte) (privateKey device.NoisePrivateKey, publicKey device.NoisePublicKey, err error) {
 	for i := range privateKey {
 		privateKey[i] = seed + byte(i) + 1
 	}
 	privateKey[0] &= 248
 	privateKey[31] = (privateKey[31] & 127) | 64
 
-	publicKey, err := curve25519.X25519(privateKey, curve25519.Basepoint)
+	publicBytes, err := curve25519.X25519(privateKey[:], curve25519.Basepoint)
 	if err != nil {
-		return "", "", err
+		return device.NoisePrivateKey{}, device.NoisePublicKey{}, err
 	}
+	copy(publicKey[:], publicBytes)
 
-	return hex.EncodeToString(privateKey), hex.EncodeToString(publicKey), nil
-}
-
-func uapiConfig(fields ...string) string {
-	var b strings.Builder
-	for i := 0; i+1 < len(fields); i += 2 {
-		b.WriteString(fields[i])
-		b.WriteByte('=')
-		b.WriteString(fields[i+1])
-		b.WriteByte('\n')
-	}
-	return b.String()
-}
-
-func listenPort(dev *device.Device) (uint16, error) {
-	state, err := dev.IpcGet()
-	if err != nil {
-		return 0, err
-	}
-	for _, line := range strings.Split(state, "\n") {
-		if !strings.HasPrefix(line, "listen_port=") {
-			continue
-		}
-		port, err := strconv.ParseUint(strings.TrimPrefix(line, "listen_port="), 10, 16)
-		if err != nil {
-			return 0, err
-		}
-		return uint16(port), nil
-	}
-	return 0, errors.New("listen_port not found in UAPI state")
+	return privateKey, publicKey, nil
 }
