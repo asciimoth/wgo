@@ -45,11 +45,11 @@ import (
  */
 
 type QueueOutboundElement struct {
-	buffer  *[MaxMessageSize]byte // slice holding the packet data
-	packet  []byte                // slice of "buffer" (always!)
-	nonce   uint64                // nonce for encryption
-	keypair *Keypair              // keypair for encryption
-	peer    *Peer                 // related peer
+	buffer  *[MessageBufferSize]byte // slice holding the packet data
+	packet  []byte                   // slice of "buffer" (always!)
+	nonce   uint64                   // nonce for encryption
+	keypair *Keypair                 // keypair for encryption
+	peer    *Peer                    // related peer
 }
 
 type QueueOutboundElementsContainer struct {
@@ -220,7 +220,7 @@ func (device *Device) RoutineReadFromTUN() {
 		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
 		count       = 0
 		sizes       = make([]int, batchSize)
-		offset      = MessageTransportHeaderSize
+		offset      = device.tun.readOffset
 	)
 
 	for i := range elems {
@@ -246,7 +246,10 @@ func (device *Device) RoutineReadFromTUN() {
 			}
 
 			elem := elems[i]
-			elem.packet = bufs[i][offset : offset+sizes[i]]
+			if device.tun.readNeedsCopy {
+				copy(bufs[i][MessageTransportHeaderSize:], bufs[i][offset:offset+sizes[i]])
+			}
+			elem.packet = bufs[i][MessageTransportHeaderSize : MessageTransportHeaderSize+sizes[i]]
 
 			// lookup peer
 			var peer *Peer

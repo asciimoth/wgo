@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"sync"
 
 	gtun "github.com/asciimoth/gonnect/tun"
 )
@@ -84,14 +85,29 @@ type channelTUN struct {
 	closed chan struct{}
 	events chan gtun.Event
 	tun    chTun
+
+	mu sync.Mutex
+
+	mwo int
+	mro int
+
+	lastReadOffset  int
+	lastWriteOffset int
+	lastWrite       []byte
 }
 
 func newChannelTUN() *channelTUN {
+	return newChannelTUNWithOffsets(0, 0)
+}
+
+func newChannelTUNWithOffsets(mwo, mro int) *channelTUN {
 	c := &channelTUN{
 		Inbound:  make(chan []byte),
 		Outbound: make(chan []byte),
 		closed:   make(chan struct{}),
 		events:   make(chan gtun.Event, 1),
+		mwo:      mwo,
+		mro:      mro,
 	}
 	c.tun.c = c
 	c.events <- gtun.EventUp
@@ -109,6 +125,9 @@ type chTun struct {
 func (t *chTun) File() *os.File { return nil }
 
 func (t *chTun) Read(packets [][]byte, sizes []int, offset int) (int, error) {
+	t.c.mu.Lock()
+	t.c.lastReadOffset = offset
+	t.c.mu.Unlock()
 	select {
 	case <-t.c.closed:
 		return 0, os.ErrClosed
@@ -126,6 +145,10 @@ func (t *chTun) Write(packets [][]byte, offset int) (int, error) {
 		return 0, io.EOF
 	}
 	for i, data := range packets {
+		t.c.mu.Lock()
+		t.c.lastWriteOffset = offset
+		t.c.lastWrite = append(t.c.lastWrite[:0], data...)
+		t.c.mu.Unlock()
 		msg := make([]byte, len(data)-offset)
 		copy(msg, data[offset:])
 		select {
@@ -138,12 +161,32 @@ func (t *chTun) Write(packets [][]byte, offset int) (int, error) {
 }
 
 func (t *chTun) BatchSize() int            { return 1 }
-func (t *chTun) MWO() int                  { return 0 }
-func (t *chTun) MRO() int                  { return 0 }
+func (t *chTun) MWO() int                  { return t.c.mwo }
+func (t *chTun) MRO() int                  { return t.c.mro }
 func (t *chTun) MTU() (int, error)         { return DefaultMTU, nil }
 func (t *chTun) Name() (string, error)     { return "loopbackTun1", nil }
 func (t *chTun) Events() <-chan gtun.Event { return t.c.events }
 func (t *chTun) Close() error {
 	t.Write(nil, -1)
 	return nil
+}
+
+func (c *channelTUN) lastReadCallOffset() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastReadOffset
+}
+
+func (c *channelTUN) lastWriteCallOffset() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastWriteOffset
+}
+
+func (c *channelTUN) lastWritePacket() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]byte, len(c.lastWrite))
+	copy(out, c.lastWrite)
+	return out
 }

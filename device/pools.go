@@ -56,7 +56,7 @@ func (device *Device) PopulatePools() {
 		return &QueueOutboundElementsContainer{elems: s}
 	})
 	device.pool.messageBuffers = NewWaitPool(PreallocatedBuffersPerPool, func() any {
-		return new([MaxMessageSize]byte)
+		return new([MessageBufferSize]byte)
 	})
 	device.pool.inboundElements = NewWaitPool(PreallocatedBuffersPerPool, func() any {
 		return new(QueueInboundElement)
@@ -94,11 +94,11 @@ func (device *Device) PutOutboundElementsContainer(c *QueueOutboundElementsConta
 	device.pool.outboundElementsContainer.Put(c)
 }
 
-func (device *Device) GetMessageBuffer() *[MaxMessageSize]byte {
-	return device.pool.messageBuffers.Get().(*[MaxMessageSize]byte)
+func (device *Device) GetMessageBuffer() *[MessageBufferSize]byte {
+	return device.pool.messageBuffers.Get().(*[MessageBufferSize]byte)
 }
 
-func (device *Device) PutMessageBuffer(msg *[MaxMessageSize]byte) {
+func (device *Device) PutMessageBuffer(msg *[MessageBufferSize]byte) {
 	device.pool.messageBuffers.Put(msg)
 }
 

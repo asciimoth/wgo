@@ -30,6 +30,11 @@ const (
 	MinMessageSize = MessageKeepaliveSize                  // minimum size of transport message (keepalive)
 	MaxMessageSize = MaxSegmentSize                        // maximum size of transport message
 	MaxContentSize = MaxSegmentSize - MessageTransportSize // maximum size of transport message content
+
+	// Keep transport message sizing fixed and reserve a small amount of extra
+	// headroom for TUN implementations that require larger adapter offsets.
+	MaxTunOffsetHeadroom = 64
+	MessageBufferSize    = MaxMessageSize + MaxTunOffsetHeadroom
 )
 
 /* Implementation constants */

@@ -77,6 +77,25 @@ Concrete providers now come from external packages:
 - `github.com/asciimoth/gonnect-netstack/vtun` for userspace virtual TUNs
 - package-local test helpers in `device/*_test.go`
 
+At the TUN boundary, `device` keeps two concepts separate:
+
+- the internal WireGuard transport layout inside device buffers
+- the adapter offsets required by a specific `tun.Tun`
+
+The transport layout remains fixed:
+
+- transport header starts at offset `0`
+- transport plaintext content starts at offset `16`
+
+TUN offsets are treated as adapter metadata computed during `NewDevice`:
+
+- `readOffset`: offset passed to `tun.Read`
+- `writeOffset`: offset passed to `tun.Write`
+- `readNeedsCopy`: whether inbound TUN plaintext must be compacted left to offset `16`
+- `writeNeedsCopy`: whether outbound plaintext must be shifted right before `tun.Write`
+
+This preserves the existing crypto and packet layout logic while allowing arbitrary non-negative `MRO()`/`MWO()` values as long as they fit device buffer capacity.
+
 ### `ipc`
 
 `ipc` is intentionally narrow in this repo. It provides platform-specific UAPI listener helpers such as Unix socket setup in [ipc/uapi_unix.go](/home/moth/projects/wgo/ipc/uapi_unix.go) and named pipe support on Windows.
@@ -101,6 +120,8 @@ These packages are small, focused dependencies of `device` and transport code.
 During construction it:
 
 - records the provided TUN and bind implementations
+- validates TUN offsets against buffer-capacity limits
+- computes TUN read/write adapter strategy from `MRO()` and `MWO()`
 - reads and stores the current MTU
 - initializes peer maps, pools, rate limiter, and key index table
 - creates handshake, encryption, and decryption queues
@@ -135,20 +156,22 @@ The outbound path starts with packets read from the TUN device by `RoutineReadFr
 
 Flow:
 
-1. Read one or more plaintext IP packets from `tun.Tun`
-2. Determine IP version and destination address
-3. Look up the destination in `AllowedIPs`
-4. Stage packets on the selected peer
-5. Ensure a valid session exists, initiating handshake if needed
-6. Assign nonces sequentially per peer
-7. Encrypt transport packets in parallel worker goroutines
-8. Send ciphertext through `conn.Bind`
+1. Read one or more plaintext IP packets from `tun.Tun` using `device.tun.readOffset`
+2. If the TUN requires a larger read offset than the internal transport layout, compact plaintext left to offset `16`
+3. Determine IP version and destination address
+4. Look up the destination in `AllowedIPs`
+5. Stage packets on the selected peer
+6. Ensure a valid session exists, initiating handshake if needed
+7. Assign nonces sequentially per peer
+8. Encrypt transport packets in parallel worker goroutines
+9. Send ciphertext through `conn.Bind`
 
 Key design point:
 
 - routing and nonce assignment are serialized where ordering matters
 - expensive crypto work is parallelized
 - transmission preserves per-peer ordering
+- the encryption path always sees plaintext at the fixed transport content offset, regardless of TUN requirements
 
 ### Inbound path
 
@@ -163,7 +186,8 @@ Flow:
 5. Decrypt transport packets in parallel
 6. Validate counters and replay windows
 7. Deliver plaintext IP packets to the peer’s sequential inbound consumer
-8. Write plaintext packets back to `tun.Tun`
+8. If the TUN requires a larger write offset than the internal transport layout, shift plaintext right before TUN delivery
+9. Write plaintext packets back to `tun.Tun` using `device.tun.writeOffset`
 
 Handshake packets and transport packets are deliberately separated early so the device can scale crypto work while keeping protocol ordering constraints.
 
@@ -200,6 +224,8 @@ Important patterns:
 - `ipcMutex` prevents configuration operations from racing with lifecycle-sensitive sections
 - queue wrappers in [device/channels.go](/home/moth/projects/wgo/device/channels.go) use ref-counted shutdown to avoid closing channels while writers are still active
 - memory reuse is handled by pools in `device/pools.go` to reduce allocations on packet hot paths
+
+Message buffers intentionally include a small amount of extra TUN staging headroom beyond the protocol `MaxMessageSize`. This headroom exists only to satisfy oversized TUN read/write offsets without changing the WireGuard transport packet format.
 
 The architecture favors predictable ordering and explicit ownership over fully lock-free operation.
 

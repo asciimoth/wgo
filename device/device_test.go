@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asciimoth/gonnect-netstack/vtun"
 	gtun "github.com/asciimoth/gonnect/tun"
 	"github.com/asciimoth/wgo/conn"
 	"github.com/asciimoth/wgo/conn/bindtest"
@@ -189,6 +190,93 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 		tb.Cleanup(p.dev.Close)
 	}
 	return
+}
+
+func genTestPairWithChannelTUNOffsets(tb testing.TB, mwo, mro int) (pair testPair) {
+	tb.Helper()
+
+	tuns := [2]*channelTUN{
+		newChannelTUNWithOffsets(mwo, mro),
+		newChannelTUNWithOffsets(mwo, mro),
+	}
+	devs := newDevicePairForTUNs(tb, tuns[0].TUN(), tuns[1].TUN(), [2]netip.Addr{
+		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
+		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
+	})
+	for i := range pair {
+		pair[i] = testPeer{
+			tun: tuns[i],
+			dev: devs[i],
+			ip:  netip.AddrFrom4([4]byte{1, 0, 0, byte(i + 1)}),
+		}
+	}
+	return pair
+}
+
+func newDevicePairForTUNs(tb testing.TB, tun0, tun1 gtun.Tun, ips [2]netip.Addr) [2]*Device {
+	tb.Helper()
+
+	key0 := mustPrivateKey(tb, 0)
+	key1 := mustPrivateKey(tb, 1)
+	pub0 := key0.publicKey()
+	pub1 := key1.publicKey()
+
+	cfgs := [2]string{
+		uapiCfg(
+			"private_key", hex.EncodeToString(key0[:]),
+			"listen_port", "0",
+			"replace_peers", "true",
+			"public_key", hex.EncodeToString(pub1[:]),
+			"protocol_version", "1",
+			"replace_allowed_ips", "true",
+			"allowed_ip", ips[1].String()+"/32",
+		),
+		uapiCfg(
+			"private_key", hex.EncodeToString(key1[:]),
+			"listen_port", "0",
+			"replace_peers", "true",
+			"public_key", hex.EncodeToString(pub0[:]),
+			"protocol_version", "1",
+			"replace_allowed_ips", "true",
+			"allowed_ip", ips[0].String()+"/32",
+		),
+	}
+	endpointCfgs := [2]string{
+		uapiCfg("public_key", hex.EncodeToString(pub1[:]), "endpoint", "127.0.0.1:%d"),
+		uapiCfg("public_key", hex.EncodeToString(pub0[:]), "endpoint", "127.0.0.1:%d"),
+	}
+
+	binds := bindtest.NewChannelBinds()
+	devs := [2]*Device{
+		NewDevice(tun0, binds[0], NewLogger(LogLevelError, "dev0: ")),
+		NewDevice(tun1, binds[1], NewLogger(LogLevelError, "dev1: ")),
+	}
+	for i := range devs {
+		if err := devs[i].IpcSet(cfgs[i]); err != nil {
+			tb.Fatalf("failed to configure device %d: %v", i, err)
+		}
+		if err := devs[i].Up(); err != nil {
+			tb.Fatalf("failed to bring up device %d: %v", i, err)
+		}
+		endpointCfgs[i^1] = fmt.Sprintf(endpointCfgs[i^1], devs[i].net.port)
+	}
+	for i := range devs {
+		if err := devs[i].IpcSet(endpointCfgs[i]); err != nil {
+			tb.Fatalf("failed to configure endpoint %d: %v", i, err)
+		}
+		tb.Cleanup(devs[i].Close)
+	}
+	return devs
+}
+
+func mustPrivateKey(tb testing.TB, seed byte) NoisePrivateKey {
+	tb.Helper()
+	var key NoisePrivateKey
+	for i := range key {
+		key[i] = seed + byte(i) + 1
+	}
+	key.clamp()
+	return key
 }
 
 func TestTwoDevicePing(t *testing.T) {
@@ -435,20 +523,46 @@ type fakeTUNDeviceSized struct {
 	size int
 	mwo  int
 	mro  int
+
+	events chan gtun.Event
+	closed chan struct{}
+
+	closeOnce sync.Once
+}
+
+func (t *fakeTUNDeviceSized) ensureInit() {
+	if t.closed == nil {
+		t.closed = make(chan struct{})
+	}
+	if t.events == nil {
+		t.events = make(chan gtun.Event)
+	}
 }
 
 func (t *fakeTUNDeviceSized) File() *os.File { return nil }
 func (t *fakeTUNDeviceSized) Read(bufs [][]byte, sizes []int, offset int) (n int, err error) {
-	return 0, nil
+	t.ensureInit()
+	<-t.closed
+	return 0, os.ErrClosed
 }
 func (t *fakeTUNDeviceSized) Write(bufs [][]byte, offset int) (int, error) { return 0, nil }
 func (t *fakeTUNDeviceSized) MWO() int                                     { return t.mwo }
 func (t *fakeTUNDeviceSized) MRO() int                                     { return t.mro }
 func (t *fakeTUNDeviceSized) MTU() (int, error)                            { return 0, nil }
 func (t *fakeTUNDeviceSized) Name() (string, error)                        { return "", nil }
-func (t *fakeTUNDeviceSized) Events() <-chan gtun.Event                    { return nil }
-func (t *fakeTUNDeviceSized) Close() error                                 { return nil }
-func (t *fakeTUNDeviceSized) BatchSize() int                               { return t.size }
+func (t *fakeTUNDeviceSized) Events() <-chan gtun.Event {
+	t.ensureInit()
+	return t.events
+}
+func (t *fakeTUNDeviceSized) Close() error {
+	t.ensureInit()
+	t.closeOnce.Do(func() {
+		close(t.closed)
+		close(t.events)
+	})
+	return nil
+}
+func (t *fakeTUNDeviceSized) BatchSize() int { return t.size }
 
 func TestBatchSize(t *testing.T) {
 	d := Device{}
@@ -478,22 +592,173 @@ func TestBatchSize(t *testing.T) {
 	}
 }
 
-func TestNewDeviceRejectsUnsupportedTunOffsets(t *testing.T) {
-	t.Run("mwo too large", func(t *testing.T) {
-		defer func() {
-			if recover() == nil {
-				t.Fatal("expected panic for unsupported MWO")
-			}
-		}()
-		NewDevice(&fakeTUNDeviceSized{size: 1, mwo: MessageTransportHeaderSize + 1}, &fakeBindSized{1}, NewLogger(LogLevelError, ""))
-	})
+func TestNewDeviceTunOffsetStrategy(t *testing.T) {
+	t.Parallel()
 
-	t.Run("mro non-zero", func(t *testing.T) {
-		defer func() {
-			if recover() == nil {
-				t.Fatal("expected panic for unsupported MRO")
+	tests := []struct {
+		name            string
+		mwo             int
+		mro             int
+		wantReadOffset  int
+		wantWriteOffset int
+		wantReadCopy    bool
+		wantWriteCopy   bool
+		wantPanic       bool
+	}{
+		{name: "zero offsets", mwo: 0, mro: 0, wantReadOffset: 16, wantWriteOffset: 16},
+		{name: "exact transport offsets", mwo: 16, mro: 16, wantReadOffset: 16, wantWriteOffset: 16},
+		{name: "smaller offsets", mwo: 4, mro: 8, wantReadOffset: 16, wantWriteOffset: 16},
+		{name: "read copy", mwo: 16, mro: 32, wantReadOffset: 32, wantWriteOffset: 16, wantReadCopy: true},
+		{name: "write copy", mwo: 32, mro: 16, wantReadOffset: 16, wantWriteOffset: 32, wantWriteCopy: true},
+		{name: "both copy", mwo: 48, mro: 32, wantReadOffset: 32, wantWriteOffset: 48, wantReadCopy: true, wantWriteCopy: true},
+		{name: "negative write offset", mwo: -1, wantPanic: true},
+		{name: "negative read offset", mro: -1, wantPanic: true},
+		{name: "write offset exceeds buffer headroom", mwo: MessageBufferSize - MaxContentSize + 1, wantPanic: true},
+		{name: "read offset exceeds buffer headroom", mro: MessageBufferSize - MaxContentSize + 1, wantPanic: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tunDev := &fakeTUNDeviceSized{size: 1, mwo: tt.mwo, mro: tt.mro}
+			tunDev.ensureInit()
+			if tt.wantPanic {
+				defer func() {
+					if recover() == nil {
+						t.Fatal("expected panic")
+					}
+				}()
+				NewDevice(tunDev, &fakeBindSized{1}, NewLogger(LogLevelError, ""))
+				return
 			}
-		}()
-		NewDevice(&fakeTUNDeviceSized{size: 1, mro: 1}, &fakeBindSized{1}, NewLogger(LogLevelError, ""))
-	})
+
+			dev := NewDevice(tunDev, &fakeBindSized{1}, NewLogger(LogLevelError, ""))
+			t.Cleanup(dev.Close)
+
+			if got := dev.tun.readOffset; got != tt.wantReadOffset {
+				t.Fatalf("readOffset = %d, want %d", got, tt.wantReadOffset)
+			}
+			if got := dev.tun.writeOffset; got != tt.wantWriteOffset {
+				t.Fatalf("writeOffset = %d, want %d", got, tt.wantWriteOffset)
+			}
+			if got := dev.tun.readNeedsCopy; got != tt.wantReadCopy {
+				t.Fatalf("readNeedsCopy = %v, want %v", got, tt.wantReadCopy)
+			}
+			if got := dev.tun.writeNeedsCopy; got != tt.wantWriteCopy {
+				t.Fatalf("writeNeedsCopy = %v, want %v", got, tt.wantWriteCopy)
+			}
+		})
+	}
+}
+
+func TestTwoDevicePingWithChannelTunOffsets(t *testing.T) {
+	goroutineLeakCheck(t)
+
+	tests := []struct {
+		name      string
+		mwo, mro  int
+		wantRead  int
+		wantWrite int
+	}{
+		{name: "compatible zero copy", mwo: 0, mro: 0, wantRead: 16, wantWrite: 16},
+		{name: "read copy required", mwo: 0, mro: 32, wantRead: 32, wantWrite: 16},
+		{name: "write copy required", mwo: 32, mro: 0, wantRead: 16, wantWrite: 32},
+		{name: "both copy required", mwo: 48, mro: 32, wantRead: 32, wantWrite: 48},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pair := genTestPairWithChannelTUNOffsets(t, tt.mwo, tt.mro)
+			pair.Send(t, Ping, nil)
+			pair.Send(t, Pong, nil)
+
+			for _, p := range pair {
+				if got := p.tun.lastReadCallOffset(); got != tt.wantRead {
+					t.Fatalf("read offset = %d, want %d", got, tt.wantRead)
+				}
+				if got := p.tun.lastWriteCallOffset(); got != tt.wantWrite {
+					t.Fatalf("write offset = %d, want %d", got, tt.wantWrite)
+				}
+				raw := p.tun.lastWritePacket()
+				if len(raw) == 0 {
+					t.Fatal("expected write packet to be recorded")
+				}
+				if !bytes.Equal(raw[tt.wantWrite:], pingPacket(pair[1].ip, pair[0].ip)) && !bytes.Equal(raw[tt.wantWrite:], pingPacket(pair[0].ip, pair[1].ip)) {
+					t.Fatal("recorded write packet payload mismatch")
+				}
+			}
+		})
+	}
+}
+
+func TestVTunOffsetsEndToEnd(t *testing.T) {
+	goroutineLeakCheck(t)
+
+	tests := []struct {
+		name     string
+		mwo, mro int
+	}{
+		{name: "compatible", mwo: 0, mro: 0},
+		{name: "read copy", mwo: 0, mro: 32},
+		{name: "write copy", mwo: 32, mro: 0},
+		{name: "both copy", mwo: 48, mro: 32},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vt0, err := (&vtun.Opts{
+				LocalAddrs:     []netip.Addr{netip.MustParseAddr("10.44.0.1")},
+				NoLoopbackAddr: true,
+				MWO:            tt.mwo,
+				MRO:            tt.mro,
+			}).Build()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer vt0.Close()
+
+			vt1, err := (&vtun.Opts{
+				LocalAddrs:     []netip.Addr{netip.MustParseAddr("10.44.0.2")},
+				NoLoopbackAddr: true,
+				MWO:            tt.mwo,
+				MRO:            tt.mro,
+			}).Build()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer vt1.Close()
+
+			newDevicePairForTUNs(t, vt0, vt1, [2]netip.Addr{
+				netip.MustParseAddr("10.44.0.1"),
+				netip.MustParseAddr("10.44.0.2"),
+			})
+
+			listener, err := vt1.ListenUDPAddrPort(netip.MustParseAddrPort("10.44.0.2:9000"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+
+			conn, err := vt0.DialUDPAddrPort(netip.MustParseAddrPort("10.44.0.1:8000"), netip.MustParseAddrPort("10.44.0.2:9000"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+
+			want := []byte("vtun offsets payload")
+			if _, err := conn.Write(want); err != nil {
+				t.Fatal(err)
+			}
+
+			_ = listener.SetReadDeadline(time.Now().Add(5 * time.Second))
+			got := make([]byte, len(want))
+			n, _, err := listener.ReadFrom(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = got[:n]
+			if !bytes.Equal(got, want) {
+				t.Fatalf("payload mismatch: got %q want %q", got, want)
+			}
+		})
+	}
 }

@@ -85,6 +85,13 @@ type Device struct {
 	tun struct {
 		device gtun.Tun
 		mtu    atomic.Int32
+
+		// Transport layout inside device buffers stays fixed at offset 16.
+		// These fields describe only the TUN adapter offsets at the boundary.
+		readOffset     int
+		writeOffset    int
+		readNeedsCopy  bool
+		writeNeedsCopy bool
 	}
 
 	ipcMutex sync.RWMutex
@@ -283,11 +290,16 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 }
 
 func validateTunOffsets(tunDevice gtun.Tun) error {
-	if mwo := tunDevice.MWO(); mwo > MessageTransportHeaderSize {
-		return fmt.Errorf("unsupported tun minimal write offset %d: must be <= %d", mwo, MessageTransportHeaderSize)
+	maxOffset := MessageBufferSize - MaxContentSize
+	if mwo := tunDevice.MWO(); mwo < 0 {
+		return fmt.Errorf("invalid tun minimal write offset %d: must be >= 0", mwo)
+	} else if mwo > maxOffset {
+		return fmt.Errorf("unsupported tun minimal write offset %d: exceeds buffer capacity limit %d", mwo, maxOffset)
 	}
-	if mro := tunDevice.MRO(); mro != 0 {
-		return fmt.Errorf("unsupported tun minimal read offset %d: must be 0", mro)
+	if mro := tunDevice.MRO(); mro < 0 {
+		return fmt.Errorf("invalid tun minimal read offset %d: must be >= 0", mro)
+	} else if mro > maxOffset {
+		return fmt.Errorf("unsupported tun minimal read offset %d: exceeds buffer capacity limit %d", mro, maxOffset)
 	}
 	return nil
 }
@@ -303,6 +315,16 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger *Logger) *Device {
 	device.log = logger
 	device.net.bind = bind
 	device.tun.device = tunDevice
+	device.tun.readOffset = MessageTransportHeaderSize
+	if mro := tunDevice.MRO(); mro > device.tun.readOffset {
+		device.tun.readOffset = mro
+		device.tun.readNeedsCopy = true
+	}
+	device.tun.writeOffset = MessageTransportOffsetContent
+	if mwo := tunDevice.MWO(); mwo > device.tun.writeOffset {
+		device.tun.writeOffset = mwo
+		device.tun.writeNeedsCopy = true
+	}
 	mtu, err := device.tun.device.MTU()
 	if err != nil {
 		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)

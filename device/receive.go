@@ -22,11 +22,11 @@ type QueueHandshakeElement struct {
 	msgType  uint32
 	packet   []byte
 	endpoint conn.Endpoint
-	buffer   *[MaxMessageSize]byte
+	buffer   *[MessageBufferSize]byte
 }
 
 type QueueInboundElement struct {
-	buffer   *[MaxMessageSize]byte
+	buffer   *[MessageBufferSize]byte
 	packet   []byte
 	counter  uint64
 	keypair  *Keypair
@@ -83,7 +83,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 	// receive datagrams until conn is closed
 
 	var (
-		bufsArrs    = make([]*[MaxMessageSize]byte, maxBatchSize)
+		bufsArrs    = make([]*[MessageBufferSize]byte, maxBatchSize)
 		bufs        = make([][]byte, maxBatchSize)
 		err         error
 		sizes       = make([]int, maxBatchSize)
@@ -507,7 +507,12 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 
-			bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
+			if device.tun.writeNeedsCopy {
+				copy(elem.buffer[device.tun.writeOffset:], elem.packet)
+				bufs = append(bufs, elem.buffer[:device.tun.writeOffset+len(elem.packet)])
+			} else {
+				bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
+			}
 		}
 
 		peer.rxBytes.Add(rxBytesLen)
@@ -521,7 +526,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			peer.timersDataReceived()
 		}
 		if len(bufs) > 0 {
-			_, err := device.tun.device.Write(bufs, MessageTransportOffsetContent)
+			_, err := device.tun.device.Write(bufs, device.tun.writeOffset)
 			if err != nil && !device.isClosed() {
 				device.log.Errorf("Failed to write packets to TUN device: %v", err)
 			}
