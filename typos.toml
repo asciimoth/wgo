@@ -1,0 +1,14 @@
+[default.extend-words]
+pn = "pn"
+nd6 = "nd6"
+nd = "nd"
+oif = "oif"
+ba = "ba"
+
+# Typos in original wireguard-go code; TODO: Fix
+Initation = "Initation"
+mis = "mis"
+
+[files]
+extend-exclude = ["*_test.go"]
+

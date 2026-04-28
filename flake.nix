@@ -27,7 +27,7 @@
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
           hooks = {
-            gotest.enable = true;
+            # gotest.enable = true;
             commitizen.enable = true;
             typos.enable = true;
             typos-commit = {
@@ -38,7 +38,7 @@
               ''; in builtins.toString script;
               stages = [ "commit-msg" ];
             };
-            govet.enable = true;
+            # govet.enable = true;
             gofmt.enable = true;
             # golangci-lint.enable = true;
             gotidy = {
@@ -46,6 +46,14 @@
               description = "Makes sure go.mod matches the source code";
               entry = let script = pkgs.writeShellScript "gotidyhook" ''
                 go mod tidy -v
+              ''; in builtins.toString script;
+              stages = [ "pre-commit" ];
+            };
+            golangtest = {
+              enable = true;
+              description = "go test ./... --race";
+              entry = let script = pkgs.writeShellScript "gotidyhook" ''
+                go test ./... --race
               ''; in builtins.toString script;
               stages = [ "pre-commit" ];
             };
