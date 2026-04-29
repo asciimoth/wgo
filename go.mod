@@ -6,7 +6,7 @@ require (
 	github.com/asciimoth/batchudp v0.1.2
 	github.com/asciimoth/gonnect v0.11.0
 	github.com/asciimoth/gonnect-netstack v0.3.14
-	github.com/asciimoth/tuntap v0.2.4
+	github.com/asciimoth/tuntap v0.3.0
 	golang.org/x/crypto v0.42.0
 	golang.org/x/net v0.44.0
 	golang.org/x/sys v0.42.0
