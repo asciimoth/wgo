@@ -45,3 +45,8 @@ examples/tcp_pingpong/tcp_pingpong
 examples/udp_pingpong/udp_pingpong
 examples/web_admin/web_admin
 
+# Compatibility test artifacts
+/.tmp/
+
+test.log
+
