@@ -4,6 +4,7 @@ This repository has two test layers:
 
 - Fast package tests with `go test -race ./...`
 - A Linux compatibility suite that runs this library against kernel-space WireGuard in Docker
+- A Linux performance suite that benchmarks this library, upstream `wireguard-go`, and kernel-space WireGuard with `iperf3`
 
 ## Standard Checks
 
@@ -89,6 +90,52 @@ The runner captures:
 - UAPI request/response logs for the `wgo` peer
 
 Containers, Docker network, and temporary Docker images are removed during cleanup.
+
+## Performance Suite
+
+Run the performance suite with:
+
+```bash
+just test-performance
+```
+
+It follows the same high-level harness style as the compatibility suite: build temporary Docker images, create isolated networks, start privileged containers, configure real WireGuard peers, then exercise traffic through the tunnel.
+
+### What It Benchmarks
+
+The performance suite runs three subjects independently:
+
+- Two peers implemented by this repository (`wgo`)
+- Two peers implemented by upstream `wireguard-go`
+- Two peers implemented by Linux kernel-space WireGuard
+
+For each subject it:
+
+1. Starts two paired peers in Docker.
+2. Configures tunnel addresses, routes, private keys, public keys, endpoints, and listen ports.
+3. Verifies bidirectional tunnel reachability with `ping`.
+4. Runs `iperf3` TCP and UDP benchmarks in both directions across the WireGuard tunnel.
+5. Stores raw `iperf3` JSON output under `.tmp/perf/` and writes a readable summary report to the repository-root `performance-log.md`.
+
+The runner is [tests/perf/run.sh](/home/moth/projects/wgo/tests/perf/run.sh).
+
+### Performance Artifacts
+
+Temporary outputs are written under:
+
+```text
+.tmp/perf/
+```
+
+Each run gets its own directory with:
+
+- Per-subject raw `iperf3` JSON output
+- Container logs
+- `ip addr` / `ip route` / `wg show` snapshots
+
+The committed summary file is `performance-log.md`.
+
+Like the compatibility suite, temporary containers, networks, and Docker images are removed during cleanup.
 
 ## Scope And Limits
 

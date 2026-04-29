@@ -16,6 +16,8 @@ tidy:
 test-compat:
 	sudo ./tests/compat/run.sh
 
+test-performance:
+	sudo ./tests/perf/run.sh
+
 # Stress tests + compat tests.
 test-total: test-stress test-compat
-
