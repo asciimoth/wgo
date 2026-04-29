@@ -448,17 +448,24 @@ func (device *Device) RemoveAllPeers() {
 
 func (device *Device) Close() {
 	device.state.Lock()
-	defer device.state.Unlock()
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
 	if device.isClosed() {
+		device.state.Unlock()
 		return
 	}
 	device.state.state.Store(uint32(deviceStateClosed))
+	device.state.Unlock()
+
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
 	device.log.Debugf("Device closing")
 
+	// Stop TUN workers without holding state.mu. The event reader may already be
+	// processing an event and attempt Up/Down, which also takes state.mu.
 	device.stopTUN(device.tun.device.Swap(nil))
+
+	device.state.Lock()
 	device.downLocked()
+	device.state.Unlock()
 
 	// Remove peers before closing queues,
 	// because peers assume that queues are active.

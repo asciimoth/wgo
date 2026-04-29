@@ -927,6 +927,40 @@ func (t *fakeTUNDeviceSized) Close() error {
 }
 func (t *fakeTUNDeviceSized) BatchSize() int { return t.size }
 
+type fakeBlockingEventTUN struct {
+	fakeTUNDeviceSized
+	mtu        int
+	mtuCalled  chan struct{}
+	releaseMTU chan struct{}
+	mtuCalls   atomic.Int32
+}
+
+func newFakeBlockingEventTUN(mtu int) *fakeBlockingEventTUN {
+	return &fakeBlockingEventTUN{
+		fakeTUNDeviceSized: fakeTUNDeviceSized{
+			size:   1,
+			events: make(chan gtun.Event, 1),
+			closed: make(chan struct{}),
+		},
+		mtu:        mtu,
+		mtuCalled:  make(chan struct{}),
+		releaseMTU: make(chan struct{}),
+	}
+}
+
+func (t *fakeBlockingEventTUN) MTU() (int, error) {
+	if t.mtuCalls.Add(1) == 1 {
+		return t.mtu, nil
+	}
+	select {
+	case <-t.mtuCalled:
+	default:
+		close(t.mtuCalled)
+	}
+	<-t.releaseMTU
+	return t.mtu, nil
+}
+
 func TestBatchSize(t *testing.T) {
 	d := Device{}
 
@@ -1101,6 +1135,35 @@ func TestDeviceAttachBindReturnsErrorOnBindSetMarkPanic(t *testing.T) {
 	err := dev.AttachBind(&fakePanicSetMarkBind{size: 1})
 	if err == nil {
 		t.Fatal("AttachBind() error = nil, want error")
+	}
+}
+
+func TestDeviceCloseDoesNotDeadlockWithConcurrentTUNEvent(t *testing.T) {
+	t.Parallel()
+
+	tunDev := newFakeBlockingEventTUN(DefaultMTU)
+	dev := NewDevice(tunDev, nil, NewLogger(LogLevelError, ""))
+
+	tunDev.events <- gtun.EventMTUUpdate | gtun.EventUp
+
+	select {
+	case <-tunDev.mtuCalled:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for MTU update handling")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		dev.Close()
+		close(done)
+	}()
+
+	close(tunDev.releaseMTU)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() deadlocked with concurrent TUN event")
 	}
 }
 
