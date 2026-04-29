@@ -227,6 +227,31 @@ func TestDeviceTypedConfigMethodErrors(t *testing.T) {
 	})
 }
 
+func TestActivatePeerStartsPeerWhenDeviceIsUp(t *testing.T) {
+	tunDev := newChannelTUN()
+	bind := &fakeTransitionBind{id: "bind0", size: 1}
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+	t.Cleanup(dev.Close)
+	waitForDeviceUp(t, dev)
+
+	peerPrivateKey := mustPrivateKey(t, 10)
+	peerKey := peerPrivateKey.publicKey()
+	peer, err := dev.NewPeer(peerKey)
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	if peer.isRunning.Load() {
+		t.Fatal("new peer unexpectedly started before activation")
+	}
+
+	if err := dev.ActivatePeer(peerKey); err != nil {
+		t.Fatalf("ActivatePeer: %v", err)
+	}
+	if !peer.isRunning.Load() {
+		t.Fatal("ActivatePeer() did not start the peer while device was up")
+	}
+}
+
 func sortPrefixes(prefixes []netip.Prefix) {
 	slices.SortFunc(prefixes, func(a, b netip.Prefix) int {
 		switch {

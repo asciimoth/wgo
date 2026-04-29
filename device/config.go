@@ -154,6 +154,27 @@ func (device *Device) RemovePeerAllowedIP(publicKey NoisePublicKey, prefix netip
 	return device.removePeerAllowedIPLocked(publicKey, prefix)
 }
 
+// ActivatePeer applies the same post-configuration activation used by UAPI.
+// If the device is up, it starts the peer and flushes any staged packets.
+func (device *Device) ActivatePeer(publicKey NoisePublicKey) error {
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
+
+	peer, err := device.requirePeerLocked(publicKey)
+	if err != nil {
+		return err
+	}
+	if !device.isUp() {
+		return nil
+	}
+	peer.Start()
+	if peer.persistentKeepaliveInterval.Load() > 0 {
+		peer.SendKeepalive()
+	}
+	peer.SendStagedPackets()
+	return nil
+}
+
 func (device *Device) setListenPortLocked(port uint16) error {
 	device.net.Lock()
 	device.net.port = port

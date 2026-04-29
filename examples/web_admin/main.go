@@ -20,7 +20,7 @@ import (
 	"time"
 
 	conn "github.com/asciimoth/batchudp"
-	"github.com/asciimoth/gonnect/native"
+	"github.com/asciimoth/gonnect-netstack/vtun"
 	gtun "github.com/asciimoth/gonnect/tun"
 	"github.com/asciimoth/tuntap"
 	"github.com/asciimoth/wgo/device"
@@ -46,9 +46,10 @@ func main() {
 }
 
 type adminApp struct {
-	dev    *device.Device
-	server *http.Server
-	plan   pairingPlan
+	dev     *device.Device
+	server  *http.Server
+	plan    pairingPlan
+	traffic tunnelTrafficState
 
 	mu   sync.Mutex
 	tun  *tunAttachment
@@ -56,22 +57,25 @@ type adminApp struct {
 }
 
 type tunAttachment struct {
+	kind    string
 	name    string
 	localIP netip.Addr
 	peerIP  netip.Addr
 	mtu     int
+	stack   *vtun.VTun
 	cleanup func() error
 }
 
 type bindAttachment struct {
-	network       *native.Network
+	network       *recordingNetwork
 	requestedPort uint16
 }
 
 type appState struct {
-	Device deviceStateSummary `json:"device"`
-	TUN    *tunStateSummary   `json:"tun,omitempty"`
-	Bind   *bindStateSummary  `json:"bind,omitempty"`
+	Device  deviceStateSummary    `json:"device"`
+	TUN     *tunStateSummary      `json:"tun,omitempty"`
+	Bind    *bindStateSummary     `json:"bind,omitempty"`
+	Traffic *tunnelTrafficSummary `json:"traffic,omitempty"`
 }
 
 type deviceStateSummary struct {
@@ -94,6 +98,7 @@ type peerStateSummary struct {
 }
 
 type tunStateSummary struct {
+	Kind    string `json:"kind"`
 	Name    string `json:"name"`
 	LocalIP string `json:"local_ip"`
 	PeerIP  string `json:"peer_ip"`
@@ -101,9 +106,10 @@ type tunStateSummary struct {
 }
 
 type bindStateSummary struct {
-	Type          string `json:"type"`
-	RequestedPort uint16 `json:"requested_port"`
-	ListenPort    uint16 `json:"listen_port"`
+	Type          string   `json:"type"`
+	RequestedPort uint16   `json:"requested_port"`
+	ListenPort    uint16   `json:"listen_port"`
+	ListenAddrs   []string `json:"listen_addrs,omitempty"`
 }
 
 type deviceUpdateRequest struct {
@@ -177,8 +183,12 @@ func newAdminApp() (*adminApp, error) {
 	mux.HandleFunc("/api/peers/delete_all", app.handlePeerDeleteAll)
 	mux.HandleFunc("/api/tun/attach", app.handleAttachTUN)
 	mux.HandleFunc("/api/tun/detach", app.handleDetachTUN)
+	mux.HandleFunc("/api/vtun/attach", app.handleAttachVTun)
 	mux.HandleFunc("/api/bind/attach", app.handleAttachBind)
 	mux.HandleFunc("/api/bind/detach", app.handleDetachBind)
+	mux.HandleFunc("/api/tunnel/echo/start", app.handleTunnelEchoStart)
+	mux.HandleFunc("/api/tunnel/echo/stop", app.handleTunnelEchoStop)
+	mux.HandleFunc("/api/tunnel/probe", app.handleTunnelProbe)
 
 	app.server = &http.Server{
 		Addr:              "127.0.0.1:0",
@@ -241,6 +251,7 @@ func (a *adminApp) Close() error {
 	if bind != nil && bind.network != nil {
 		_ = bind.network.Down()
 	}
+	_ = a.traffic.stopEcho()
 
 	a.dev.Close()
 
@@ -262,6 +273,62 @@ func (a *adminApp) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) logPanelAction(action, format string, args ...any) {
+	msg := format
+	if msg == "" {
+		msg = "ok"
+	} else {
+		msg = fmt.Sprintf(format, args...)
+	}
+	log.Printf("[web_admin panel] %s %s", action, msg)
+}
+
+func shortHex(src string) string {
+	src = strings.TrimSpace(src)
+	if len(src) <= 12 {
+		return src
+	}
+	return src[:8] + "..." + src[len(src)-4:]
+}
+
+func displayPort(port *uint16) any {
+	if port == nil {
+		return "unchanged"
+	}
+	return *port
+}
+
+func displayUint32(v *uint32) any {
+	if v == nil {
+		return "unchanged"
+	}
+	return *v
+}
+
+func displayInt(v *int) any {
+	if v == nil {
+		return "unchanged"
+	}
+	return *v
+}
+
+func displayString(v *string) any {
+	if v == nil {
+		return "unchanged"
+	}
+	if strings.TrimSpace(*v) == "" {
+		return `""`
+	}
+	return strings.TrimSpace(*v)
+}
+
+func displayStringSlice(v []string) any {
+	if len(v) == 0 {
+		return "[]"
+	}
+	return strings.Join(v, ",")
 }
 
 func (a *adminApp) handleDeviceUpdate(w http.ResponseWriter, r *http.Request) {
@@ -299,6 +366,13 @@ func (a *adminApp) handleDeviceUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	a.logPanelAction(
+		"device.update",
+		"private_key=%t listen_port=%v fwmark=%v",
+		req.PrivateKey != nil,
+		displayPort(req.ListenPort),
+		displayUint32(req.Fwmark),
+	)
 
 	writeJSON(w, http.StatusOK, a.snapshot())
 }
@@ -366,6 +440,21 @@ func (a *adminApp) handlePeerApply(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if err := a.dev.ActivatePeer(publicKey); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	a.logPanelAction(
+		"peer.apply",
+		"public_key=%s preshared_key=%t endpoint=%v protocol=%v keepalive=%v replace_allowed_ips=%t allowed_ips=%v",
+		shortHex(req.PublicKey),
+		req.PresharedKey != nil,
+		displayString(req.Endpoint),
+		displayInt(req.ProtocolVersion),
+		displayPort(req.PersistentKeepaliveInterval),
+		req.ReplaceAllowedIPs,
+		displayStringSlice(req.AllowedIPs),
+	)
 
 	writeJSON(w, http.StatusOK, a.snapshot())
 }
@@ -388,6 +477,7 @@ func (a *adminApp) handlePeerDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.dev.RemovePeer(publicKey)
+	a.logPanelAction("peer.delete", "public_key=%s", shortHex(req.PublicKey))
 	writeJSON(w, http.StatusOK, a.snapshot())
 }
 
@@ -397,6 +487,7 @@ func (a *adminApp) handlePeerDeleteAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.dev.RemoveAllPeers()
+	a.logPanelAction("peer.delete_all", "")
 	writeJSON(w, http.StatusOK, a.snapshot())
 }
 
@@ -416,6 +507,40 @@ func (a *adminApp) handleAttachTUN(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	a.logPanelAction(
+		"tun.attach_native",
+		"name=%s local_ip=%s peer_ip=%s mtu=%d",
+		strings.TrimSpace(req.Name),
+		strings.TrimSpace(req.LocalIP),
+		strings.TrimSpace(req.PeerIP),
+		req.MTU,
+	)
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handleAttachVTun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req attachTUNRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if err := a.attachVTun(req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	a.logPanelAction(
+		"tun.attach_vtun",
+		"name=%s local_ip=%s peer_ip=%s",
+		strings.TrimSpace(req.Name),
+		strings.TrimSpace(req.LocalIP),
+		strings.TrimSpace(req.PeerIP),
+	)
 	writeJSON(w, http.StatusOK, a.snapshot())
 }
 
@@ -428,6 +553,7 @@ func (a *adminApp) handleDetachTUN(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	a.logPanelAction("tun.detach", "")
 	writeJSON(w, http.StatusOK, a.snapshot())
 }
 
@@ -446,6 +572,7 @@ func (a *adminApp) handleAttachBind(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	a.logPanelAction("bind.attach", "listen_port=%v", displayPort(req.ListenPort))
 	writeJSON(w, http.StatusOK, a.snapshot())
 }
 
@@ -458,7 +585,71 @@ func (a *adminApp) handleDetachBind(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	a.logPanelAction("bind.detach", "")
 	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handleTunnelEchoStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req tunnelEchoRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := a.startTunnelEcho(req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	a.logPanelAction("tunnel.echo_start", "port=%v", displayPort(req.Port))
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handleTunnelEchoStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := a.stopTunnelEcho(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	a.logPanelAction("tunnel.echo_stop", "")
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handleTunnelProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req tunnelProbeRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := a.probeTunnel(req)
+	if err != nil {
+		a.traffic.setLastProbeResult("error: " + err.Error())
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	a.logPanelAction(
+		"tunnel.probe",
+		"remote_ip=%v port=%v message=%v result=%s",
+		displayString(req.RemoteIP),
+		displayPort(req.Port),
+		displayString(req.Message),
+		result,
+	)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"result": result,
+		"state":  a.snapshot(),
+	})
 }
 
 func (a *adminApp) attachTUN(req attachTUNRequest) error {
@@ -495,6 +686,7 @@ func (a *adminApp) attachTUN(req attachTUNRequest) error {
 	if err != nil {
 		return err
 	}
+	tunDev = newLoggingTUN(ifName, tunDev)
 	if err := a.dev.AttachTUN(tunDev); err != nil {
 		_ = tunDev.Close()
 		if cleanup != nil {
@@ -504,11 +696,68 @@ func (a *adminApp) attachTUN(req attachTUNRequest) error {
 	}
 
 	a.tun = &tunAttachment{
+		kind:    "native",
 		name:    ifName,
 		localIP: localIP,
 		peerIP:  peerIP,
 		mtu:     mtu,
 		cleanup: cleanup,
+	}
+	return nil
+}
+
+func (a *adminApp) attachVTun(req attachTUNRequest) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.tun != nil {
+		return fmt.Errorf("a TUN is already attached")
+	}
+
+	localIP, err := netip.ParseAddr(strings.TrimSpace(req.LocalIP))
+	if err != nil {
+		return fmt.Errorf("parse local_ip: %w", err)
+	}
+	peerIP, err := netip.ParseAddr(strings.TrimSpace(req.PeerIP))
+	if err != nil {
+		return fmt.Errorf("parse peer_ip: %w", err)
+	}
+
+	tunDev, err := (&vtun.Opts{
+		Name:           strings.TrimSpace(req.Name),
+		LocalAddrs:     []netip.Addr{localIP},
+		NoLoopbackAddr: true,
+	}).Build()
+	if err != nil {
+		return fmt.Errorf("build vtun: %w", err)
+	}
+	select {
+	case <-tunDev.Events():
+	case <-time.After(5 * time.Second):
+		_ = tunDev.Close()
+		return fmt.Errorf("timed out waiting for vtun event")
+	}
+
+	mtu, err := tunDev.MTU()
+	if err != nil {
+		_ = tunDev.Close()
+		return fmt.Errorf("read vtun mtu: %w", err)
+	}
+
+	var tun gtun.Tun = tunDev
+	tun = newLoggingTUN(req.Name, tun)
+	if err := a.dev.AttachTUN(tun); err != nil {
+		_ = tunDev.Close()
+		return err
+	}
+
+	a.tun = &tunAttachment{
+		kind:    "vtun",
+		name:    req.Name,
+		localIP: localIP,
+		peerIP:  peerIP,
+		mtu:     mtu,
+		stack:   tunDev,
 	}
 	return nil
 }
@@ -529,6 +778,7 @@ func (a *adminApp) detachTUN() error {
 		a.mu.Unlock()
 		return err
 	}
+	_ = a.traffic.stopEcho()
 	if tun.cleanup != nil {
 		return tun.cleanup()
 	}
@@ -551,12 +801,13 @@ func (a *adminApp) attachBind(req attachBindRequest) error {
 		return err
 	}
 
-	network := (&native.Config{}).Build()
-	bind := conn.NewDefaultBind(network)
+	network := newRecordingNetwork()
+	bind := newLoggingBind("native-default", conn.NewDefaultBind(network))
 	if err := a.dev.AttachBind(bind); err != nil {
 		_ = network.Down()
 		return err
 	}
+	log.Printf("web_admin bind listening on %s", strings.Join(network.ListenAddrs(), ", "))
 
 	a.bind = &bindAttachment{
 		network:       network,
@@ -622,6 +873,7 @@ func (a *adminApp) snapshot() appState {
 
 	if a.tun != nil {
 		state.TUN = &tunStateSummary{
+			Kind:    a.tun.kind,
 			Name:    a.tun.name,
 			LocalIP: a.tun.localIP.String(),
 			PeerIP:  a.tun.peerIP.String(),
@@ -633,10 +885,25 @@ func (a *adminApp) snapshot() appState {
 			Type:          "native-default",
 			RequestedPort: a.bind.requestedPort,
 			ListenPort:    a.dev.ListenPort(),
+			ListenAddrs:   a.bind.network.ListenAddrs(),
 		}
 	}
+	state.Traffic = newTunnelTrafficSummary(&a.traffic)
 
 	return state
+}
+
+func (a *adminApp) tunnelNetwork() (*vtun.VTun, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.tun == nil {
+		return nil, fmt.Errorf("attach TUN first")
+	}
+	if a.tun.stack == nil {
+		return nil, fmt.Errorf("explicit tunnel traffic requires a userspace VTun attachment, not a native OS TUN")
+	}
+	return a.tun.stack, nil
 }
 
 func (a *adminApp) printPairingGuide() {
@@ -667,8 +934,9 @@ func (a *adminApp) printPairingGuide() {
 	fmt.Printf("  2. In this panel, configure %s.\n", local.Label)
 	fmt.Printf("  3. In the other panel, configure %s.\n", remote.Label)
 	fmt.Println("  4. On each side: attach TUN, attach bind, create peer.")
-	fmt.Printf("  5. From %s, ping %s.\n", local.Label, local.PingTargetIP)
-	fmt.Printf("  6. From %s, ping %s.\n", remote.Label, remote.PingTargetIP)
+	fmt.Printf("  5. On one side, start tunnel echo on %s:%d.\n", local.LocalIP, defaultTunnelEchoPort)
+	fmt.Printf("  6. On the other side, probe %s:%d through the tunnel.\n", local.LocalIP, defaultTunnelEchoPort)
+	fmt.Println("  7. If one side is behind NAT, set persistent keepalive there and use a reachable endpoint/port mapping.")
 	fmt.Println()
 }
 
@@ -985,7 +1253,7 @@ pre {
     </section>
 
     <section class="panel">
-      <h2>Native TUN</h2>
+      <h2>TUN</h2>
       <label>Name
         <input id="tun_name" value="wgoadm0">
       </label>
@@ -999,6 +1267,7 @@ pre {
         <input id="tun_mtu" type="number" min="576" value="1420">
       </label>
       <button onclick="attachTun()">Create and attach native TUN</button>
+      <button class="ghost" onclick="attachVTun()">Attach userspace VTun</button>
       <button class="alt" onclick="detachTun()">Detach and destroy TUN</button>
     </section>
 
@@ -1009,6 +1278,26 @@ pre {
       </label>
       <button onclick="attachBind()">Attach native bind</button>
       <button class="alt" onclick="detachBind()">Detach bind</button>
+    </section>
+
+    <section class="panel">
+      <h2>Forced Tunnel Traffic</h2>
+      <p>This uses the attached <code>VTun</code> userspace stack so traffic must pass through WireGuard. It is not available with a native OS TUN.</p>
+      <label>Echo port
+        <input id="echo_port" type="number" min="1" max="65535" value="18080">
+      </label>
+      <button onclick="startTunnelEcho()">Start TCP echo on local VTun IP</button>
+      <button class="alt" onclick="stopTunnelEcho()">Stop echo</button>
+      <label>Probe peer IP
+        <input id="probe_remote_ip" placeholder="empty uses attached peer IP">
+      </label>
+      <label>Probe port
+        <input id="probe_port" type="number" min="1" max="65535" value="18080">
+      </label>
+      <label>Probe message
+        <input id="probe_message" placeholder="optional custom payload">
+      </label>
+      <button class="ghost" onclick="probeTunnel()">Probe peer through tunnel</button>
     </section>
 
     <section class="panel" style="grid-column: 1 / -1;">
@@ -1104,6 +1393,15 @@ function attachTun() {
   }));
 }
 
+function attachVTun() {
+  run(() => post('/api/vtun/attach', {
+    name: document.getElementById('tun_name').value.trim(),
+    local_ip: document.getElementById('tun_local_ip').value.trim(),
+    peer_ip: document.getElementById('tun_peer_ip').value.trim(),
+    mtu: numValue('tun_mtu') || 1420
+  }));
+}
+
 function detachTun() {
   run(() => post('/api/tun/detach', {}));
 }
@@ -1116,6 +1414,33 @@ function attachBind() {
 
 function detachBind() {
   run(() => post('/api/bind/detach', {}));
+}
+
+function startTunnelEcho() {
+  run(() => post('/api/tunnel/echo/start', {
+    port: numValue('echo_port')
+  }));
+}
+
+function stopTunnelEcho() {
+  run(() => post('/api/tunnel/echo/stop', {}));
+}
+
+function probeTunnel() {
+  (async () => {
+    try {
+      const data = await post('/api/tunnel/probe', {
+        remote_ip: document.getElementById('probe_remote_ip').value.trim() || null,
+        port: numValue('probe_port'),
+        message: document.getElementById('probe_message').value.trim() || null
+      });
+      showMessage(data.result, false);
+      await refresh();
+    } catch (err) {
+      showMessage(err.message, true);
+      await refresh();
+    }
+  })();
 }
 
 refresh();
