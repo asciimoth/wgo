@@ -573,32 +573,65 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 
 func (device *Device) DeterminePacketTypeAndPadding(packet []byte, expectedType uint32) (uint32, int) {
 	size := len(packet)
-	amnezia := device.amneziaWGSnapshot()
+	foundType := uint32(MessageUnknownType)
+	foundPadding := 0
+	device.visitAmneziaWGSnapshots(func(amnezia amneziaWGSnapshot) bool {
+		if expectedType == MessageUnknownType || expectedType == MessageInitiationType {
+			padding := amnezia.paddings.init
+			if size == padding+MessageInitiationSize && size >= padding+4 && amnezia.headers.init.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+				foundType = MessageInitiationType
+				foundPadding = padding
+				return true
+			}
+		}
+		if expectedType == MessageUnknownType || expectedType == MessageResponseType {
+			padding := amnezia.paddings.response
+			if size == padding+MessageResponseSize && size >= padding+4 && amnezia.headers.response.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+				foundType = MessageResponseType
+				foundPadding = padding
+				return true
+			}
+		}
+		if expectedType == MessageUnknownType || expectedType == MessageCookieReplyType {
+			padding := amnezia.paddings.cookie
+			if size == padding+MessageCookieReplySize && size >= padding+4 && amnezia.headers.cookie.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+				foundType = MessageCookieReplyType
+				foundPadding = padding
+				return true
+			}
+		}
+		if expectedType == MessageUnknownType || expectedType == MessageTransportType {
+			padding := amnezia.paddings.transport
+			if size >= padding+MessageTransportHeaderSize && size >= padding+4 && amnezia.headers.transport.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+				foundType = MessageTransportType
+				foundPadding = padding
+				return true
+			}
+		}
+		return false
+	})
 
-	if expectedType == MessageUnknownType || expectedType == MessageInitiationType {
-		padding := amnezia.paddings.init
-		if size == padding+MessageInitiationSize && size >= padding+4 && amnezia.headers.init.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-			return MessageInitiationType, padding
-		}
-	}
-	if expectedType == MessageUnknownType || expectedType == MessageResponseType {
-		padding := amnezia.paddings.response
-		if size == padding+MessageResponseSize && size >= padding+4 && amnezia.headers.response.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-			return MessageResponseType, padding
-		}
-	}
-	if expectedType == MessageUnknownType || expectedType == MessageCookieReplyType {
-		padding := amnezia.paddings.cookie
-		if size == padding+MessageCookieReplySize && size >= padding+4 && amnezia.headers.cookie.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-			return MessageCookieReplyType, padding
-		}
-	}
-	if expectedType == MessageUnknownType || expectedType == MessageTransportType {
-		padding := amnezia.paddings.transport
-		if size >= padding+MessageTransportHeaderSize && size >= padding+4 && amnezia.headers.transport.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-			return MessageTransportType, padding
-		}
+	if foundType != MessageUnknownType {
+		return foundType, foundPadding
 	}
 
 	return MessageUnknownType, 0
+}
+
+func (device *Device) visitAmneziaWGSnapshots(fn func(amneziaWGSnapshot) bool) {
+	if fn(device.amneziaWGSnapshot()) {
+		return
+	}
+
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+	for _, peer := range device.peers.keyMap {
+		snapshot := peer.amnezia.snapshot.Load()
+		if snapshot == nil {
+			continue
+		}
+		if fn(*snapshot) {
+			return
+		}
+	}
 }

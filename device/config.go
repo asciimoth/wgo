@@ -32,6 +32,22 @@ type PeerConfig struct {
 	RxBytes                     uint64
 	PersistentKeepaliveInterval uint16
 	AllowedIPs                  []netip.Prefix
+	AmneziaWG                   *AmneziaWGConfig
+}
+
+type AmneziaWGConfigPatch struct {
+	JunkCount         *int
+	JunkMin           *int
+	JunkMax           *int
+	InitHeader        *AmneziaWGHeaderRange
+	ResponseHeader    *AmneziaWGHeaderRange
+	CookieHeader      *AmneziaWGHeaderRange
+	TransportHeader   *AmneziaWGHeaderRange
+	InitPadding       *int
+	ResponsePadding   *int
+	CookiePadding     *int
+	TransportPadding  *int
+	InitiationPackets [amneziaPacketCount]*string
 }
 
 func (device *Device) PrivateKey() NoisePrivateKey {
@@ -76,6 +92,18 @@ func (device *Device) AmneziaWGConfig() AmneziaWGConfig {
 func (device *Device) SetAmneziaWGConfig(cfg AmneziaWGConfig) error {
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
+	return device.setAmneziaWGConfigLocked(cfg)
+}
+
+func (device *Device) SetAmneziaWGConfigPatch(patch AmneziaWGConfigPatch) error {
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
+	override, err := patch.toIPC()
+	if err != nil {
+		return err
+	}
+	cfg := device.amneziaWGConfigLocked()
+	override.merge(&cfg)
 	return device.setAmneziaWGConfigLocked(cfg)
 }
 
@@ -150,6 +178,48 @@ func (device *Device) SetPeerProtocolVersion(publicKey NoisePublicKey, version i
 	return device.setPeerProtocolVersionLocked(publicKey, version)
 }
 
+func (device *Device) SetPeerAmneziaWGConfig(publicKey NoisePublicKey, cfg AmneziaWGConfig) error {
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
+	return device.setPeerAmneziaWGConfigLocked(publicKey, &cfg)
+}
+
+func (device *Device) PeerAmneziaWGConfigOverride(publicKey NoisePublicKey) (AmneziaWGConfigPatch, bool) {
+	device.ipcMutex.RLock()
+	defer device.ipcMutex.RUnlock()
+
+	peer := device.lookupPeerLocked(publicKey)
+	if peer == nil || !peer.amnezia.override.hasValues() {
+		return AmneziaWGConfigPatch{}, false
+	}
+	return amneziaWGConfigPatchFromIPC(peer.amnezia.override), true
+}
+
+func (device *Device) SetPeerAmneziaWGConfigPatch(publicKey NoisePublicKey, patch AmneziaWGConfigPatch) error {
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
+	override, err := patch.toIPC()
+	if err != nil {
+		return err
+	}
+	peer, err := device.requirePeerLocked(publicKey)
+	if err != nil {
+		return err
+	}
+	if peer.amnezia.override.hasValues() {
+		base := peer.amnezia.override
+		override.mergeIntoOverride(&base)
+		override = base
+	}
+	return device.setPeerAmneziaWGConfigPatchLocked(peer, override)
+}
+
+func (device *Device) ClearPeerAmneziaWGConfig(publicKey NoisePublicKey) error {
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
+	return device.setPeerAmneziaWGConfigLocked(publicKey, nil)
+}
+
 func (device *Device) ReplacePeerAllowedIPs(publicKey NoisePublicKey, allowedIPs []netip.Prefix) error {
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
@@ -221,6 +291,84 @@ func (device *Device) amneziaWGConfigLocked() AmneziaWGConfig {
 	return cfg
 }
 
+func (patch AmneziaWGConfigPatch) toIPC() (ipcSetAmneziaWG, error) {
+	override := ipcSetAmneziaWG{
+		junkCount:        patch.JunkCount,
+		junkMin:          patch.JunkMin,
+		junkMax:          patch.JunkMax,
+		initPadding:      patch.InitPadding,
+		responsePadding:  patch.ResponsePadding,
+		cookiePadding:    patch.CookiePadding,
+		transportPadding: patch.TransportPadding,
+	}
+	if patch.InitHeader != nil {
+		override.initHeader = &magicHeader{start: patch.InitHeader.Start, end: patch.InitHeader.End}
+	}
+	if patch.ResponseHeader != nil {
+		override.responseHeader = &magicHeader{start: patch.ResponseHeader.Start, end: patch.ResponseHeader.End}
+	}
+	if patch.CookieHeader != nil {
+		override.cookieHeader = &magicHeader{start: patch.CookieHeader.Start, end: patch.CookieHeader.End}
+	}
+	if patch.TransportHeader != nil {
+		override.transportHeader = &magicHeader{start: patch.TransportHeader.Start, end: patch.TransportHeader.End}
+	}
+	for i, spec := range patch.InitiationPackets {
+		if spec == nil {
+			continue
+		}
+		override.packetSet[i] = true
+		if *spec == "" {
+			continue
+		}
+		chain, err := newObfChain(*spec)
+		if err != nil {
+			return ipcSetAmneziaWG{}, fmt.Errorf("parse initiation packet %d: %w", i+1, err)
+		}
+		override.initiationPackets[i] = chain
+	}
+	return override, nil
+}
+
+func amneziaWGConfigPatchFromIPC(override ipcSetAmneziaWG) AmneziaWGConfigPatch {
+	patch := AmneziaWGConfigPatch{
+		JunkCount:        override.junkCount,
+		JunkMin:          override.junkMin,
+		JunkMax:          override.junkMax,
+		InitPadding:      override.initPadding,
+		ResponsePadding:  override.responsePadding,
+		CookiePadding:    override.cookiePadding,
+		TransportPadding: override.transportPadding,
+	}
+	if override.initHeader != nil {
+		header := override.initHeader.toConfig()
+		patch.InitHeader = &header
+	}
+	if override.responseHeader != nil {
+		header := override.responseHeader.toConfig()
+		patch.ResponseHeader = &header
+	}
+	if override.cookieHeader != nil {
+		header := override.cookieHeader.toConfig()
+		patch.CookieHeader = &header
+	}
+	if override.transportHeader != nil {
+		header := override.transportHeader.toConfig()
+		patch.TransportHeader = &header
+	}
+	for i, chain := range override.initiationPackets {
+		if !override.packetSet[i] {
+			continue
+		}
+		spec := ""
+		if chain != nil {
+			spec = chain.Spec
+		}
+		patch.InitiationPackets[i] = &spec
+	}
+	return patch
+}
+
 func (device *Device) setAmneziaWGConfigLocked(cfg AmneziaWGConfig) error {
 	if err := validateAmneziaWGConfig(cfg); err != nil {
 		return err
@@ -249,6 +397,7 @@ func (device *Device) setAmneziaWGConfigLocked(cfg AmneziaWGConfig) error {
 		device.ipackets[i] = chain
 	}
 	device.storeAmneziaWGSnapshot()
+	device.refreshPeerAmneziaWGSnapshotsLocked()
 	return nil
 }
 
@@ -360,6 +509,61 @@ func (device *Device) setPeerProtocolVersionLocked(publicKey NoisePublicKey, ver
 	return nil
 }
 
+func (device *Device) setPeerAmneziaWGConfigLocked(publicKey NoisePublicKey, cfg *AmneziaWGConfig) error {
+	peer, err := device.requirePeerLocked(publicKey)
+	if err != nil {
+		return err
+	}
+
+	if cfg == nil {
+		peer.amnezia.override = ipcSetAmneziaWG{}
+		peer.amnezia.snapshot.Store(nil)
+		return nil
+	}
+
+	if err := validateAmneziaWGConfig(*cfg); err != nil {
+		return err
+	}
+
+	override := ipcSetAmneziaWG{
+		junkCount:        &cfg.JunkCount,
+		junkMin:          &cfg.JunkMin,
+		junkMax:          &cfg.JunkMax,
+		initHeader:       &magicHeader{start: cfg.InitHeader.Start, end: cfg.InitHeader.End},
+		responseHeader:   &magicHeader{start: cfg.ResponseHeader.Start, end: cfg.ResponseHeader.End},
+		cookieHeader:     &magicHeader{start: cfg.CookieHeader.Start, end: cfg.CookieHeader.End},
+		transportHeader:  &magicHeader{start: cfg.TransportHeader.Start, end: cfg.TransportHeader.End},
+		initPadding:      &cfg.InitPadding,
+		responsePadding:  &cfg.ResponsePadding,
+		cookiePadding:    &cfg.CookiePadding,
+		transportPadding: &cfg.TransportPadding,
+	}
+	for i, spec := range cfg.InitiationPackets {
+		override.packetSet[i] = true
+		if spec == "" {
+			continue
+		}
+		chain, err := newObfChain(spec)
+		if err != nil {
+			return fmt.Errorf("parse initiation packet %d: %w", i+1, err)
+		}
+		override.initiationPackets[i] = chain
+	}
+	peer.amnezia.override = override
+	return device.refreshPeerAmneziaWGSnapshotLocked(peer)
+}
+
+func (device *Device) setPeerAmneziaWGConfigPatchLocked(peer *Peer, override ipcSetAmneziaWG) error {
+	if !override.hasValues() {
+		peer.amnezia.override = ipcSetAmneziaWG{}
+		peer.amnezia.snapshot.Store(nil)
+		return nil
+	}
+
+	peer.amnezia.override = override
+	return device.refreshPeerAmneziaWGSnapshotLocked(peer)
+}
+
 func (device *Device) replacePeerAllowedIPsLocked(publicKey NoisePublicKey, allowedIPs []netip.Prefix) error {
 	peer, err := device.requirePeerLocked(publicKey)
 	if err != nil {
@@ -448,5 +652,65 @@ func (device *Device) peerConfigLocked(peer *Peer) PeerConfig {
 	slices.SortFunc(cfg.AllowedIPs, func(a, b netip.Prefix) int {
 		return strings.Compare(a.String(), b.String())
 	})
+	if peer.amnezia.override.hasValues() {
+		effective, err := device.peerAmneziaWGConfigLocked(peer)
+		if err == nil {
+			cfg.AmneziaWG = &effective
+		}
+	}
 	return cfg
+}
+
+func (device *Device) peerAmneziaWGConfigLocked(peer *Peer) (AmneziaWGConfig, error) {
+	cfg := device.amneziaWGConfigLocked()
+	peer.amnezia.override.merge(&cfg)
+	if err := validateAmneziaWGConfig(cfg); err != nil {
+		return AmneziaWGConfig{}, err
+	}
+	return cfg, nil
+}
+
+func (device *Device) refreshPeerAmneziaWGSnapshotsLocked() {
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+	for _, peer := range device.peers.keyMap {
+		_ = device.refreshPeerAmneziaWGSnapshotLocked(peer)
+	}
+}
+
+func (device *Device) refreshPeerAmneziaWGSnapshotLocked(peer *Peer) error {
+	if !peer.amnezia.override.hasValues() {
+		peer.amnezia.snapshot.Store(nil)
+		return nil
+	}
+
+	cfg, err := device.peerAmneziaWGConfigLocked(peer)
+	if err != nil {
+		return err
+	}
+
+	var snapshot amneziaWGSnapshot
+	snapshot.junk.count = cfg.JunkCount
+	snapshot.junk.min = cfg.JunkMin
+	snapshot.junk.max = cfg.JunkMax
+	snapshot.headers.init = &magicHeader{start: cfg.InitHeader.Start, end: cfg.InitHeader.End}
+	snapshot.headers.response = &magicHeader{start: cfg.ResponseHeader.Start, end: cfg.ResponseHeader.End}
+	snapshot.headers.cookie = &magicHeader{start: cfg.CookieHeader.Start, end: cfg.CookieHeader.End}
+	snapshot.headers.transport = &magicHeader{start: cfg.TransportHeader.Start, end: cfg.TransportHeader.End}
+	snapshot.paddings.init = cfg.InitPadding
+	snapshot.paddings.response = cfg.ResponsePadding
+	snapshot.paddings.cookie = cfg.CookiePadding
+	snapshot.paddings.transport = cfg.TransportPadding
+	for i, spec := range cfg.InitiationPackets {
+		if spec == "" {
+			continue
+		}
+		chain, err := newObfChain(spec)
+		if err != nil {
+			return fmt.Errorf("parse initiation packet %d: %w", i+1, err)
+		}
+		snapshot.ipackets[i] = chain
+	}
+	peer.amnezia.snapshot.Store(&snapshot)
+	return nil
 }

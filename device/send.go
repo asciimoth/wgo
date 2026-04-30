@@ -118,7 +118,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.handshake.mutex.Unlock()
 
 	peer.device.log.Debugf("%v - Sending handshake initiation", peer)
-	amnezia := peer.device.amneziaWGSnapshot()
+	amnezia := peer.amneziaWGSnapshot()
 
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
@@ -173,7 +173,7 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.handshake.mutex.Unlock()
 
 	peer.device.log.Debugf("%v - Sending handshake response", peer)
-	amnezia := peer.device.amneziaWGSnapshot()
+	amnezia := peer.amneziaWGSnapshot()
 
 	response, err := peer.device.CreateMessageResponse(peer)
 	if err != nil {
@@ -522,8 +522,8 @@ func (device *Device) RoutineEncryption(id int) {
 	device.log.Debugf("Routine: encryption worker %d - started", id)
 
 	for elemsContainer := range device.queue.encryption.c {
-		amnezia := device.amneziaWGSnapshot()
 		for _, elem := range elemsContainer.elems {
+			amnezia := elem.peer.amneziaWGSnapshot()
 			// populate header fields
 			header := elem.buffer[:MessageTransportHeaderSize]
 
@@ -564,7 +564,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	bufs := make([][]byte, 0, maxBatchSize)
 
 	for elemsContainer := range peer.queue.outbound.c {
-		amnezia := device.amneziaWGSnapshot()
+		amnezia := peer.amneziaWGSnapshot()
 		bufs = bufs[:0]
 		if elemsContainer == nil {
 			return

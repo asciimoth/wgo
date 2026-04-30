@@ -271,7 +271,7 @@ func init() {
 func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, error) {
 	device.staticIdentity.RLock()
 	defer device.staticIdentity.RUnlock()
-	amnezia := device.amneziaWGSnapshot()
+	amnezia := peer.amneziaWGSnapshot()
 
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
@@ -444,7 +444,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 }
 
 func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error) {
-	amnezia := device.amneziaWGSnapshot()
+	amnezia := peer.amneziaWGSnapshot()
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
 	defer handshake.mutex.Unlock()

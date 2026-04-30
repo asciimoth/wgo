@@ -11,9 +11,11 @@ WG_PORT_B="${WG_PORT_B:-51821}"
 
 VANILLA_DIR="${TMP_DIR}/vanilla"
 AMNEZIA_DIR="${TMP_DIR}/amnezia"
+MULTI_DIR="${TMP_DIR}/multi-peer"
 
 VANILLA_NETWORK="${RUN_ID}-vanilla-net"
 AMNEZIA_NETWORK="${RUN_ID}-amnezia-net"
+MULTI_NETWORK="${RUN_ID}-multi-net"
 
 KERNEL_IMAGE="wgo-compat-kernel:${RUN_ID}"
 WGO_IMAGE="wgo-compat-wgo:${RUN_ID}"
@@ -23,6 +25,10 @@ KERNEL_CONT="${RUN_ID}-kernel"
 VANILLA_WGO_CONT="${RUN_ID}-wgo"
 AMNEZIA_CONT="${RUN_ID}-amnezia"
 AMNEZIA_WGO_CONT="${RUN_ID}-amnezia-wgo"
+MULTI_KERNEL_CONT="${RUN_ID}-multi-kernel"
+MULTI_AMNEZIA_A_CONT="${RUN_ID}-multi-amnezia-a"
+MULTI_AMNEZIA_B_CONT="${RUN_ID}-multi-amnezia-b"
+MULTI_WGO_CONT="${RUN_ID}-multi-wgo"
 
 VANILLA_KERNEL_TUN_IP="10.88.0.1/32"
 VANILLA_WGO_TUN_IP="10.88.0.2/32"
@@ -34,7 +40,16 @@ AMNEZIA_WGO_TUN_IP="10.89.0.2/32"
 AMNEZIA_PEER_TUN_HOST="10.89.0.1"
 AMNEZIA_WGO_TUN_HOST="10.89.0.2"
 
-mkdir -p "${VANILLA_DIR}" "${AMNEZIA_DIR}"
+MULTI_WGO_TUN_IP="10.90.0.1/32"
+MULTI_KERNEL_TUN_IP="10.90.0.2/32"
+MULTI_AMNEZIA_A_TUN_IP="10.90.0.3/32"
+MULTI_AMNEZIA_B_TUN_IP="10.90.0.4/32"
+MULTI_WGO_TUN_HOST="10.90.0.1"
+MULTI_KERNEL_TUN_HOST="10.90.0.2"
+MULTI_AMNEZIA_A_TUN_HOST="10.90.0.3"
+MULTI_AMNEZIA_B_TUN_HOST="10.90.0.4"
+
+mkdir -p "${VANILLA_DIR}" "${AMNEZIA_DIR}" "${MULTI_DIR}"
 
 log() {
 	printf '==> %s\n' "$*" >&2
@@ -68,9 +83,14 @@ cleanup() {
 	capture_state "${KERNEL_CONT}" "${VANILLA_DIR}" "kernel" || true
 	capture_state "${AMNEZIA_WGO_CONT}" "${AMNEZIA_DIR}" "wgo" || true
 	capture_state "${AMNEZIA_CONT}" "${AMNEZIA_DIR}" "amnezia" || true
+	capture_state "${MULTI_WGO_CONT}" "${MULTI_DIR}" "wgo" || true
+	capture_state "${MULTI_KERNEL_CONT}" "${MULTI_DIR}" "kernel" || true
+	capture_state "${MULTI_AMNEZIA_A_CONT}" "${MULTI_DIR}" "amnezia-a" || true
+	capture_state "${MULTI_AMNEZIA_B_CONT}" "${MULTI_DIR}" "amnezia-b" || true
 
-	docker rm -f "${VANILLA_WGO_CONT}" "${KERNEL_CONT}" "${AMNEZIA_WGO_CONT}" "${AMNEZIA_CONT}" >/dev/null 2>&1 || true
-	docker network rm "${VANILLA_NETWORK}" "${AMNEZIA_NETWORK}" >/dev/null 2>&1 || true
+	docker rm -f "${VANILLA_WGO_CONT}" "${KERNEL_CONT}" "${AMNEZIA_WGO_CONT}" "${AMNEZIA_CONT}" \
+		"${MULTI_WGO_CONT}" "${MULTI_KERNEL_CONT}" "${MULTI_AMNEZIA_A_CONT}" "${MULTI_AMNEZIA_B_CONT}" >/dev/null 2>&1 || true
+	docker network rm "${VANILLA_NETWORK}" "${AMNEZIA_NETWORK}" "${MULTI_NETWORK}" >/dev/null 2>&1 || true
 	docker image rm -f "${WGO_IMAGE}" "${KERNEL_IMAGE}" "${AMNEZIA_IMAGE}" >/dev/null 2>&1 || true
 	set -e
 }
@@ -218,7 +238,7 @@ configure_kernel_peer() {
 			'
 }
 
-amnezia_device_config_payload() {
+amnezia_device_config_payload_a() {
 	cat <<'EOF'
 jc=2
 jmin=11
@@ -236,6 +256,26 @@ i2=<r 5>
 i3=<rd 4>
 i4=<rc 6>
 i5=<b 0x01020304>
+EOF
+}
+
+amnezia_device_config_payload_b() {
+	cat <<'EOF'
+jc=3
+jmin=7
+jmax=14
+s1=5
+s2=9
+s3=11
+s4=15
+h1=5111-5114
+h2=5222-5224
+h3=5333-5333
+h4=5444-5446
+i1=<b 0xdead><r 4>
+i2=<rc 2><t>
+i4=<rd 3>
+i5=<b 0x99>
 EOF
 }
 
@@ -455,7 +495,7 @@ run_amnezia_suite() {
 	amnezia_pub_hex="$(b64_to_hex "${amnezia_pub_b64}")"
 	wgo_priv_hex="$(b64_to_hex "${wgo_priv_b64}")"
 	psk_hex="$(b64_to_hex "${psk_b64}")"
-	amnezia_device_lines="$(amnezia_device_config_payload)"
+	amnezia_device_lines="$(amnezia_device_config_payload_a)"
 
 	configure_userspace_interface "${AMNEZIA_CONT}" "${AMNEZIA_PEER_TUN_IP}" "${AMNEZIA_WGO_TUN_HOST}"
 
@@ -498,6 +538,132 @@ EOF
 	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
 }
 
+run_multi_peer_suite() {
+	local kernel_outer_ip amnezia_a_outer_ip amnezia_b_outer_ip wgo_outer_ip
+	local kernel_priv_b64 kernel_pub_b64
+	local amnezia_a_priv_b64 amnezia_a_pub_b64
+	local amnezia_b_priv_b64 amnezia_b_pub_b64
+	local wgo_priv_b64 wgo_pub_b64
+	local wgo_priv_hex kernel_pub_hex amnezia_a_pub_hex amnezia_b_pub_hex
+	local amnezia_a_device_lines amnezia_b_device_lines
+
+	log "starting multi-peer per-peer compatibility suite"
+	run docker network create "${MULTI_NETWORK}"
+
+	run docker run -d \
+		--name "${MULTI_KERNEL_CONT}" \
+		--hostname multi-kernel-peer \
+		--network "${MULTI_NETWORK}" \
+		--network-alias multi-kernel-peer \
+		--privileged \
+		-v /lib/modules:/lib/modules:ro \
+		"${KERNEL_IMAGE}"
+
+	run docker run -d \
+		--name "${MULTI_AMNEZIA_A_CONT}" \
+		--hostname multi-amnezia-a-peer \
+		--network "${MULTI_NETWORK}" \
+		--network-alias multi-amnezia-a-peer \
+		--privileged \
+		"${AMNEZIA_IMAGE}" \
+		wg0
+
+	run docker run -d \
+		--name "${MULTI_AMNEZIA_B_CONT}" \
+		--hostname multi-amnezia-b-peer \
+		--network "${MULTI_NETWORK}" \
+		--network-alias multi-amnezia-b-peer \
+		--privileged \
+		"${AMNEZIA_IMAGE}" \
+		wg0
+
+	run docker run -d \
+		--name "${MULTI_WGO_CONT}" \
+		--hostname multi-wgo-peer \
+		--network "${MULTI_NETWORK}" \
+		--network-alias multi-wgo-peer \
+		--privileged \
+		"${WGO_IMAGE}" \
+		-iface wg0 \
+		-tun-local "${MULTI_WGO_TUN_IP}" \
+		-peer-route "${MULTI_KERNEL_TUN_IP}" \
+		-listen-port "${WG_PORT_A}" \
+		-mtu "${MTU}" \
+		-log-level debug
+
+	wait_for_cmd "${MULTI_KERNEL_CONT}" "true"
+	wait_for_cmd "${MULTI_AMNEZIA_A_CONT}" "test -S /var/run/amneziawg/wg0.sock"
+	wait_for_cmd "${MULTI_AMNEZIA_A_CONT}" "ip link show dev wg0"
+	wait_for_cmd "${MULTI_AMNEZIA_B_CONT}" "test -S /var/run/amneziawg/wg0.sock"
+	wait_for_cmd "${MULTI_AMNEZIA_B_CONT}" "ip link show dev wg0"
+	wait_for_cmd "${MULTI_WGO_CONT}" "test -S /var/run/wireguard/wg0.sock"
+	wait_for_cmd "${MULTI_WGO_CONT}" "ip link show dev wg0"
+
+	kernel_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${MULTI_KERNEL_CONT}")"
+	amnezia_a_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${MULTI_AMNEZIA_A_CONT}")"
+	amnezia_b_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${MULTI_AMNEZIA_B_CONT}")"
+	wgo_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${MULTI_WGO_CONT}")"
+
+	read -r kernel_priv_b64 kernel_pub_b64 <<<"$(new_key_pair "${MULTI_KERNEL_CONT}")"
+	read -r amnezia_a_priv_b64 amnezia_a_pub_b64 <<<"$(new_key_pair "${MULTI_KERNEL_CONT}")"
+	read -r amnezia_b_priv_b64 amnezia_b_pub_b64 <<<"$(new_key_pair "${MULTI_KERNEL_CONT}")"
+	read -r wgo_priv_b64 wgo_pub_b64 <<<"$(new_key_pair "${MULTI_KERNEL_CONT}")"
+
+	wgo_priv_hex="$(b64_to_hex "${wgo_priv_b64}")"
+	kernel_pub_hex="$(b64_to_hex "${kernel_pub_b64}")"
+	amnezia_a_pub_hex="$(b64_to_hex "${amnezia_a_pub_b64}")"
+	amnezia_b_pub_hex="$(b64_to_hex "${amnezia_b_pub_b64}")"
+	amnezia_a_device_lines="$(amnezia_device_config_payload_a)"
+	amnezia_b_device_lines="$(amnezia_device_config_payload_b)"
+
+	configure_kernel_interface "${MULTI_KERNEL_CONT}" "${MULTI_KERNEL_TUN_IP}" "${MULTI_WGO_TUN_HOST}"
+	configure_userspace_interface "${MULTI_AMNEZIA_A_CONT}" "${MULTI_AMNEZIA_A_TUN_IP}" "${MULTI_WGO_TUN_HOST}"
+	configure_userspace_interface "${MULTI_AMNEZIA_B_CONT}" "${MULTI_AMNEZIA_B_TUN_IP}" "${MULTI_WGO_TUN_HOST}"
+	docker_shell "${MULTI_WGO_CONT}" "ip route replace ${MULTI_AMNEZIA_A_TUN_HOST}/32 dev wg0"
+	docker_shell "${MULTI_WGO_CONT}" "ip route replace ${MULTI_AMNEZIA_B_TUN_HOST}/32 dev wg0"
+
+	log "multi-peer case: configuring remote peers"
+	configure_kernel_peer "${MULTI_KERNEL_CONT}" "${kernel_priv_b64}" "${WG_PORT_A}" "${wgo_pub_b64}" "${wgo_outer_ip}" "${WG_PORT_A}" "${MULTI_WGO_TUN_HOST}"
+	configure_wgo_peer "${MULTI_AMNEZIA_A_CONT}" "${MULTI_DIR}/amnezia-a-uapi.log" "$(b64_to_hex "${amnezia_a_priv_b64}")" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${MULTI_WGO_TUN_HOST}" "${amnezia_a_device_lines}"$'\n'
+	configure_wgo_peer "${MULTI_AMNEZIA_B_CONT}" "${MULTI_DIR}/amnezia-b-uapi.log" "$(b64_to_hex "${amnezia_b_priv_b64}")" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${MULTI_WGO_TUN_HOST}" "${amnezia_b_device_lines}"$'\n'
+
+	log "multi-peer case: configuring one wgo node with vanilla plus two peer-local amnezia profiles"
+	uapi_set "${MULTI_WGO_CONT}" "$(cat <<EOF
+set=1
+private_key=${wgo_priv_hex}
+listen_port=${WG_PORT_A}
+replace_peers=true
+public_key=${kernel_pub_hex}
+protocol_version=1
+replace_allowed_ips=true
+allowed_ip=${MULTI_KERNEL_TUN_HOST}/32
+endpoint=${kernel_outer_ip}:${WG_PORT_A}
+public_key=${amnezia_a_pub_hex}
+protocol_version=1
+$(printf '%s\n' "${amnezia_a_device_lines}")
+replace_allowed_ips=true
+allowed_ip=${MULTI_AMNEZIA_A_TUN_HOST}/32
+endpoint=${amnezia_a_outer_ip}:${WG_PORT_A}
+public_key=${amnezia_b_pub_hex}
+protocol_version=1
+$(printf '%s\n' "${amnezia_b_device_lines}")
+replace_allowed_ips=true
+allowed_ip=${MULTI_AMNEZIA_B_TUN_HOST}/32
+endpoint=${amnezia_b_outer_ip}:${WG_PORT_A}
+EOF
+)" "${MULTI_DIR}/wgo-uapi.log"
+
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_KERNEL_TUN_HOST}"
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_A_TUN_HOST}"
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_B_TUN_HOST}"
+	expect_ping_success "${MULTI_KERNEL_CONT}" "${MULTI_WGO_TUN_HOST}"
+	expect_ping_success "${MULTI_AMNEZIA_A_CONT}" "${MULTI_WGO_TUN_HOST}"
+	expect_ping_success "${MULTI_AMNEZIA_B_CONT}" "${MULTI_WGO_TUN_HOST}"
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_KERNEL_TUN_HOST}"
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_A_TUN_HOST}"
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_B_TUN_HOST}"
+}
+
 main() {
 	require_cmd docker
 	require_cmd base64
@@ -509,6 +675,7 @@ main() {
 
 	run_vanilla_suite
 	run_amnezia_suite
+	run_multi_peer_suite
 
 	log "compatibility suite passed"
 	log "artifacts: ${TMP_DIR}"

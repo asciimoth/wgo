@@ -57,6 +57,10 @@ type Peer struct {
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
 	persistentKeepaliveInterval atomic.Uint32
+	amnezia                     struct {
+		override ipcSetAmneziaWG
+		snapshot atomic.Pointer[amneziaWGSnapshot]
+	}
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
@@ -110,6 +114,7 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 
 	// add
 	device.peers.keyMap[pk] = peer
+	_ = device.refreshPeerAmneziaWGSnapshotLocked(peer)
 
 	return peer, nil
 }
@@ -192,6 +197,14 @@ func (peer *Peer) String() string {
 	b[second+2] = b64(((src[30] << 4) | (src[31] >> 4)) & 63)
 	b[second+3] = b64((src[31] << 2) & 63)
 	return string(b)
+}
+
+func (peer *Peer) amneziaWGSnapshot() amneziaWGSnapshot {
+	snapshot := peer.amnezia.snapshot.Load()
+	if snapshot == nil {
+		return peer.device.amneziaWGSnapshot()
+	}
+	return *snapshot
 }
 
 func (peer *Peer) Start() {

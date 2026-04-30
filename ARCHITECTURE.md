@@ -316,6 +316,8 @@ The primary configuration surface for embedders is the typed `Device` API. Commo
 - `Device.SetListenPort(uint16)`
 - `Device.SetFwmark(uint32)`
 - `Device.SetAmneziaWGConfig(AmneziaWGConfig)`
+- `Device.SetPeerAmneziaWGConfig(NoisePublicKey, AmneziaWGConfig)`
+- `Device.ClearPeerAmneziaWGConfig(NoisePublicKey)`
 - `Device.NewPeer(NoisePublicKey)`
 - `Device.RemovePeer(NoisePublicKey)`
 - `Device.RemoveAllPeers()`
@@ -352,23 +354,34 @@ In practice, the examples in this repository prefer the direct `Device` methods 
 
 This repository now implements the AmneziaWG 2.0 obfuscation extension described in [amnezia_wg_extension.md](/home/moth/projects/wgo/amnezia_wg_extension.md), using the current `amneziawg-go` behavior as the compatibility target where that differs from public docs.
 
-The implementation is intentionally device-global, matching the original Go daemon:
+The configuration model is now hierarchical:
 
 - `H1..H4` header ranges
 - `S1..S4` fixed prefix lengths
 - `I1..I5` pre-handshake decoy packet specs
 - `Jc`, `Jmin`, `Jmax` pre-handshake junk packet settings
 
-These values are stored on `device.Device` and apply to all peers attached to that device instance. There is no per-peer AmneziaWG profile in this repository yet.
+These values still exist on `device.Device` as the default profile for the node, but peers may now carry their own effective AmneziaWG profile too.
+
+The runtime behavior is:
+
+- device-level AmneziaWG config is the default inherited by every peer
+- a peer may override that default with its own AmneziaWG config through typed setters or peer-scoped UAPI keys
+- outbound initiation, response, and transport packets use the peer's effective AmneziaWG snapshot
+- peers without overrides continue to use the device-global defaults
+
+Receive-side classification is more constrained because the peer is not always known before packet parsing. The implementation handles this by testing the device-global snapshot first and then any peer-specific snapshots already compiled into live peers. That preserves mixed-profile interoperability while keeping the inner WireGuard processing unchanged after padding is stripped.
+
+This also means mixed per-peer profiles are only safe when their receive-side signatures are unambiguous. Matching currently stops at the first snapshot whose `(configured padding, configured header range, expected size)` fits the packet. Validation prevents header overlap within one effective profile, but it does not reject overlaps or other ambiguous combinations across different peers. If two peers can both plausibly match the same incoming wire packet, classification may select the wrong profile and the subsequent handshake or transport decode will fail.
 
 The implementation touches four main areas:
 
-- config and state: [device/amnezia.go](/home/moth/projects/wgo/device/amnezia.go), [device/config.go](/home/moth/projects/wgo/device/config.go), and [device/uapi.go](/home/moth/projects/wgo/device/uapi.go) define the typed config model, UAPI keys, CPS parsing for `I1..I5`, and header-overlap validation
-- send path: [device/noise-protocol.go](/home/moth/projects/wgo/device/noise-protocol.go) and [device/send.go](/home/moth/projects/wgo/device/send.go) generate randomized header values, prepend fixed-size random prefixes, emit `I1..I5` and `J*` packets before each initiation, and preserve the keepalive `S4` quirk from `amneziawg-go`
-- receive path: [device/receive.go](/home/moth/projects/wgo/device/receive.go) classifies packets by `(configured padding, configured header range, expected size)` before handing the stripped inner message to normal WireGuard processing
+- config and state: [device/amnezia.go](/home/moth/projects/wgo/device/amnezia.go), [device/config.go](/home/moth/projects/wgo/device/config.go), and [device/uapi.go](/home/moth/projects/wgo/device/uapi.go) define the typed config model, peer override patches, UAPI keys, CPS parsing for `I1..I5`, and header-overlap validation
+- send path: [device/noise-protocol.go](/home/moth/projects/wgo/device/noise-protocol.go) and [device/send.go](/home/moth/projects/wgo/device/send.go) generate randomized header values, prepend fixed-size random prefixes, emit `I1..I5` and `J*` packets before each initiation, and preserve the keepalive `S4` quirk from `amneziawg-go`, all from the effective per-peer snapshot
+- receive path: [device/receive.go](/home/moth/projects/wgo/device/receive.go) classifies packets by `(configured padding, configured header range, expected size)` before handing the stripped inner message to normal WireGuard processing, checking both the device-default and peer-specific snapshots; mixed per-peer profiles therefore need distinct receive-side signatures
 - cookie handling: [device/cookie.go](/home/moth/projects/wgo/device/cookie.go) now accepts the configured cookie header value so `H3` applies to cookie replies too
 
-Vanilla WireGuard support is preserved by the default device configuration:
+Vanilla WireGuard support is preserved by the default configuration and by peers that do not override it:
 
 - `H1=1`
 - `H2=2`

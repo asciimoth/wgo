@@ -42,6 +42,8 @@ It covers two interoperability tracks:
   basic tunnel setup, shared preshared key, and dynamic peer mutation
 - AmneziaWG against upstream `amneziawg-go`:
   non-default `jc/jmin/jmax`, `s1-s4`, `h1-h4`, and `i1-i5` parameters plus the same preshared-key and dynamic peer update flow
+- A concurrent multi-peer topology:
+  one `wgo` node talking to a vanilla kernel WireGuard peer and two upstream `amneziawg-go` peers with different non-default obfuscation profiles at the same time
 
 ### How It Works
 
@@ -150,6 +152,5 @@ Current gaps:
 - IPv4 only
 - No explicit roaming coverage
 - No MTU or large-transfer stress case
-- No concurrent multi-peer topology
 
 If future refactors touch UAPI handling, peer mutation logic, native TUN attachment, or bind/listen-port behavior, this suite should be extended before merging.

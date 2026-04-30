@@ -298,9 +298,21 @@ type ipcSetAmneziaWG struct {
 	packetSet         [amneziaPacketCount]bool
 }
 
-func (s *ipcSetAmneziaWG) mergeWithDevice(device *Device) error {
-	cfg := device.amneziaWGConfigLocked()
+func (s *ipcSetAmneziaWG) hasValues() bool {
+	if s.junkCount != nil || s.junkMin != nil || s.junkMax != nil ||
+		s.initHeader != nil || s.responseHeader != nil || s.cookieHeader != nil || s.transportHeader != nil ||
+		s.initPadding != nil || s.responsePadding != nil || s.cookiePadding != nil || s.transportPadding != nil {
+		return true
+	}
+	for i := range s.packetSet {
+		if s.packetSet[i] {
+			return true
+		}
+	}
+	return false
+}
 
+func (s *ipcSetAmneziaWG) merge(cfg *AmneziaWGConfig) {
 	if s.junkCount != nil {
 		cfg.JunkCount = *s.junkCount
 	}
@@ -344,7 +356,54 @@ func (s *ipcSetAmneziaWG) mergeWithDevice(device *Device) error {
 		}
 		cfg.InitiationPackets[i] = s.initiationPackets[i].Spec
 	}
+}
 
+func (s *ipcSetAmneziaWG) mergeIntoOverride(dst *ipcSetAmneziaWG) {
+	if s.junkCount != nil {
+		dst.junkCount = s.junkCount
+	}
+	if s.junkMin != nil {
+		dst.junkMin = s.junkMin
+	}
+	if s.junkMax != nil {
+		dst.junkMax = s.junkMax
+	}
+	if s.initHeader != nil {
+		dst.initHeader = s.initHeader
+	}
+	if s.responseHeader != nil {
+		dst.responseHeader = s.responseHeader
+	}
+	if s.cookieHeader != nil {
+		dst.cookieHeader = s.cookieHeader
+	}
+	if s.transportHeader != nil {
+		dst.transportHeader = s.transportHeader
+	}
+	if s.initPadding != nil {
+		dst.initPadding = s.initPadding
+	}
+	if s.responsePadding != nil {
+		dst.responsePadding = s.responsePadding
+	}
+	if s.cookiePadding != nil {
+		dst.cookiePadding = s.cookiePadding
+	}
+	if s.transportPadding != nil {
+		dst.transportPadding = s.transportPadding
+	}
+	for i := range s.initiationPackets {
+		if !s.packetSet[i] {
+			continue
+		}
+		dst.packetSet[i] = true
+		dst.initiationPackets[i] = s.initiationPackets[i]
+	}
+}
+
+func (s *ipcSetAmneziaWG) mergeWithDevice(device *Device) error {
+	cfg := device.amneziaWGConfigLocked()
+	s.merge(&cfg)
 	return device.setAmneziaWGConfigLocked(cfg)
 }
 
