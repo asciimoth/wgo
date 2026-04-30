@@ -723,14 +723,16 @@ func (device *Device) ReplaceTUN(tunDevice gtun.Tun) error {
 	}
 
 	device.state.Lock()
-	defer device.state.Unlock()
 	if device.isClosed() {
+		device.state.Unlock()
 		_ = tunDevice.Close()
 		return fmt.Errorf("device is closed")
 	}
 
 	old := device.tun.device.Swap(tunState)
 	device.tun.mtu.Store(int32(mtu))
+	device.state.Unlock()
+
 	device.startTUN(tunState)
 	device.stopTUN(old)
 	device.log.Debugf("TUN device replaced")
@@ -753,18 +755,21 @@ func (device *Device) AttachTUN(tunDevice gtun.Tun) error {
 	}
 
 	device.state.Lock()
-	defer device.state.Unlock()
 	if device.isClosed() {
+		device.state.Unlock()
 		_ = tunDevice.Close()
 		return fmt.Errorf("device is closed")
 	}
 	if device.currentTUN() != nil {
+		device.state.Unlock()
 		_ = tunDevice.Close()
 		return fmt.Errorf("device already has a TUN attached")
 	}
 
 	device.tun.device.Store(tunState)
 	device.tun.mtu.Store(int32(mtu))
+	device.state.Unlock()
+
 	device.startTUN(tunState)
 	device.log.Debugf("TUN device attached")
 	return nil
@@ -773,15 +778,18 @@ func (device *Device) AttachTUN(tunDevice gtun.Tun) error {
 // DetachTUN closes and removes the currently attached TUN, if any.
 func (device *Device) DetachTUN() error {
 	device.state.Lock()
-	defer device.state.Unlock()
 	if device.isClosed() {
+		device.state.Unlock()
 		return fmt.Errorf("device is closed")
 	}
 	old := device.tun.device.Swap(nil)
 	if old == nil {
+		device.state.Unlock()
 		return nil
 	}
 	device.tun.mtu.Store(int32(DefaultMTU))
+	device.state.Unlock()
+
 	device.stopTUN(old)
 	device.log.Debugf("TUN device detached")
 	return nil

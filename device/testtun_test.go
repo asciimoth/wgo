@@ -88,8 +88,11 @@ type channelTUN struct {
 
 	mu sync.Mutex
 
+	closeOnce sync.Once
+
 	mwo int
 	mro int
+	mtu int
 
 	lastReadOffset  int
 	lastWriteOffset int
@@ -97,10 +100,18 @@ type channelTUN struct {
 }
 
 func newChannelTUN() *channelTUN {
-	return newChannelTUNWithOffsets(0, 0)
+	return newChannelTUNWithConfig(0, 0, DefaultMTU)
 }
 
 func newChannelTUNWithOffsets(mwo, mro int) *channelTUN {
+	return newChannelTUNWithConfig(mwo, mro, DefaultMTU)
+}
+
+func newChannelTUNWithMTU(mtu int) *channelTUN {
+	return newChannelTUNWithConfig(0, 0, mtu)
+}
+
+func newChannelTUNWithConfig(mwo, mro, mtu int) *channelTUN {
 	c := &channelTUN{
 		Inbound:  make(chan []byte),
 		Outbound: make(chan []byte),
@@ -108,6 +119,7 @@ func newChannelTUNWithOffsets(mwo, mro int) *channelTUN {
 		events:   make(chan gtun.Event, 1),
 		mwo:      mwo,
 		mro:      mro,
+		mtu:      mtu,
 	}
 	c.tun.c = c
 	c.events <- gtun.EventUp
@@ -140,8 +152,10 @@ func (t *chTun) Read(packets [][]byte, sizes []int, offset int) (int, error) {
 
 func (t *chTun) Write(packets [][]byte, offset int) (int, error) {
 	if offset == -1 {
-		close(t.c.closed)
-		close(t.c.events)
+		t.c.closeOnce.Do(func() {
+			close(t.c.closed)
+			close(t.c.events)
+		})
 		return 0, io.EOF
 	}
 	for i, data := range packets {
@@ -163,7 +177,7 @@ func (t *chTun) Write(packets [][]byte, offset int) (int, error) {
 func (t *chTun) BatchSize() int            { return 1 }
 func (t *chTun) MWO() int                  { return t.c.mwo }
 func (t *chTun) MRO() int                  { return t.c.mro }
-func (t *chTun) MTU() (int, error)         { return DefaultMTU, nil }
+func (t *chTun) MTU() (int, error)         { return t.c.mtu, nil }
 func (t *chTun) Name() (string, error)     { return "loopbackTun1", nil }
 func (t *chTun) Events() <-chan gtun.Event { return t.c.events }
 func (t *chTun) Close() error {

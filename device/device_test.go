@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -867,6 +868,25 @@ func (b *fakeClosedErrBind) Send(bufs [][]byte, ep conn.Endpoint) error    { ret
 func (b *fakeClosedErrBind) ParseEndpoint(s string) (conn.Endpoint, error) { return nil, nil }
 func (b *fakeClosedErrBind) BatchSize() int                                { return b.size }
 
+type fakeAlreadyClosedBind struct {
+	size int
+}
+
+func (b *fakeAlreadyClosedBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
+	return nil, 0, net.ErrClosed
+}
+func (b *fakeAlreadyClosedBind) Close() error { return net.ErrClosed }
+func (b *fakeAlreadyClosedBind) SetMark(mark uint32) error {
+	return nil
+}
+func (b *fakeAlreadyClosedBind) Send(bufs [][]byte, ep conn.Endpoint) error {
+	return net.ErrClosed
+}
+func (b *fakeAlreadyClosedBind) ParseEndpoint(s string) (conn.Endpoint, error) {
+	return fakeBindEndpoint{bindID: "closed", dst: s}, nil
+}
+func (b *fakeAlreadyClosedBind) BatchSize() int { return b.size }
+
 type fakePanicSetMarkBind struct {
 	size int
 }
@@ -1211,6 +1231,131 @@ func TestDeviceReplaceTUN(t *testing.T) {
 	pair.Send(t, Pong, nil)
 }
 
+func TestDeviceReplaceTUNUpdatesMTU(t *testing.T) {
+	t.Parallel()
+
+	ips := [2]netip.Addr{
+		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
+		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
+	}
+	tuns := [2]*channelTUN{
+		newChannelTUNWithMTU(1500),
+		newChannelTUN(),
+	}
+	devs := newDevicePairForTUNs(t, tuns[0].TUN(), tuns[1].TUN(), ips)
+	pair := testPair{
+		{tun: tuns[0], dev: devs[0], ip: ips[0]},
+		{tun: tuns[1], dev: devs[1], ip: ips[1]},
+	}
+
+	if got := devs[0].tun.mtu.Load(); got != 1500 {
+		t.Fatalf("initial mtu = %d, want %d", got, 1500)
+	}
+
+	pair.Send(t, Ping, nil)
+
+	replacement := newChannelTUNWithConfig(maxTunHeadroom()+32, maxTunHeadroom()+32, 576)
+	if err := devs[0].ReplaceTUN(replacement.TUN()); err != nil {
+		t.Fatalf("ReplaceTUN: %v", err)
+	}
+	pair[0].tun = replacement
+
+	if got := devs[0].tun.mtu.Load(); got != 576 {
+		t.Fatalf("replacement mtu = %d, want %d", got, 576)
+	}
+
+	select {
+	case <-tuns[0].closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old tun was not closed")
+	}
+
+	pair.Send(t, Ping, nil)
+	pair.Send(t, Pong, nil)
+}
+
+func TestDeviceReplaceTUNWithClosedTUNCanRecover(t *testing.T) {
+	t.Parallel()
+
+	ips := [2]netip.Addr{
+		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
+		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
+	}
+	tuns := [2]*channelTUN{
+		newChannelTUN(),
+		newChannelTUN(),
+	}
+	devs := newDevicePairForTUNs(t, tuns[0].TUN(), tuns[1].TUN(), ips)
+	pair := testPair{
+		{tun: tuns[0], dev: devs[0], ip: ips[0]},
+		{tun: tuns[1], dev: devs[1], ip: ips[1]},
+	}
+
+	pair.Send(t, Ping, nil)
+
+	closedReplacement := newChannelTUNWithOffsets(maxTunHeadroom()+32, maxTunHeadroom()+32)
+	if err := closedReplacement.TUN().Close(); err != nil {
+		t.Fatalf("close replacement tun: %v", err)
+	}
+	if err := devs[0].ReplaceTUN(closedReplacement.TUN()); err != nil {
+		t.Fatalf("ReplaceTUN(closed): %v", err)
+	}
+
+	select {
+	case <-devs[0].Wait():
+		t.Fatal("device closed after replacing with a closed tun")
+	default:
+	}
+
+	recovery := newChannelTUNWithOffsets(maxTunHeadroom()+32, maxTunHeadroom()+32)
+	if err := devs[0].ReplaceTUN(recovery.TUN()); err != nil {
+		t.Fatalf("ReplaceTUN(recovery): %v", err)
+	}
+	pair[0].tun = recovery
+
+	pair.Send(t, Ping, nil)
+	pair.Send(t, Pong, nil)
+}
+
+func TestDeviceExternallyClosedTUNCanRecover(t *testing.T) {
+	t.Parallel()
+
+	ips := [2]netip.Addr{
+		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
+		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
+	}
+	tuns := [2]*channelTUN{
+		newChannelTUN(),
+		newChannelTUN(),
+	}
+	devs := newDevicePairForTUNs(t, tuns[0].TUN(), tuns[1].TUN(), ips)
+	pair := testPair{
+		{tun: tuns[0], dev: devs[0], ip: ips[0]},
+		{tun: tuns[1], dev: devs[1], ip: ips[1]},
+	}
+
+	pair.Send(t, Ping, nil)
+
+	if err := tuns[0].TUN().Close(); err != nil {
+		t.Fatalf("close active tun: %v", err)
+	}
+
+	select {
+	case <-devs[0].Wait():
+		t.Fatal("device closed after external tun close")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	replacement := newChannelTUNWithOffsets(maxTunHeadroom()+32, maxTunHeadroom()+32)
+	if err := devs[0].ReplaceTUN(replacement.TUN()); err != nil {
+		t.Fatalf("ReplaceTUN(recovery): %v", err)
+	}
+	pair[0].tun = replacement
+
+	pair.Send(t, Ping, nil)
+	pair.Send(t, Pong, nil)
+}
+
 func TestDeviceDetachAndAttachTUN(t *testing.T) {
 	t.Parallel()
 
@@ -1374,6 +1519,128 @@ func TestDeviceReplaceBindReparsesPeerEndpoints(t *testing.T) {
 
 	if err := peer.SendBuffers([][]byte{{1, 2, 3}}); err != nil {
 		t.Fatalf("SendBuffers with rebound endpoint: %v", err)
+	}
+}
+
+func TestDeviceExternallyClosedBindCanRecover(t *testing.T) {
+	t.Parallel()
+
+	ips := [2]netip.Addr{
+		netip.AddrFrom4([4]byte{1, 0, 0, 1}),
+		netip.AddrFrom4([4]byte{1, 0, 0, 2}),
+	}
+	tuns := [2]*channelTUN{
+		newChannelTUN(),
+		newChannelTUN(),
+	}
+	binds := bindtest.NewChannelBinds()
+	key0 := mustPrivateKey(t, 0)
+	key1 := mustPrivateKey(t, 1)
+	pub0 := key0.publicKey()
+	pub1 := key1.publicKey()
+	devs := newDevicePairForTUNsAndBinds(t, tuns[0].TUN(), tuns[1].TUN(), ips, binds)
+	pair := testPair{
+		{tun: tuns[0], dev: devs[0], ip: ips[0]},
+		{tun: tuns[1], dev: devs[1], ip: ips[1]},
+	}
+
+	pair.Send(t, Ping, nil)
+
+	for i := range binds {
+		if err := binds[i].Close(); err != nil {
+			t.Fatalf("close active bind %d: %v", i, err)
+		}
+	}
+
+	for i := range devs {
+		select {
+		case <-devs[i].Wait():
+			t.Fatalf("device %d closed after external bind close", i)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	replacementBinds := bindtest.NewChannelBinds()
+	for i := range devs {
+		if err := devs[i].ReplaceBind(replacementBinds[i]); err != nil {
+			t.Fatalf("ReplaceBind(%d): %v", i, err)
+		}
+	}
+
+	endpointCfgs := [2]string{
+		uapiCfg("public_key", hex.EncodeToString(pub1[:]), "endpoint", fmt.Sprintf("127.0.0.1:%d", devs[1].net.port)),
+		uapiCfg("public_key", hex.EncodeToString(pub0[:]), "endpoint", fmt.Sprintf("127.0.0.1:%d", devs[0].net.port)),
+	}
+	for i := range devs {
+		if err := devs[i].IpcSet(endpointCfgs[i]); err != nil {
+			t.Fatalf("IpcSet endpoint after ReplaceBind(%d): %v", i, err)
+		}
+	}
+
+	pair.Send(t, Ping, nil)
+	pair.Send(t, Pong, nil)
+}
+
+func TestDeviceReplaceBindWithClosedBindCanRecover(t *testing.T) {
+	t.Parallel()
+
+	tunDev := &fakeTUNDeviceSized{size: 1}
+	tunDev.ensureInit()
+
+	bind0 := &fakeTransitionBind{id: "bind0", size: 1}
+	bind1 := &fakeTransitionBind{id: "bind1", size: 1}
+	dev := NewDevice(tunDev, bind0, NewLogger(LogLevelError, "dev0: "))
+	t.Cleanup(dev.Close)
+
+	key0 := mustPrivateKey(t, 0)
+	key1 := mustPrivateKey(t, 1)
+	dev.SetPrivateKey(key0)
+
+	peer, err := dev.NewPeer(key1.publicKey())
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	peer.endpoint.Lock()
+	peer.endpoint.val = fakeBindEndpoint{bindID: bind0.id, dst: "127.0.0.1:51820"}
+	peer.endpoint.Unlock()
+
+	if err := dev.Up(); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	waitForDeviceUp(t, dev)
+
+	err = dev.ReplaceBind(&fakeAlreadyClosedBind{size: 1})
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("ReplaceBind(closed) error = %v, want %v", err, net.ErrClosed)
+	}
+	if !dev.isUp() {
+		t.Fatal("device should remain in up state after failed closed bind replacement")
+	}
+
+	select {
+	case <-dev.Wait():
+		t.Fatal("device closed after replacing with a closed bind")
+	default:
+	}
+
+	if err := dev.ReplaceBind(bind1); err != nil {
+		t.Fatalf("ReplaceBind(recovery): %v", err)
+	}
+
+	peer.endpoint.Lock()
+	endpoint, ok := peer.endpoint.val.(fakeBindEndpoint)
+	peer.endpoint.Unlock()
+	if !ok {
+		t.Fatal("expected fake bind endpoint after bind recovery")
+	}
+	if endpoint.bindID != bind1.id {
+		t.Fatalf("endpoint bind id = %q, want %q", endpoint.bindID, bind1.id)
+	}
+	if !peer.isRunning.Load() {
+		t.Fatal("expected peer to be running after bind recovery")
+	}
+	if err := peer.SendBuffers([][]byte{{1, 2, 3}}); err != nil {
+		t.Fatalf("SendBuffers after bind recovery: %v", err)
 	}
 }
 

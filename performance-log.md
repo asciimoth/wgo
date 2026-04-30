@@ -1,6 +1,6 @@
 # WireGuard Performance Report
 
-- Generated: 2026-04-30 17:03:35Z
+- Generated: 2026-04-30 18:43:37Z
 - Duration per iperf run: 10s
 - Omit window: 1s
 - MTU: 1420
@@ -8,41 +8,41 @@
 
 ## wgo
 
-- Revision: `184ad93`
+- Revision: `61cd91e`
 
 ### TCP
 
 | Direction | Duration (s) | Sender (Mbps) | Receiver (Mbps) | Retransmits | Bytes Sent | Bytes Received |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.00 | 7748.99 | 7749.32 | 0 | 9686220800 | 9689628664 |
-| peer-b -> peer-a | 10.00 | 7635.91 | 7636.63 | 0 | 9544663040 | 9548793392 |
+| peer-a -> peer-b | 10.00 | 7872.73 | 7873.98 | 0 | 9840885760 | 9844360832 |
+| peer-b -> peer-a | 10.00 | 7672.45 | 7672.26 | 0 | 9590538240 | 9594144464 |
 
 ### UDP
 
 | Direction | Duration (s) | Throughput (Mbps) | Jitter (ms) | Lost (%) | Bytes | Packets | Lost Packets |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.20 | 7105.21 | 0.015 | 93.504 | 8881507440 | 6492330 | 6070614 |
-| peer-b -> peer-a | 10.02 | 7121.29 | 0.013 | 93.997 | 8901603360 | 6507020 | 6116428 |
+| peer-a -> peer-b | 10.21 | 7007.51 | 0.013 | 93.501 | 8759386080 | 6403060 | 5986896 |
+| peer-b -> peer-a | 10.21 | 7626.96 | 0.011 | 93.161 | 9533687760 | 6969070 | 6492485 |
 
 
 ## wgo-amnezia
 
-- Revision: `184ad93`
+- Revision: `61cd91e`
 - Profile: non-default Amnezia UAPI fields (, , , , , , )
 
 ### TCP
 
 | Direction | Duration (s) | Sender (Mbps) | Receiver (Mbps) | Retransmits | Bytes Sent | Bytes Received |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.00 | 2.95 | 2.92 | 354 | 3681288 | 3645720 |
-| peer-b -> peer-a | 10.00 | 6.63 | 6.61 | 388 | 8281872 | 8259984 |
+| peer-a -> peer-b | 10.00 | 6.78 | 6.78 | 416 | 8478864 | 8474760 |
+| peer-b -> peer-a | 10.00 | 6.81 | 6.78 | 414 | 8511696 | 8478864 |
 
 ### UDP
 
 | Direction | Duration (s) | Throughput (Mbps) | Jitter (ms) | Lost (%) | Bytes | Packets | Lost Packets |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.21 | 7817.26 | 0.014 | 96.371 | 9771555600 | 7142950 | 6883712 |
-| peer-b -> peer-a | 10.20 | 7710.57 | 0.014 | 94.983 | 9638189280 | 7045460 | 6691991 |
+| peer-a -> peer-b | 10.21 | 7322.59 | 0.015 | 96.691 | 9153219600 | 6690950 | 6469531 |
+| peer-b -> peer-a | 10.20 | 7466.25 | 0.014 | 96.922 | 9332810640 | 6822230 | 6612256 |
 
 
 ## wireguard-go
@@ -53,15 +53,15 @@
 
 | Direction | Duration (s) | Sender (Mbps) | Receiver (Mbps) | Retransmits | Bytes Sent | Bytes Received |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.00 | 7742.56 | 7741.85 | 0 | 9678356480 | 9681239808 |
-| peer-b -> peer-a | 10.00 | 7715.43 | 7715.16 | 0 | 9644277760 | 9647686568 |
+| peer-a -> peer-b | 10.00 | 7736.66 | 7737.30 | 0 | 9670492160 | 9674755120 |
+| peer-b -> peer-a | 10.00 | 7787.80 | 7788.41 | 0 | 9734717440 | 9738457136 |
 
 ### UDP
 
 | Direction | Duration (s) | Throughput (Mbps) | Jitter (ms) | Lost (%) | Bytes | Packets | Lost Packets |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.20 | 7268.00 | 0.009 | 93.915 | 9084983760 | 6641070 | 6236942 |
-| peer-b -> peer-a | 10.20 | 7458.99 | 0.012 | 93.428 | 9323740800 | 6815600 | 6367700 |
+| peer-a -> peer-b | 10.20 | 7045.08 | 0.012 | 93.342 | 8806335840 | 6437380 | 6008770 |
+| peer-b -> peer-a | 10.01 | 7068.67 | 0.011 | 94.319 | 8835816240 | 6458930 | 6092023 |
 
 
 ## amneziawg-go
@@ -73,15 +73,15 @@
 
 | Direction | Duration (s) | Sender (Mbps) | Receiver (Mbps) | Retransmits | Bytes Sent | Bytes Received |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.00 | 4.21 | 4.17 | 366 | 5264064 | 5218920 |
-| peer-b -> peer-a | 10.00 | 4.78 | 4.76 | 356 | 5974056 | 5952168 |
+| peer-a -> peer-b | 10.00 | 5.96 | 5.96 | 402 | 7447392 | 7444656 |
+| peer-b -> peer-a | 10.00 | 6.87 | 6.87 | 412 | 8592408 | 8593776 |
 
 ### UDP
 
 | Direction | Duration (s) | Throughput (Mbps) | Jitter (ms) | Lost (%) | Bytes | Packets | Lost Packets |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.02 | 7411.04 | 0.014 | 96.562 | 9263781360 | 6771770 | 6538952 |
-| peer-b -> peer-a | 10.21 | 7796.34 | 0.011 | 96.018 | 9745413120 | 7123840 | 6840198 |
+| peer-a -> peer-b | 10.01 | 7995.92 | 0.017 | 95.702 | 9994881600 | 7306200 | 6992151 |
+| peer-b -> peer-a | 10.21 | 7267.04 | 0.016 | 96.228 | 9083779920 | 6640190 | 6389691 |
 
 
 ## kernel
@@ -92,13 +92,13 @@
 
 | Direction | Duration (s) | Sender (Mbps) | Receiver (Mbps) | Retransmits | Bytes Sent | Bytes Received |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.00 | 1697.26 | 1696.51 | 0 | 2121575112 | 2121011496 |
-| peer-b -> peer-a | 10.00 | 1683.17 | 1683.25 | 0 | 2103958008 | 2104802064 |
+| peer-a -> peer-b | 10.00 | 1943.60 | 1943.87 | 0 | 2429488656 | 2430284832 |
+| peer-b -> peer-a | 10.00 | 1739.39 | 1738.96 | 0 | 2174233536 | 2174147352 |
 
 ### UDP
 
 | Direction | Duration (s) | Throughput (Mbps) | Jitter (ms) | Lost (%) | Bytes | Packets | Lost Packets |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.00 | 2092.58 | 0.004 | 0.013 | 2615711760 | 1912070 | 245 |
-| peer-b -> peer-a | 10.00 | 2192.93 | 0.005 | 0.001 | 2741157360 | 2003770 | 13 |
+| peer-a -> peer-b | 10.00 | 2220.14 | 0.005 | 0.046 | 2775165840 | 2028630 | 928 |
+| peer-b -> peer-a | 10.00 | 1998.45 | 0.004 | 0.007 | 2498063760 | 1826070 | 136 |
 

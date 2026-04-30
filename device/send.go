@@ -383,9 +383,17 @@ func (device *Device) RoutineReadFromTUN(tun *tunState) {
 				return
 			}
 			if !device.isClosed() {
-				if !errors.Is(readErr, os.ErrClosed) {
-					device.log.Errf("Failed to read packet from TUN device: %v", readErr)
+				if errors.Is(readErr, os.ErrClosed) {
+					device.state.Lock()
+					if !device.isClosed() && device.currentTUN() == tun {
+						device.tun.device.Store(nil)
+						device.tun.mtu.Store(int32(DefaultMTU))
+						device.log.Debugf("TUN device detached after external close")
+					}
+					device.state.Unlock()
+					return
 				}
+				device.log.Errf("Failed to read packet from TUN device: %v", readErr)
 				go device.Close()
 			}
 			return
