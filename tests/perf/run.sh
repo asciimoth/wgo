@@ -11,6 +11,7 @@ SUMMARY_BIN="${TMP_DIR}/iperf-summary"
 KERNEL_IMAGE="wgo-perf-kernel:${RUN_ID}"
 WGO_IMAGE="wgo-perf-wgo:${RUN_ID}"
 UPSTREAM_IMAGE="wgo-perf-upstream:${RUN_ID}"
+AMNEZIA_IMAGE="wgo-perf-amnezia:${RUN_ID}"
 
 MTU="${MTU:-1420}"
 IPERF_SECONDS="${IPERF_SECONDS:-10}"
@@ -19,10 +20,10 @@ IPERF_PORT="${IPERF_PORT:-5201}"
 WG_PORT_A="${WG_PORT_A:-51820}"
 WG_PORT_B="${WG_PORT_B:-51821}"
 
-SUBJECTS=(wgo wireguard-go kernel)
+SUBJECTS=(wgo wgo-amnezia wireguard-go amneziawg-go kernel)
 NETWORKS=()
 CONTAINERS=()
-IMAGES=("${KERNEL_IMAGE}" "${WGO_IMAGE}" "${UPSTREAM_IMAGE}")
+IMAGES=("${KERNEL_IMAGE}" "${WGO_IMAGE}" "${UPSTREAM_IMAGE}" "${AMNEZIA_IMAGE}")
 
 mkdir -p "${TMP_DIR}"
 
@@ -156,7 +157,13 @@ uapi_set() {
 	local reply
 	reply="$(
 		printf '%s\n\n' "${payload}" \
-			| docker exec -i "${cont}" sh -ceu 'exec socat - UNIX-CONNECT:/var/run/wireguard/wg0.sock'
+			| docker exec -i "${cont}" sh -ceu '
+				socket=/var/run/wireguard/wg0.sock
+				if [ ! -S "${socket}" ] && [ -S /var/run/amneziawg/wg0.sock ]; then
+					socket=/var/run/amneziawg/wg0.sock
+				fi
+				exec socat - UNIX-CONNECT:"${socket}"
+			'
 	)"
 	if ! grep -q '^errno=0$' <<<"${reply}"; then
 		echo "uapi request failed in ${cont}" >&2
@@ -220,11 +227,12 @@ set_peer_with_uapi() {
 	local peer_outer_ip="$5"
 	local peer_port="$6"
 	local peer_tun_host="$7"
+	local extra_device_lines="${8:-}"
 	uapi_set "${cont}" "$(cat <<EOF
 set=1
 private_key=${private_key_hex}
 listen_port=${listen_port}
-replace_peers=true
+${extra_device_lines}replace_peers=true
 public_key=${peer_pub_hex}
 protocol_version=1
 replace_allowed_ips=true
@@ -232,6 +240,27 @@ allowed_ip=${peer_tun_host}/32
 endpoint=${peer_outer_ip}:${peer_port}
 EOF
 )"
+}
+
+amnezia_perf_device_config_payload() {
+	cat <<'EOF'
+jc=2
+jmin=11
+jmax=23
+s1=13
+s2=17
+s3=19
+s4=29
+h1=1111-1113
+h2=2222-2225
+h3=3333-3333
+h4=4444-4449
+i1=<b 0xaa55><rc 3><rd 2><t>
+i2=<r 5>
+i3=<rd 4>
+i4=<rc 6>
+i5=<b 0x01020304>
+EOF
 }
 
 run_iperf() {
@@ -298,7 +327,7 @@ start_subject_containers() {
 	local tun_ip_b="$6"
 
 	case "${subject}" in
-		wgo)
+		wgo | wgo-amnezia)
 			run docker run -d \
 				--name "${cont_a}" \
 				--hostname "${cont_a}" \
@@ -350,6 +379,27 @@ start_subject_containers() {
 			wait_for_cmd "${cont_a}" "ip link show dev wg0"
 			wait_for_cmd "${cont_b}" "ip link show dev wg0"
 			;;
+		amneziawg-go)
+			run docker run -d \
+				--name "${cont_a}" \
+				--hostname "${cont_a}" \
+				--network "${network}" \
+				--privileged \
+				"${AMNEZIA_IMAGE}" \
+				wg0
+			run docker run -d \
+				--name "${cont_b}" \
+				--hostname "${cont_b}" \
+				--network "${network}" \
+				--privileged \
+				"${AMNEZIA_IMAGE}" \
+				wg0
+			CONTAINERS+=("${subject}:${cont_a}" "${subject}:${cont_b}")
+			wait_for_cmd "${cont_a}" "test -S /var/run/amneziawg/wg0.sock"
+			wait_for_cmd "${cont_b}" "test -S /var/run/amneziawg/wg0.sock"
+			wait_for_cmd "${cont_a}" "ip link show dev wg0"
+			wait_for_cmd "${cont_b}" "ip link show dev wg0"
+			;;
 		kernel)
 			run docker run -d \
 				--name "${cont_a}" \
@@ -384,23 +434,34 @@ configure_subject() {
 	local tun_host_b="$7"
 	local outer_ip_a="$8"
 	local outer_ip_b="$9"
-	local key_a key_b priv_a pub_a priv_b pub_b
+	local key_a key_b priv_a pub_a priv_b pub_b amnezia_device_lines
 
 	key_a="$(new_key_pair "${cont_a}")"
 	key_b="$(new_key_pair "${cont_b}")"
 	read -r priv_a pub_a <<<"${key_a}"
 	read -r priv_b pub_b <<<"${key_b}"
+	amnezia_device_lines="$(amnezia_perf_device_config_payload)"$'\n'
 
 	case "${subject}" in
 		wgo)
 			set_peer_with_uapi "${cont_a}" "$(b64_to_hex "${priv_a}")" "${WG_PORT_A}" "$(b64_to_hex "${pub_b}")" "${outer_ip_b}" "${WG_PORT_B}" "${tun_host_b}"
 			set_peer_with_uapi "${cont_b}" "$(b64_to_hex "${priv_b}")" "${WG_PORT_B}" "$(b64_to_hex "${pub_a}")" "${outer_ip_a}" "${WG_PORT_A}" "${tun_host_a}"
 			;;
+		wgo-amnezia)
+			set_peer_with_uapi "${cont_a}" "$(b64_to_hex "${priv_a}")" "${WG_PORT_A}" "$(b64_to_hex "${pub_b}")" "${outer_ip_b}" "${WG_PORT_B}" "${tun_host_b}" "${amnezia_device_lines}"
+			set_peer_with_uapi "${cont_b}" "$(b64_to_hex "${priv_b}")" "${WG_PORT_B}" "$(b64_to_hex "${pub_a}")" "${outer_ip_a}" "${WG_PORT_A}" "${tun_host_a}" "${amnezia_device_lines}"
+			;;
 		wireguard-go)
 			configure_userspace_iface "${cont_a}" "${tun_ip_a}" "${tun_host_b}"
 			configure_userspace_iface "${cont_b}" "${tun_ip_b}" "${tun_host_a}"
 			set_peer_with_wg "${cont_a}" "${priv_a}" "${WG_PORT_A}" "${pub_b}" "${outer_ip_b}" "${WG_PORT_B}" "${tun_host_b}"
 			set_peer_with_wg "${cont_b}" "${priv_b}" "${WG_PORT_B}" "${pub_a}" "${outer_ip_a}" "${WG_PORT_A}" "${tun_host_a}"
+			;;
+		amneziawg-go)
+			configure_userspace_iface "${cont_a}" "${tun_ip_a}" "${tun_host_b}"
+			configure_userspace_iface "${cont_b}" "${tun_ip_b}" "${tun_host_a}"
+			set_peer_with_uapi "${cont_a}" "$(b64_to_hex "${priv_a}")" "${WG_PORT_A}" "$(b64_to_hex "${pub_b}")" "${outer_ip_b}" "${WG_PORT_B}" "${tun_host_b}" "${amnezia_device_lines}"
+			set_peer_with_uapi "${cont_b}" "$(b64_to_hex "${priv_b}")" "${WG_PORT_B}" "$(b64_to_hex "${pub_a}")" "${outer_ip_a}" "${WG_PORT_A}" "${tun_host_a}" "${amnezia_device_lines}"
 			;;
 		kernel)
 			configure_kernel_iface "${cont_a}" "${tun_ip_a}" "${tun_host_b}"
@@ -417,13 +478,21 @@ record_subject_metadata() {
 	append_log ""
 	append_log "## ${subject}"
 	append_log ""
-	case "${subject}" in
-		wgo)
-			append_log "- Revision: \`$(git -C "${ROOT_DIR}" rev-parse --short HEAD)\`"
-			;;
-		wireguard-go)
-			append_log "- Upstream revision: \`$(docker_shell "${cont}" "cat /usr/local/share/wireguard-go.commit" | cut -c1-12)\`"
-			;;
+		case "${subject}" in
+			wgo)
+				append_log "- Revision: \`$(git -C "${ROOT_DIR}" rev-parse --short HEAD)\`"
+				;;
+			wgo-amnezia)
+				append_log "- Revision: \`$(git -C "${ROOT_DIR}" rev-parse --short HEAD)\`"
+				append_log "- Profile: non-default Amnezia UAPI fields (`jc=2`, `jmin=11`, `jmax=23`, `s1=13`, `s2=17`, `s3=19`, `s4=29`)"
+				;;
+			wireguard-go)
+				append_log "- Upstream revision: \`$(docker_shell "${cont}" "cat /usr/local/share/wireguard-go.commit" | cut -c1-12)\`"
+				;;
+			amneziawg-go)
+				append_log "- Upstream revision: \`$(docker_shell "${cont}" "cat /usr/local/share/amneziawg-go.commit" | cut -c1-12)\`"
+				append_log "- Profile: non-default Amnezia UAPI fields (`jc=2`, `jmin=11`, `jmax=23`, `s1=13`, `s2=17`, `s3=19`, `s4=29`)"
+				;;
 		kernel)
 			append_log "- Kernel release: \`$(docker_shell "${cont}" "uname -r")\`"
 			;;
@@ -476,6 +545,7 @@ main() {
 	run docker build -f tests/perf/docker/kernel-peer.Dockerfile -t "${KERNEL_IMAGE}" "${ROOT_DIR}"
 	run docker build -f tests/perf/docker/wgo-peer.Dockerfile -t "${WGO_IMAGE}" "${ROOT_DIR}"
 	run docker build -f tests/perf/docker/upstream-peer.Dockerfile -t "${UPSTREAM_IMAGE}" "${ROOT_DIR}"
+	run docker build -f tests/perf/docker/amnezia-peer.Dockerfile -t "${AMNEZIA_IMAGE}" "${ROOT_DIR}"
 
 	for subject in "${SUBJECTS[@]}"; do
 		log "running ${subject} performance benchmarks"

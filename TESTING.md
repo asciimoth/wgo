@@ -4,7 +4,7 @@ This repository has two test layers:
 
 - Fast package tests with `go test -race ./...`
 - A Linux compatibility suite that runs this library against kernel-space WireGuard and upstream `amneziawg-go` in Docker
-- A Linux performance suite that benchmarks this library, upstream `wireguard-go`, and kernel-space WireGuard with `iperf3`
+- A Linux performance suite that benchmarks this library, upstream `wireguard-go`, upstream `amneziawg-go`, and kernel-space WireGuard with `iperf3`
 
 ## Standard Checks
 
@@ -108,19 +108,22 @@ It follows the same high-level harness style as the compatibility suite: build t
 
 ### What It Benchmarks
 
-The performance suite runs three subjects independently:
+The performance suite runs five subjects independently:
 
 - Two peers implemented by this repository (`wgo`)
+- Two peers implemented by this repository with a non-default Amnezia profile (`wgo-amnezia`)
 - Two peers implemented by upstream `wireguard-go`
+- Two peers implemented by upstream `amneziawg-go` with the same non-default Amnezia profile
 - Two peers implemented by Linux kernel-space WireGuard
 
 For each subject it:
 
 1. Starts two paired peers in Docker.
 2. Configures tunnel addresses, routes, private keys, public keys, endpoints, and listen ports.
-3. Verifies bidirectional tunnel reachability with `ping`.
-4. Runs `iperf3` TCP and UDP benchmarks in both directions across the WireGuard tunnel.
-5. Stores raw `iperf3` JSON output under `.tmp/perf/` and writes a readable summary report to the repository-root `performance-log.md`.
+3. For the Amnezia-specific subjects, also applies non-default `jc/jmin/jmax`, `s1-s4`, `h1-h4`, and `i1-i5` UAPI fields, including a positive `s4`.
+4. Verifies bidirectional tunnel reachability with `ping`.
+5. Runs `iperf3` TCP and UDP benchmarks in both directions across the WireGuard tunnel.
+6. Stores raw `iperf3` JSON output under `.tmp/perf/` and writes a readable summary report to the repository-root `performance-log.md`.
 
 The runner is [tests/perf/run.sh](/home/moth/projects/wgo/tests/perf/run.sh).
 
