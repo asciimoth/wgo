@@ -3,7 +3,7 @@
 This repository has two test layers:
 
 - Fast package tests with `go test -race ./...`
-- A Linux compatibility suite that runs this library against kernel-space WireGuard in Docker
+- A Linux compatibility suite that runs this library against kernel-space WireGuard and upstream `amneziawg-go` in Docker
 - A Linux performance suite that benchmarks this library, upstream `wireguard-go`, and kernel-space WireGuard with `iperf3`
 
 ## Standard Checks
@@ -33,14 +33,15 @@ The current `Justfile` uses `sudo` for this target because the suite needs Docke
 The compatibility suite validates interoperability between:
 
 - A Linux kernel-space WireGuard peer
+- An upstream `amneziawg-go` peer
 - A userspace peer built from this repository (`cmd/compat_wgo_peer`)
 
-It covers three cases:
+It covers two interoperability tracks:
 
-- Basic tunnel setup and bidirectional ping over the WireGuard tunnel
-- Peer setup with a symmetric preshared key on both sides
-- Dynamic peer changes through live configuration updates:
-  remove peer, add peer back, and edit endpoint after listen-port change
+- Vanilla WireGuard against the Linux kernel peer:
+  basic tunnel setup, shared preshared key, and dynamic peer mutation
+- AmneziaWG against upstream `amneziawg-go`:
+  non-default `jc/jmin/jmax`, `s1-s4`, `h1-h4`, and `i1-i5` parameters plus the same preshared-key and dynamic peer update flow
 
 ### How It Works
 
@@ -48,16 +49,18 @@ The runner is [tests/compat/run.sh](/home/moth/projects/wgo/tests/compat/run.sh)
 
 For each run it:
 
-1. Builds two temporary Docker images:
+1. Builds three temporary Docker images:
    - [tests/compat/docker/kernel-peer.Dockerfile](/home/moth/projects/wgo/tests/compat/docker/kernel-peer.Dockerfile)
    - [tests/compat/docker/wgo-peer.Dockerfile](/home/moth/projects/wgo/tests/compat/docker/wgo-peer.Dockerfile)
+   - [tests/compat/docker/amnezia-peer.Dockerfile](/home/moth/projects/wgo/tests/compat/docker/amnezia-peer.Dockerfile)
 2. Creates an isolated Docker network.
-3. Starts two privileged containers:
+3. Starts privileged containers for each track:
    - `kernel-peer`: uses Linux kernel WireGuard via `ip link add ... type wireguard`
+   - `amnezia-peer`: runs upstream `amneziawg-go`
    - `wgo-peer`: runs `compat-wgo-peer`, which creates a native TUN, starts `device.Device`, and exposes a WireGuard-compatible UAPI socket
 4. Configures both peers using real control surfaces:
    - `wg` commands on the kernel peer
-   - UAPI `set=1` requests against `/var/run/wireguard/wg0.sock` on the `wgo` peer
+   - UAPI `set=1` requests against `/var/run/wireguard/wg0.sock` on the `wgo` and `amneziawg-go` peers
    - `ip` commands for interface addresses, routes, MTU, and link state
 5. Verifies tunnel behavior with `ping`.
 
@@ -87,7 +90,7 @@ The runner captures:
 - Container logs
 - `ip addr` / `ip route` snapshots
 - `wg show` output
-- UAPI request/response logs for the `wgo` peer
+- UAPI request/response logs for the `wgo` and `amneziawg-go` peers
 
 Containers, Docker network, and temporary Docker images are removed during cleanup.
 

@@ -1,6 +1,6 @@
 # WireGuard Performance Report
 
-- Generated: 2026-04-29 10:57:41Z
+- Generated: 2026-04-30 14:57:16Z
 - Duration per iperf run: 10s
 - Omit window: 1s
 - MTU: 1420
@@ -8,21 +8,21 @@
 
 ## wgo
 
-- Revision: `06c0363`
+- Revision: `58e79eb`
 
 ### TCP
 
 | Direction | Duration (s) | Sender (Mbps) | Receiver (Mbps) | Retransmits | Bytes Sent | Bytes Received |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.00 | 7643.08 | 7643.51 | 0 | 9553838080 | 9557183616 |
-| peer-b -> peer-a | 10.00 | 7720.47 | 7719.98 | 0 | 9650831360 | 9654568744 |
+| peer-a -> peer-b | 10.00 | 7838.12 | 7838.22 | 0 | 9797632000 | 9800976088 |
+| peer-b -> peer-a | 10.00 | 7588.47 | 7587.91 | 0 | 9485680640 | 9488957608 |
 
 ### UDP
 
 | Direction | Duration (s) | Throughput (Mbps) | Jitter (ms) | Lost (%) | Bytes | Packets | Lost Packets |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.20 | 7435.95 | 0.011 | 92.173 | 9294930720 | 6794540 | 6262762 |
-| peer-b -> peer-a | 10.21 | 7598.73 | 0.012 | 92.895 | 9498407040 | 6943280 | 6449950 |
+| peer-a -> peer-b | 10.20 | 7086.59 | 0.012 | 94.083 | 8858224080 | 6475310 | 6092147 |
+| peer-b -> peer-a | 10.01 | 7113.42 | 0.013 | 94.668 | 8891767440 | 6499830 | 6153234 |
 
 
 ## wireguard-go
@@ -33,15 +33,15 @@
 
 | Direction | Duration (s) | Sender (Mbps) | Receiver (Mbps) | Retransmits | Bytes Sent | Bytes Received |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.00 | 7575.93 | 7575.98 | 0 | 9469952000 | 9474213336 |
-| peer-b -> peer-a | 10.00 | 7641.01 | 7640.70 | 0 | 9551216640 | 9554234800 |
+| peer-a -> peer-b | 10.00 | 7876.95 | 7877.54 | 0 | 9846128640 | 9849997008 |
+| peer-b -> peer-a | 10.00 | 7773.11 | 7772.54 | 0 | 9716367360 | 9719579008 |
 
 ### UDP
 
 | Direction | Duration (s) | Throughput (Mbps) | Jitter (ms) | Lost (%) | Bytes | Packets | Lost Packets |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.21 | 7561.25 | 0.011 | 92.886 | 9451539360 | 6909020 | 6417501 |
-| peer-b -> peer-a | 10.21 | 6894.42 | 0.013 | 93.026 | 8618016960 | 6299720 | 5860383 |
+| peer-a -> peer-b | 10.21 | 7523.09 | 0.012 | 93.020 | 9403850880 | 6874160 | 6394349 |
+| peer-b -> peer-a | 10.21 | 6989.65 | 0.013 | 93.521 | 8737046640 | 6386730 | 5972915 |
 
 
 ## kernel
@@ -52,13 +52,13 @@
 
 | Direction | Duration (s) | Sender (Mbps) | Receiver (Mbps) | Retransmits | Bytes Sent | Bytes Received |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.00 | 1466.57 | 1466.37 | 0 | 1833207552 | 1833274584 |
-| peer-b -> peer-a | 10.00 | 1423.83 | 1423.13 | 0 | 1779777576 | 1779271416 |
+| peer-a -> peer-b | 10.00 | 1746.39 | 1746.15 | 0 | 2182977792 | 2183139216 |
+| peer-b -> peer-a | 10.00 | 1850.03 | 1849.72 | 0 | 2312534232 | 2312513712 |
 
 ### UDP
 
 | Direction | Duration (s) | Throughput (Mbps) | Jitter (ms) | Lost (%) | Bytes | Packets | Lost Packets |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| peer-a -> peer-b | 10.00 | 1745.33 | 0.005 | 0.000 | 2181659040 | 1594780 | 5 |
-| peer-b -> peer-a | 10.00 | 1748.43 | 0.006 | 0.000 | 2185544160 | 1597620 | 0 |
+| peer-a -> peer-b | 10.00 | 2037.48 | 0.003 | 0.002 | 2546846640 | 1861730 | 35 |
+| peer-b -> peer-a | 10.00 | 2156.01 | 0.004 | 0.008 | 2695014720 | 1970040 | 149 |
 

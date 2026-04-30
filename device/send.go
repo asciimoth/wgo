@@ -6,8 +6,10 @@
 package device
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"math/big"
 	"net"
 	"os"
 	"sync"
@@ -116,11 +118,29 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.handshake.mutex.Unlock()
 
 	peer.device.log.Debugf("%v - Sending handshake initiation", peer)
+	amnezia := peer.device.amneziaWGSnapshot()
 
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
 		peer.device.log.Errf("%v - Failed to create initiation message: %v", peer, err)
 		return err
+	}
+
+	sendBuffer := make([][]byte, 0, amneziaPacketCount+1+amnezia.junk.count)
+	for _, chain := range amnezia.ipackets {
+		if chain == nil {
+			continue
+		}
+		buf := make([]byte, chain.ObfuscatedLen())
+		chain.Obfuscate(buf)
+		sendBuffer = append(sendBuffer, buf)
+	}
+	for i := 0; i < amnezia.junk.count; i++ {
+		nBig, _ := rand.Int(rand.Reader, big.NewInt(int64(amnezia.junk.max-amnezia.junk.min+1)))
+		n := int(nBig.Int64()) + amnezia.junk.min
+		buf := make([]byte, n)
+		_, _ = rand.Read(buf)
+		sendBuffer = append(sendBuffer, buf)
 	}
 
 	packet := make([]byte, MessageInitiationSize)
@@ -130,7 +150,15 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	err = peer.SendBuffers([][]byte{packet})
+	if padding := amnezia.paddings.init; padding > 0 {
+		buf := make([]byte, padding+len(packet))
+		_, _ = rand.Read(buf[:padding])
+		copy(buf[padding:], packet)
+		packet = buf
+	}
+
+	sendBuffer = append(sendBuffer, packet)
+	err = peer.SendBuffers(sendBuffer)
 	if err != nil {
 		peer.device.log.Errf("%v - Failed to send handshake initiation: %v", peer, err)
 	}
@@ -145,6 +173,7 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.handshake.mutex.Unlock()
 
 	peer.device.log.Debugf("%v - Sending handshake response", peer)
+	amnezia := peer.device.amneziaWGSnapshot()
 
 	response, err := peer.device.CreateMessageResponse(peer)
 	if err != nil {
@@ -166,6 +195,13 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
+	if padding := amnezia.paddings.response; padding > 0 {
+		buf := make([]byte, padding+len(packet))
+		_, _ = rand.Read(buf[:padding])
+		copy(buf[padding:], packet)
+		packet = buf
+	}
+
 	// TODO: allocation could be avoided
 	err = peer.SendBuffers([][]byte{packet})
 	if err != nil {
@@ -176,9 +212,15 @@ func (peer *Peer) SendHandshakeResponse() error {
 
 func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
 	device.log.Debugf("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
+	amnezia := device.amneziaWGSnapshot()
 
 	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
-	reply, err := device.cookieChecker.CreateReply(initiatingElem.packet, sender, initiatingElem.endpoint.DstToBytes())
+	reply, err := device.cookieChecker.CreateReply(
+		initiatingElem.packet,
+		sender,
+		initiatingElem.endpoint.DstToBytes(),
+		amnezia.headers.cookie.Generate(),
+	)
 	if err != nil {
 		device.log.Errf("Failed to create cookie reply: %v", err)
 		return err
@@ -186,6 +228,12 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 
 	packet := make([]byte, MessageCookieReplySize)
 	_ = reply.marshal(packet)
+	if padding := amnezia.paddings.cookie; padding > 0 {
+		buf := make([]byte, padding+len(packet))
+		_, _ = rand.Read(buf[:padding])
+		copy(buf[padding:], packet)
+		packet = buf
+	}
 	device.net.RLock()
 	bind := device.net.bind
 	device.net.RUnlock()
@@ -474,6 +522,7 @@ func (device *Device) RoutineEncryption(id int) {
 	device.log.Debugf("Routine: encryption worker %d - started", id)
 
 	for elemsContainer := range device.queue.encryption.c {
+		amnezia := device.amneziaWGSnapshot()
 		for _, elem := range elemsContainer.elems {
 			// populate header fields
 			header := elem.buffer[:MessageTransportHeaderSize]
@@ -482,7 +531,7 @@ func (device *Device) RoutineEncryption(id int) {
 			fieldReceiver := header[4:8]
 			fieldNonce := header[8:16]
 
-			binary.LittleEndian.PutUint32(fieldType, MessageTransportType)
+			binary.LittleEndian.PutUint32(fieldType, amnezia.headers.transport.Generate())
 			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
 			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
 
@@ -515,6 +564,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	bufs := make([][]byte, 0, maxBatchSize)
 
 	for elemsContainer := range peer.queue.outbound.c {
+		amnezia := device.amneziaWGSnapshot()
 		bufs = bufs[:0]
 		if elemsContainer == nil {
 			return
@@ -539,6 +589,13 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		for _, elem := range elemsContainer.elems {
 			if len(elem.packet) != MessageKeepaliveSize {
 				dataSent = true
+				if padding := amnezia.paddings.transport; padding > 0 {
+					for i := len(elem.packet) - 1; i >= 0; i-- {
+						elem.buffer[i+padding] = elem.buffer[i]
+					}
+					_, _ = rand.Read(elem.buffer[:padding])
+					elem.packet = elem.buffer[:padding+len(elem.packet)]
+				}
 			}
 			bufs = append(bufs, elem.packet)
 		}

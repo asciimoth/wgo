@@ -54,6 +54,7 @@ const (
 )
 
 const (
+	MessageUnknownType     = 0
 	MessageInitiationType  = 1
 	MessageResponseType    = 2
 	MessageCookieReplyType = 3
@@ -270,6 +271,7 @@ func init() {
 func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, error) {
 	device.staticIdentity.RLock()
 	defer device.staticIdentity.RUnlock()
+	amnezia := device.amneziaWGSnapshot()
 
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
@@ -287,7 +289,7 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	handshake.mixHash(handshake.remoteStatic[:])
 
 	msg := MessageInitiation{
-		Type:      MessageInitiationType,
+		Type:      amnezia.headers.init.Generate(),
 		Ephemeral: handshake.localEphemeral.publicKey(),
 	}
 
@@ -442,6 +444,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 }
 
 func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error) {
+	amnezia := device.amneziaWGSnapshot()
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
 	defer handshake.mutex.Unlock()
@@ -460,7 +463,7 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	}
 
 	var msg MessageResponse
-	msg.Type = MessageResponseType
+	msg.Type = amnezia.headers.response.Generate()
 	msg.Sender = handshake.localIndex
 	msg.Receiver = handshake.remoteIndex
 

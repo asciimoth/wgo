@@ -315,6 +315,7 @@ The primary configuration surface for embedders is the typed `Device` API. Commo
 - `Device.SetPrivateKey(NoisePrivateKey)`
 - `Device.SetListenPort(uint16)`
 - `Device.SetFwmark(uint32)`
+- `Device.SetAmneziaWGConfig(AmneziaWGConfig)`
 - `Device.NewPeer(NoisePublicKey)`
 - `Device.RemovePeer(NoisePublicKey)`
 - `Device.RemoveAllPeers()`
@@ -325,6 +326,7 @@ The primary configuration surface for embedders is the typed `Device` API. Commo
 - `Device.ReplacePeerAllowedIPs(NoisePublicKey, []netip.Prefix)`
 - `Device.AddPeerAllowedIP(NoisePublicKey, netip.Prefix)`
 - `Device.RemovePeerAllowedIP(NoisePublicKey, netip.Prefix)`
+- `Device.AmneziaWGConfig()`
 - `Device.Config()`
 - `Device.PeerConfig(NoisePublicKey)`
 
@@ -345,6 +347,38 @@ For embedders, this means configuration can be driven by:
 - custom application code that speaks the same text protocol
 
 In practice, the examples in this repository prefer the direct `Device` methods and use UAPI only where compatibility with existing tooling matters.
+
+## AmneziaWG Extension
+
+This repository now implements the AmneziaWG 2.0 obfuscation extension described in [amnezia_wg_extension.md](/home/moth/projects/wgo/amnezia_wg_extension.md), using the current `amneziawg-go` behavior as the compatibility target where that differs from public docs.
+
+The implementation is intentionally device-global, matching the original Go daemon:
+
+- `H1..H4` header ranges
+- `S1..S4` fixed prefix lengths
+- `I1..I5` pre-handshake decoy packet specs
+- `Jc`, `Jmin`, `Jmax` pre-handshake junk packet settings
+
+These values are stored on `device.Device` and apply to all peers attached to that device instance. There is no per-peer AmneziaWG profile in this repository yet.
+
+The implementation touches four main areas:
+
+- config and state: [device/amnezia.go](/home/moth/projects/wgo/device/amnezia.go), [device/config.go](/home/moth/projects/wgo/device/config.go), and [device/uapi.go](/home/moth/projects/wgo/device/uapi.go) define the typed config model, UAPI keys, CPS parsing for `I1..I5`, and header-overlap validation
+- send path: [device/noise-protocol.go](/home/moth/projects/wgo/device/noise-protocol.go) and [device/send.go](/home/moth/projects/wgo/device/send.go) generate randomized header values, prepend fixed-size random prefixes, emit `I1..I5` and `J*` packets before each initiation, and preserve the keepalive `S4` quirk from `amneziawg-go`
+- receive path: [device/receive.go](/home/moth/projects/wgo/device/receive.go) classifies packets by `(configured padding, configured header range, expected size)` before handing the stripped inner message to normal WireGuard processing
+- cookie handling: [device/cookie.go](/home/moth/projects/wgo/device/cookie.go) now accepts the configured cookie header value so `H3` applies to cookie replies too
+
+Vanilla WireGuard support is preserved by the default device configuration:
+
+- `H1=1`
+- `H2=2`
+- `H3=3`
+- `H4=4`
+- `S1=S2=S3=S4=0`
+- `I1..I5` unset
+- `Jc=Jmin=Jmax=0`
+
+With those defaults, packet layout and handshake behavior remain standard WireGuard.
 
 ## Netstack Mode
 

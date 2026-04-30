@@ -18,6 +18,7 @@ type DeviceConfig struct {
 	PrivateKey NoisePrivateKey
 	ListenPort uint16
 	Fwmark     uint32
+	AmneziaWG  AmneziaWGConfig
 	Peers      []PeerConfig
 }
 
@@ -66,6 +67,18 @@ func (device *Device) Fwmark() uint32 {
 	return device.net.fwmark
 }
 
+func (device *Device) AmneziaWGConfig() AmneziaWGConfig {
+	device.ipcMutex.RLock()
+	defer device.ipcMutex.RUnlock()
+	return device.amneziaWGConfigLocked()
+}
+
+func (device *Device) SetAmneziaWGConfig(cfg AmneziaWGConfig) error {
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
+	return device.setAmneziaWGConfigLocked(cfg)
+}
+
 func (device *Device) SetFwmark(mark uint32) error {
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
@@ -89,6 +102,7 @@ func (device *Device) Config() DeviceConfig {
 		PrivateKey: device.staticIdentity.privateKey,
 		ListenPort: device.net.port,
 		Fwmark:     device.net.fwmark,
+		AmneziaWG:  device.amneziaWGConfigLocked(),
 		Peers:      make([]PeerConfig, 0, len(device.peers.keyMap)),
 	}
 	for _, peer := range device.peers.keyMap {
@@ -184,6 +198,107 @@ func (device *Device) setListenPortLocked(port uint16) error {
 
 func (device *Device) setFwmarkLocked(mark uint32) error {
 	return device.BindSetMark(mark)
+}
+
+func (device *Device) amneziaWGConfigLocked() AmneziaWGConfig {
+	cfg := DefaultAmneziaWGConfig()
+	cfg.JunkCount = device.junk.count
+	cfg.JunkMin = device.junk.min
+	cfg.JunkMax = device.junk.max
+	cfg.InitHeader = device.headers.init.toConfig()
+	cfg.ResponseHeader = device.headers.response.toConfig()
+	cfg.CookieHeader = device.headers.cookie.toConfig()
+	cfg.TransportHeader = device.headers.transport.toConfig()
+	cfg.InitPadding = device.paddings.init
+	cfg.ResponsePadding = device.paddings.response
+	cfg.CookiePadding = device.paddings.cookie
+	cfg.TransportPadding = device.paddings.transport
+	for i, chain := range device.ipackets {
+		if chain != nil {
+			cfg.InitiationPackets[i] = chain.Spec
+		}
+	}
+	return cfg
+}
+
+func (device *Device) setAmneziaWGConfigLocked(cfg AmneziaWGConfig) error {
+	if err := validateAmneziaWGConfig(cfg); err != nil {
+		return err
+	}
+
+	device.junk.count = cfg.JunkCount
+	device.junk.min = cfg.JunkMin
+	device.junk.max = cfg.JunkMax
+	device.headers.init = &magicHeader{start: cfg.InitHeader.Start, end: cfg.InitHeader.End}
+	device.headers.response = &magicHeader{start: cfg.ResponseHeader.Start, end: cfg.ResponseHeader.End}
+	device.headers.cookie = &magicHeader{start: cfg.CookieHeader.Start, end: cfg.CookieHeader.End}
+	device.headers.transport = &magicHeader{start: cfg.TransportHeader.Start, end: cfg.TransportHeader.End}
+	device.paddings.init = cfg.InitPadding
+	device.paddings.response = cfg.ResponsePadding
+	device.paddings.cookie = cfg.CookiePadding
+	device.paddings.transport = cfg.TransportPadding
+	for i := range device.ipackets {
+		device.ipackets[i] = nil
+		if cfg.InitiationPackets[i] == "" {
+			continue
+		}
+		chain, err := newObfChain(cfg.InitiationPackets[i])
+		if err != nil {
+			return fmt.Errorf("parse initiation packet %d: %w", i+1, err)
+		}
+		device.ipackets[i] = chain
+	}
+	device.storeAmneziaWGSnapshot()
+	return nil
+}
+
+func validateAmneziaWGConfig(cfg AmneziaWGConfig) error {
+	if cfg.JunkCount < 0 {
+		return fmt.Errorf("junk count must be non-negative")
+	}
+	if cfg.JunkMin < 0 {
+		return fmt.Errorf("junk min must be non-negative")
+	}
+	if cfg.JunkMax < 0 {
+		return fmt.Errorf("junk max must be non-negative")
+	}
+	if cfg.JunkCount > 0 && (cfg.JunkMin <= 0 || cfg.JunkMax <= 0) {
+		return fmt.Errorf("junk min and max must be positive when junk is enabled")
+	}
+	for _, padding := range []int{cfg.InitPadding, cfg.ResponsePadding, cfg.CookiePadding, cfg.TransportPadding} {
+		if padding < 0 {
+			return fmt.Errorf("padding values must be non-negative")
+		}
+	}
+	headers := []AmneziaWGHeaderRange{
+		cfg.InitHeader,
+		cfg.ResponseHeader,
+		cfg.CookieHeader,
+		cfg.TransportHeader,
+	}
+	for _, header := range headers {
+		if header.End < header.Start {
+			return fmt.Errorf("header range end must be >= start")
+		}
+	}
+	for i := 0; i < len(headers); i++ {
+		for j := i + 1; j < len(headers); j++ {
+			left := headers[i]
+			right := headers[j]
+			if left.Start <= right.End && right.Start <= left.End {
+				return fmt.Errorf("headers must not overlap")
+			}
+		}
+	}
+	for i, spec := range cfg.InitiationPackets {
+		if spec == "" {
+			continue
+		}
+		if _, err := newObfChain(spec); err != nil {
+			return fmt.Errorf("parse initiation packet %d: %w", i+1, err)
+		}
+	}
+	return nil
 }
 
 func (device *Device) setPeerPresharedKeyLocked(publicKey NoisePublicKey, presharedKey NoisePresharedKey) error {

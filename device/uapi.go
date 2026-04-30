@@ -81,6 +81,36 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 	if cfg.Fwmark != 0 {
 		sendf("fwmark=%d", cfg.Fwmark)
 	}
+	if cfg.AmneziaWG.JunkCount != 0 {
+		sendf("jc=%d", cfg.AmneziaWG.JunkCount)
+	}
+	if cfg.AmneziaWG.JunkMin != 0 {
+		sendf("jmin=%d", cfg.AmneziaWG.JunkMin)
+	}
+	if cfg.AmneziaWG.JunkMax != 0 {
+		sendf("jmax=%d", cfg.AmneziaWG.JunkMax)
+	}
+	if cfg.AmneziaWG.InitPadding != 0 {
+		sendf("s1=%d", cfg.AmneziaWG.InitPadding)
+	}
+	if cfg.AmneziaWG.ResponsePadding != 0 {
+		sendf("s2=%d", cfg.AmneziaWG.ResponsePadding)
+	}
+	if cfg.AmneziaWG.CookiePadding != 0 {
+		sendf("s3=%d", cfg.AmneziaWG.CookiePadding)
+	}
+	if cfg.AmneziaWG.TransportPadding != 0 {
+		sendf("s4=%d", cfg.AmneziaWG.TransportPadding)
+	}
+	sendf("h1=%s", cfg.AmneziaWG.InitHeader.Spec())
+	sendf("h2=%s", cfg.AmneziaWG.ResponseHeader.Spec())
+	sendf("h3=%s", cfg.AmneziaWG.CookieHeader.Spec())
+	sendf("h4=%s", cfg.AmneziaWG.TransportHeader.Spec())
+	for i, spec := range cfg.AmneziaWG.InitiationPackets {
+		if spec != "" {
+			sendf("i%d=%s", i+1, spec)
+		}
+	}
 
 	for _, peer := range cfg.Peers {
 		keyf("public_key", (*[32]byte)(&peer.PublicKey))
@@ -126,6 +156,7 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 	}()
 
 	peer := new(ipcSetPeer)
+	amnezia := new(ipcSetAmneziaWG)
 	deviceConfig := true
 
 	scanner := bufio.NewScanner(r)
@@ -133,6 +164,9 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 		line := scanner.Text()
 		if line == "" {
 			// Blank line means terminate operation.
+			if err := amnezia.mergeWithDevice(device); err != nil {
+				return ipcErrorf(ipc.IpcErrorInvalid, "failed to apply amneziawg config: %w", err)
+			}
 			peer.handlePostConfig()
 			return nil
 		}
@@ -156,13 +190,16 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 
 		var err error
 		if deviceConfig {
-			err = device.handleDeviceLine(key, value)
+			err = device.handleDeviceLine(key, value, amnezia)
 		} else {
 			err = device.handlePeerLine(peer, key, value)
 		}
 		if err != nil {
 			return err
 		}
+	}
+	if err := amnezia.mergeWithDevice(device); err != nil {
+		return ipcErrorf(ipc.IpcErrorInvalid, "failed to apply amneziawg config: %w", err)
 	}
 	peer.handlePostConfig()
 
@@ -172,7 +209,7 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 	return nil
 }
 
-func (device *Device) handleDeviceLine(key, value string) error {
+func (device *Device) handleDeviceLine(key, value string, amnezia *ipcSetAmneziaWG) error {
 	switch key {
 	case "private_key":
 		var sk NoisePrivateKey
@@ -214,6 +251,113 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		}
 		device.log.Debugf("UAPI: Removing all peers")
 		device.RemoveAllPeers()
+
+	case "jc":
+		jc, err := strconv.Atoi(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse jc: %w", err)
+		}
+		if jc <= 0 {
+			return ipcErrorf(ipc.IpcErrorInvalid, "jc must be a positive value")
+		}
+		amnezia.junkCount = &jc
+
+	case "jmin":
+		jmin, err := strconv.Atoi(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse jmin: %w", err)
+		}
+		if jmin <= 0 {
+			return ipcErrorf(ipc.IpcErrorInvalid, "jmin must be a positive value")
+		}
+		amnezia.junkMin = &jmin
+
+	case "jmax":
+		jmax, err := strconv.Atoi(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse jmax: %w", err)
+		}
+		if jmax <= 0 {
+			return ipcErrorf(ipc.IpcErrorInvalid, "jmax must be a positive value")
+		}
+		amnezia.junkMax = &jmax
+
+	case "s1":
+		padding, err := strconv.Atoi(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse s1: %w", err)
+		}
+		if padding < 0 {
+			return ipcErrorf(ipc.IpcErrorInvalid, "s1 must be non-negative")
+		}
+		amnezia.initPadding = &padding
+
+	case "s2":
+		padding, err := strconv.Atoi(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse s2: %w", err)
+		}
+		if padding < 0 {
+			return ipcErrorf(ipc.IpcErrorInvalid, "s2 must be non-negative")
+		}
+		amnezia.responsePadding = &padding
+
+	case "s3":
+		padding, err := strconv.Atoi(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse s3: %w", err)
+		}
+		if padding < 0 {
+			return ipcErrorf(ipc.IpcErrorInvalid, "s3 must be non-negative")
+		}
+		amnezia.cookiePadding = &padding
+
+	case "s4":
+		padding, err := strconv.Atoi(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse s4: %w", err)
+		}
+		if padding < 0 {
+			return ipcErrorf(ipc.IpcErrorInvalid, "s4 must be non-negative")
+		}
+		amnezia.transportPadding = &padding
+
+	case "h1":
+		header, err := newMagicHeader(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse H1: %w", err)
+		}
+		amnezia.initHeader = header
+
+	case "h2":
+		header, err := newMagicHeader(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse H2: %w", err)
+		}
+		amnezia.responseHeader = header
+
+	case "h3":
+		header, err := newMagicHeader(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse H3: %w", err)
+		}
+		amnezia.cookieHeader = header
+
+	case "h4":
+		header, err := newMagicHeader(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse H4: %w", err)
+		}
+		amnezia.transportHeader = header
+
+	case "i1", "i2", "i3", "i4", "i5":
+		chain, err := newObfChain(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse %s: %w", strings.ToUpper(key), err)
+		}
+		index := int(key[1] - '1')
+		amnezia.initiationPackets[index] = chain
+		amnezia.packetSet[index] = true
 
 	default:
 		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI device key: %v", key)

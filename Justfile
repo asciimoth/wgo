@@ -12,7 +12,7 @@ vet:
 tidy:
 	go mod tidy
 
-# Compatibility tests against linux kernel-space wireguard implementation. Using sudo.
+# Compatibility tests against kernel WireGuard and upstream amneziawg-go. Using sudo.
 test-compat:
 	sudo ./tests/compat/run.sh
 

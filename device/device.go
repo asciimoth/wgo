@@ -92,6 +92,30 @@ type Device struct {
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
 	log      Logger
+
+	junk struct {
+		min   int
+		max   int
+		count int
+	}
+
+	headers struct {
+		init      *magicHeader
+		response  *magicHeader
+		cookie    *magicHeader
+		transport *magicHeader
+	}
+
+	paddings struct {
+		init      int
+		response  int
+		cookie    int
+		transport int
+	}
+
+	ipackets [amneziaPacketCount]*obfChain
+
+	amneziaSnapshot atomic.Pointer[amneziaWGSnapshot]
 }
 
 type tunState struct {
@@ -382,6 +406,11 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
 	device.rate.limiter.Init()
 	device.indexTable.Init()
+	device.headers.init = &magicHeader{start: MessageInitiationType, end: MessageInitiationType}
+	device.headers.response = &magicHeader{start: MessageResponseType, end: MessageResponseType}
+	device.headers.cookie = &magicHeader{start: MessageCookieReplyType, end: MessageCookieReplyType}
+	device.headers.transport = &magicHeader{start: MessageTransportType, end: MessageTransportType}
+	device.storeAmneziaWGSnapshot()
 
 	device.PopulatePools()
 

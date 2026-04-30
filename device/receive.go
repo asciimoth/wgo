@@ -150,10 +150,12 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				continue
 			}
 
-			// check size of packet
-
 			packet := bufsArrs[i][:size]
-			msgType := binary.LittleEndian.Uint32(packet[:4])
+			msgType, padding := device.DeterminePacketTypeAndPadding(packet, MessageUnknownType)
+			if padding > 0 {
+				copy(packet, packet[padding:])
+				packet = packet[:len(packet)-padding]
+			}
 
 			switch msgType {
 
@@ -375,6 +377,7 @@ func (device *Device) RoutineHandshake(id int) {
 				device.log.Errf("Failed to decode initiation message")
 				goto skip
 			}
+			msg.Type = elem.msgType
 
 			// consume initiation
 
@@ -407,6 +410,7 @@ func (device *Device) RoutineHandshake(id int) {
 				device.log.Errf("Failed to decode response message")
 				goto skip
 			}
+			msg.Type = elem.msgType
 
 			// consume response
 
@@ -565,4 +569,36 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		packets = packets[:0]
 		device.PutInboundElementsContainer(elemsContainer)
 	}
+}
+
+func (device *Device) DeterminePacketTypeAndPadding(packet []byte, expectedType uint32) (uint32, int) {
+	size := len(packet)
+	amnezia := device.amneziaWGSnapshot()
+
+	if expectedType == MessageUnknownType || expectedType == MessageInitiationType {
+		padding := amnezia.paddings.init
+		if size == padding+MessageInitiationSize && size >= padding+4 && amnezia.headers.init.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+			return MessageInitiationType, padding
+		}
+	}
+	if expectedType == MessageUnknownType || expectedType == MessageResponseType {
+		padding := amnezia.paddings.response
+		if size == padding+MessageResponseSize && size >= padding+4 && amnezia.headers.response.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+			return MessageResponseType, padding
+		}
+	}
+	if expectedType == MessageUnknownType || expectedType == MessageCookieReplyType {
+		padding := amnezia.paddings.cookie
+		if size == padding+MessageCookieReplySize && size >= padding+4 && amnezia.headers.cookie.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+			return MessageCookieReplyType, padding
+		}
+	}
+	if expectedType == MessageUnknownType || expectedType == MessageTransportType {
+		padding := amnezia.paddings.transport
+		if size >= padding+MessageTransportHeaderSize && size >= padding+4 && amnezia.headers.transport.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+			return MessageTransportType, padding
+		}
+	}
+
+	return MessageUnknownType, 0
 }
