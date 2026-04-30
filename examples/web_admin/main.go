@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net"
@@ -79,22 +80,39 @@ type appState struct {
 }
 
 type deviceStateSummary struct {
-	PrivateKey string             `json:"private_key"`
-	ListenPort uint16             `json:"listen_port"`
-	Fwmark     uint32             `json:"fwmark"`
-	Peers      []peerStateSummary `json:"peers"`
+	PrivateKey string              `json:"private_key"`
+	ListenPort uint16              `json:"listen_port"`
+	Fwmark     uint32              `json:"fwmark"`
+	AmneziaWG  amneziaStateSummary `json:"amneziawg"`
+	Peers      []peerStateSummary  `json:"peers"`
 }
 
 type peerStateSummary struct {
-	PublicKey                   string   `json:"public_key"`
-	PresharedKey                string   `json:"preshared_key"`
-	ProtocolVersion             int      `json:"protocol_version"`
-	Endpoint                    string   `json:"endpoint"`
-	LastHandshakeTime           string   `json:"last_handshake_time"`
-	TxBytes                     uint64   `json:"tx_bytes"`
-	RxBytes                     uint64   `json:"rx_bytes"`
-	PersistentKeepaliveInterval uint16   `json:"persistent_keepalive_interval"`
-	AllowedIPs                  []string `json:"allowed_ips"`
+	PublicKey                   string               `json:"public_key"`
+	PresharedKey                string               `json:"preshared_key"`
+	ProtocolVersion             int                  `json:"protocol_version"`
+	Endpoint                    string               `json:"endpoint"`
+	LastHandshakeTime           string               `json:"last_handshake_time"`
+	TxBytes                     uint64               `json:"tx_bytes"`
+	RxBytes                     uint64               `json:"rx_bytes"`
+	PersistentKeepaliveInterval uint16               `json:"persistent_keepalive_interval"`
+	AllowedIPs                  []string             `json:"allowed_ips"`
+	AmneziaWG                   *amneziaStateSummary `json:"amneziawg,omitempty"`
+}
+
+type amneziaStateSummary struct {
+	JunkCount         int      `json:"junk_count"`
+	JunkMin           int      `json:"junk_min"`
+	JunkMax           int      `json:"junk_max"`
+	InitHeader        string   `json:"init_header"`
+	ResponseHeader    string   `json:"response_header"`
+	CookieHeader      string   `json:"cookie_header"`
+	TransportHeader   string   `json:"transport_header"`
+	InitPadding       int      `json:"init_padding"`
+	ResponsePadding   int      `json:"response_padding"`
+	CookiePadding     int      `json:"cookie_padding"`
+	TransportPadding  int      `json:"transport_padding"`
+	InitiationPackets []string `json:"initiation_packets"`
 }
 
 type tunStateSummary struct {
@@ -116,6 +134,21 @@ type deviceUpdateRequest struct {
 	PrivateKey *string `json:"private_key"`
 	ListenPort *uint16 `json:"listen_port"`
 	Fwmark     *uint32 `json:"fwmark"`
+}
+
+type amneziaApplyRequest struct {
+	JunkCount         int      `json:"junk_count"`
+	JunkMin           int      `json:"junk_min"`
+	JunkMax           int      `json:"junk_max"`
+	InitHeader        string   `json:"init_header"`
+	ResponseHeader    string   `json:"response_header"`
+	CookieHeader      string   `json:"cookie_header"`
+	TransportHeader   string   `json:"transport_header"`
+	InitPadding       int      `json:"init_padding"`
+	ResponsePadding   int      `json:"response_padding"`
+	CookiePadding     int      `json:"cookie_padding"`
+	TransportPadding  int      `json:"transport_padding"`
+	InitiationPackets []string `json:"initiation_packets"`
 }
 
 type peerApplyRequest struct {
@@ -158,6 +191,13 @@ type peerPlan struct {
 	AllowedIP    netip.Prefix
 	ListenPort   uint16
 	PingTargetIP netip.Addr
+	AmneziaWG    device.AmneziaWGConfig
+}
+
+type indexPageData struct {
+	SuggestedRole        string
+	SuggestedAmneziaJSON template.JS
+	DefaultAmneziaJSON   template.JS
 }
 
 func newAdminApp() (*adminApp, error) {
@@ -178,6 +218,7 @@ func newAdminApp() (*adminApp, error) {
 	mux.HandleFunc("/", app.handleIndex)
 	mux.HandleFunc("/api/state", app.handleState)
 	mux.HandleFunc("/api/device", app.handleDeviceUpdate)
+	mux.HandleFunc("/api/device/amnezia", app.handleAmneziaUpdate)
 	mux.HandleFunc("/api/peers/apply", app.handlePeerApply)
 	mux.HandleFunc("/api/peers/delete", app.handlePeerDelete)
 	mux.HandleFunc("/api/peers/delete_all", app.handlePeerDeleteAll)
@@ -264,7 +305,14 @@ func (a *adminApp) Close() error {
 
 func (a *adminApp) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, indexHTML)
+	page, err := newIndexPageData(a.plan.Local)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := indexTemplate.Execute(w, page); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func (a *adminApp) handleState(w http.ResponseWriter, r *http.Request) {
@@ -331,6 +379,100 @@ func displayStringSlice(v []string) any {
 	return strings.Join(v, ",")
 }
 
+func summarizeAmneziaConfig(cfg device.AmneziaWGConfig) amneziaStateSummary {
+	packets := make([]string, len(cfg.InitiationPackets))
+	copy(packets, cfg.InitiationPackets[:])
+	return amneziaStateSummary{
+		JunkCount:         cfg.JunkCount,
+		JunkMin:           cfg.JunkMin,
+		JunkMax:           cfg.JunkMax,
+		InitHeader:        cfg.InitHeader.Spec(),
+		ResponseHeader:    cfg.ResponseHeader.Spec(),
+		CookieHeader:      cfg.CookieHeader.Spec(),
+		TransportHeader:   cfg.TransportHeader.Spec(),
+		InitPadding:       cfg.InitPadding,
+		ResponsePadding:   cfg.ResponsePadding,
+		CookiePadding:     cfg.CookiePadding,
+		TransportPadding:  cfg.TransportPadding,
+		InitiationPackets: packets,
+	}
+}
+
+func amneziaApplyRequestFromConfig(cfg device.AmneziaWGConfig) amneziaApplyRequest {
+	packets := make([]string, len(cfg.InitiationPackets))
+	copy(packets, cfg.InitiationPackets[:])
+	return amneziaApplyRequest{
+		JunkCount:         cfg.JunkCount,
+		JunkMin:           cfg.JunkMin,
+		JunkMax:           cfg.JunkMax,
+		InitHeader:        cfg.InitHeader.Spec(),
+		ResponseHeader:    cfg.ResponseHeader.Spec(),
+		CookieHeader:      cfg.CookieHeader.Spec(),
+		TransportHeader:   cfg.TransportHeader.Spec(),
+		InitPadding:       cfg.InitPadding,
+		ResponsePadding:   cfg.ResponsePadding,
+		CookiePadding:     cfg.CookiePadding,
+		TransportPadding:  cfg.TransportPadding,
+		InitiationPackets: packets,
+	}
+}
+
+func (req amneziaApplyRequest) toConfig() (device.AmneziaWGConfig, error) {
+	cfg := device.DefaultAmneziaWGConfig()
+	cfg.JunkCount = req.JunkCount
+	cfg.JunkMin = req.JunkMin
+	cfg.JunkMax = req.JunkMax
+	cfg.InitPadding = req.InitPadding
+	cfg.ResponsePadding = req.ResponsePadding
+	cfg.CookiePadding = req.CookiePadding
+	cfg.TransportPadding = req.TransportPadding
+
+	var err error
+	if cfg.InitHeader, err = parseAmneziaHeader(req.InitHeader, device.DefaultAmneziaWGHeaderRange(device.MessageInitiationType)); err != nil {
+		return device.AmneziaWGConfig{}, fmt.Errorf("parse init_header: %w", err)
+	}
+	if cfg.ResponseHeader, err = parseAmneziaHeader(req.ResponseHeader, device.DefaultAmneziaWGHeaderRange(device.MessageResponseType)); err != nil {
+		return device.AmneziaWGConfig{}, fmt.Errorf("parse response_header: %w", err)
+	}
+	if cfg.CookieHeader, err = parseAmneziaHeader(req.CookieHeader, device.DefaultAmneziaWGHeaderRange(device.MessageCookieReplyType)); err != nil {
+		return device.AmneziaWGConfig{}, fmt.Errorf("parse cookie_header: %w", err)
+	}
+	if cfg.TransportHeader, err = parseAmneziaHeader(req.TransportHeader, device.DefaultAmneziaWGHeaderRange(device.MessageTransportType)); err != nil {
+		return device.AmneziaWGConfig{}, fmt.Errorf("parse transport_header: %w", err)
+	}
+
+	for i := range cfg.InitiationPackets {
+		if i < len(req.InitiationPackets) {
+			cfg.InitiationPackets[i] = strings.TrimSpace(req.InitiationPackets[i])
+		}
+	}
+	return cfg, nil
+}
+
+func parseAmneziaHeader(spec string, fallback device.AmneziaWGHeaderRange) (device.AmneziaWGHeaderRange, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return fallback, nil
+	}
+	return device.ParseAmneziaWGHeaderRange(spec)
+}
+
+func newIndexPageData(local peerPlan) (indexPageData, error) {
+	suggestedJSON, err := json.Marshal(amneziaApplyRequestFromConfig(local.AmneziaWG))
+	if err != nil {
+		return indexPageData{}, fmt.Errorf("marshal suggested amnezia profile: %w", err)
+	}
+	defaultJSON, err := json.Marshal(amneziaApplyRequestFromConfig(device.DefaultAmneziaWGConfig()))
+	if err != nil {
+		return indexPageData{}, fmt.Errorf("marshal default amnezia profile: %w", err)
+	}
+	return indexPageData{
+		SuggestedRole:        local.Label,
+		SuggestedAmneziaJSON: template.JS(suggestedJSON),
+		DefaultAmneziaJSON:   template.JS(defaultJSON),
+	}, nil
+}
+
 func (a *adminApp) handleDeviceUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -374,6 +516,46 @@ func (a *adminApp) handleDeviceUpdate(w http.ResponseWriter, r *http.Request) {
 		displayUint32(req.Fwmark),
 	)
 
+	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handleAmneziaUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req amneziaApplyRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	cfg, err := req.toConfig()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := a.dev.SetAmneziaWGConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	a.logPanelAction(
+		"device.amnezia",
+		"junk=%d/%d/%d headers=%s,%s,%s,%s paddings=%d/%d/%d/%d",
+		cfg.JunkCount,
+		cfg.JunkMin,
+		cfg.JunkMax,
+		cfg.InitHeader.Spec(),
+		cfg.ResponseHeader.Spec(),
+		cfg.CookieHeader.Spec(),
+		cfg.TransportHeader.Spec(),
+		cfg.InitPadding,
+		cfg.ResponsePadding,
+		cfg.CookiePadding,
+		cfg.TransportPadding,
+	)
 	writeJSON(w, http.StatusOK, a.snapshot())
 }
 
@@ -846,6 +1028,7 @@ func (a *adminApp) snapshot() appState {
 			PrivateKey: encodePrivateKey(cfg.PrivateKey),
 			ListenPort: cfg.ListenPort,
 			Fwmark:     cfg.Fwmark,
+			AmneziaWG:  summarizeAmneziaConfig(cfg.AmneziaWG),
 			Peers:      make([]peerStateSummary, 0, len(cfg.Peers)),
 		},
 	}
@@ -855,7 +1038,7 @@ func (a *adminApp) snapshot() appState {
 		for _, prefix := range peer.AllowedIPs {
 			allowedIPs = append(allowedIPs, prefix.String())
 		}
-		state.Device.Peers = append(state.Device.Peers, peerStateSummary{
+		summary := peerStateSummary{
 			PublicKey:                   hex.EncodeToString(peer.PublicKey[:]),
 			PresharedKey:                hex.EncodeToString(peer.PresharedKey[:]),
 			ProtocolVersion:             peer.ProtocolVersion,
@@ -865,7 +1048,12 @@ func (a *adminApp) snapshot() appState {
 			RxBytes:                     peer.RxBytes,
 			PersistentKeepaliveInterval: peer.PersistentKeepaliveInterval,
 			AllowedIPs:                  allowedIPs,
-		})
+		}
+		if peer.AmneziaWG != nil {
+			amnezia := summarizeAmneziaConfig(*peer.AmneziaWG)
+			summary.AmneziaWG = &amnezia
+		}
+		state.Device.Peers = append(state.Device.Peers, summary)
 	}
 
 	a.mu.Lock()
@@ -950,6 +1138,10 @@ func printPeerPlan(self, peer peerPlan) {
 	fmt.Printf("  allowed ip:  %s\n", self.AllowedIP)
 	fmt.Printf("  listen port: %d\n", self.ListenPort)
 	fmt.Println("  protocol:    1")
+	fmt.Println("  amneziawg:")
+	for _, line := range amneziaConfigLines(self.AmneziaWG) {
+		fmt.Printf("    %s\n", line)
+	}
 }
 
 func createConfiguredTUN(name string, localIP, peerIP netip.Addr, mtu int) (gtun.Tun, string, func() error, error) {
@@ -1049,6 +1241,7 @@ func newPairingPlan() (pairingPlan, error) {
 			AllowedIP:    netip.PrefixFrom(remoteIP, remoteIP.BitLen()),
 			ListenPort:   portBase,
 			PingTargetIP: remoteIP,
+			AmneziaWG:    suggestedAmneziaConfigA(),
 		},
 		Remote: peerPlan{
 			Label:        "node-b",
@@ -1060,8 +1253,81 @@ func newPairingPlan() (pairingPlan, error) {
 			AllowedIP:    netip.PrefixFrom(localIP, localIP.BitLen()),
 			ListenPort:   portBase + 1,
 			PingTargetIP: localIP,
+			AmneziaWG:    suggestedAmneziaConfigB(),
 		},
 	}, nil
+}
+
+func suggestedAmneziaConfigA() device.AmneziaWGConfig {
+	cfg := device.DefaultAmneziaWGConfig()
+	cfg.JunkCount = 2
+	cfg.JunkMin = 11
+	cfg.JunkMax = 23
+	cfg.InitPadding = 13
+	cfg.ResponsePadding = 17
+	cfg.CookiePadding = 19
+	cfg.TransportPadding = 29
+	cfg.InitHeader = mustAmneziaHeader("1111-1113")
+	cfg.ResponseHeader = mustAmneziaHeader("2222-2225")
+	cfg.CookieHeader = mustAmneziaHeader("3333")
+	cfg.TransportHeader = mustAmneziaHeader("4444-4449")
+	cfg.InitiationPackets[0] = "<b 0xaa55><rc 3><rd 2><t>"
+	cfg.InitiationPackets[1] = "<r 5>"
+	cfg.InitiationPackets[2] = "<rd 4>"
+	cfg.InitiationPackets[3] = "<rc 6>"
+	cfg.InitiationPackets[4] = "<b 0x01020304>"
+	return cfg
+}
+
+func suggestedAmneziaConfigB() device.AmneziaWGConfig {
+	cfg := device.DefaultAmneziaWGConfig()
+	cfg.JunkCount = 3
+	cfg.JunkMin = 7
+	cfg.JunkMax = 14
+	cfg.InitPadding = 5
+	cfg.ResponsePadding = 9
+	cfg.CookiePadding = 11
+	cfg.TransportPadding = 15
+	cfg.InitHeader = mustAmneziaHeader("5111-5114")
+	cfg.ResponseHeader = mustAmneziaHeader("5222-5224")
+	cfg.CookieHeader = mustAmneziaHeader("5333")
+	cfg.TransportHeader = mustAmneziaHeader("5444-5446")
+	cfg.InitiationPackets[0] = "<b 0xdead><r 4>"
+	cfg.InitiationPackets[1] = "<rc 2><t>"
+	cfg.InitiationPackets[3] = "<rd 3>"
+	cfg.InitiationPackets[4] = "<b 0x99>"
+	return cfg
+}
+
+func mustAmneziaHeader(spec string) device.AmneziaWGHeaderRange {
+	header, err := device.ParseAmneziaWGHeaderRange(spec)
+	if err != nil {
+		panic(err)
+	}
+	return header
+}
+
+func amneziaConfigLines(cfg device.AmneziaWGConfig) []string {
+	lines := []string{
+		fmt.Sprintf("jc=%d", cfg.JunkCount),
+		fmt.Sprintf("jmin=%d", cfg.JunkMin),
+		fmt.Sprintf("jmax=%d", cfg.JunkMax),
+		fmt.Sprintf("s1=%d", cfg.InitPadding),
+		fmt.Sprintf("s2=%d", cfg.ResponsePadding),
+		fmt.Sprintf("s3=%d", cfg.CookiePadding),
+		fmt.Sprintf("s4=%d", cfg.TransportPadding),
+		fmt.Sprintf("h1=%s", cfg.InitHeader.Spec()),
+		fmt.Sprintf("h2=%s", cfg.ResponseHeader.Spec()),
+		fmt.Sprintf("h3=%s", cfg.CookieHeader.Spec()),
+		fmt.Sprintf("h4=%s", cfg.TransportHeader.Spec()),
+	}
+	for i, spec := range cfg.InitiationPackets {
+		if spec == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("i%d=%s", i+1, spec))
+	}
+	return lines
 }
 
 func generateKeyPair() (device.NoisePrivateKey, device.NoisePublicKey, error) {
@@ -1143,7 +1409,7 @@ body {
   color: var(--ink);
 }
 main {
-  width: min(1100px, calc(100vw - 32px));
+  width: min(1280px, calc(100vw - 32px));
   margin: 24px auto 48px;
 }
 h1, h2 { font-family: "IBM Plex Mono", monospace; }
@@ -1163,6 +1429,11 @@ h1, h2 { font-family: "IBM Plex Mono", monospace; }
 label, button, input, textarea {
   display: block;
   width: 100%;
+}
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 12px;
 }
 label {
   font-size: 13px;
@@ -1225,6 +1496,68 @@ pre {
         <input id="fwmark" type="number" min="0" placeholder="0">
       </label>
       <button onclick="saveDevice()">Apply device settings</button>
+    </section>
+
+    <section class="panel">
+      <h2>AmneziaWG</h2>
+      <p>Suggested {{.SuggestedRole}} profile is preloaded into this form.</p>
+      <div class="field-grid">
+        <label>Jc
+          <input id="amnezia_junk_count" type="number" min="0" value="0">
+        </label>
+        <label>Jmin
+          <input id="amnezia_junk_min" type="number" min="0" value="0">
+        </label>
+        <label>Jmax
+          <input id="amnezia_junk_max" type="number" min="0" value="0">
+        </label>
+      </div>
+      <div class="field-grid">
+        <label>S1
+          <input id="amnezia_init_padding" type="number" min="0" value="0">
+        </label>
+        <label>S2
+          <input id="amnezia_response_padding" type="number" min="0" value="0">
+        </label>
+        <label>S3
+          <input id="amnezia_cookie_padding" type="number" min="0" value="0">
+        </label>
+        <label>S4
+          <input id="amnezia_transport_padding" type="number" min="0" value="0">
+        </label>
+      </div>
+      <div class="field-grid">
+        <label>H1
+          <input id="amnezia_init_header" placeholder="1 or 1000-1004">
+        </label>
+        <label>H2
+          <input id="amnezia_response_header" placeholder="2 or 2000-2004">
+        </label>
+        <label>H3
+          <input id="amnezia_cookie_header" placeholder="3 or 3000-3004">
+        </label>
+        <label>H4
+          <input id="amnezia_transport_header" placeholder="4 or 4000-4004">
+        </label>
+      </div>
+      <label>I1
+        <input id="amnezia_i1" placeholder="<b 0xaa55><rc 3><rd 2><t>">
+      </label>
+      <label>I2
+        <input id="amnezia_i2" placeholder="<r 5>">
+      </label>
+      <label>I3
+        <input id="amnezia_i3" placeholder="<rd 4>">
+      </label>
+      <label>I4
+        <input id="amnezia_i4" placeholder="<rc 6>">
+      </label>
+      <label>I5
+        <input id="amnezia_i5" placeholder="<b 0x01020304>">
+      </label>
+      <button onclick="applyAmnezia()">Apply AmneziaWG settings</button>
+      <button class="ghost" onclick="loadSuggestedAmnezia()">Reload suggested profile</button>
+      <button class="alt" onclick="resetAmnezia()">Reset to plain WireGuard defaults</button>
     </section>
 
     <section class="panel">
@@ -1309,6 +1642,8 @@ pre {
 <script>
 const stateEl = document.getElementById('state');
 const messageEl = document.getElementById('message');
+const suggestedAmnezia = {{.SuggestedAmneziaJSON}};
+const defaultAmnezia = {{.DefaultAmneziaJSON}};
 
 function lines(text) {
   return text.split(/\n|,/).map(v => v.trim()).filter(Boolean);
@@ -1360,6 +1695,55 @@ function saveDevice() {
     listen_port: numValue('listen_port'),
     fwmark: numValue('fwmark')
   }));
+}
+
+function setAmneziaForm(profile) {
+  document.getElementById('amnezia_junk_count').value = profile.junk_count;
+  document.getElementById('amnezia_junk_min').value = profile.junk_min;
+  document.getElementById('amnezia_junk_max').value = profile.junk_max;
+  document.getElementById('amnezia_init_padding').value = profile.init_padding;
+  document.getElementById('amnezia_response_padding').value = profile.response_padding;
+  document.getElementById('amnezia_cookie_padding').value = profile.cookie_padding;
+  document.getElementById('amnezia_transport_padding').value = profile.transport_padding;
+  document.getElementById('amnezia_init_header').value = profile.init_header;
+  document.getElementById('amnezia_response_header').value = profile.response_header;
+  document.getElementById('amnezia_cookie_header').value = profile.cookie_header;
+  document.getElementById('amnezia_transport_header').value = profile.transport_header;
+  const packets = profile.initiation_packets || [];
+  for (let i = 0; i < 5; i++) {
+    document.getElementById('amnezia_i' + (i + 1)).value = packets[i] || '';
+  }
+}
+
+function readAmneziaForm() {
+  return {
+    junk_count: Number(document.getElementById('amnezia_junk_count').value || 0),
+    junk_min: Number(document.getElementById('amnezia_junk_min').value || 0),
+    junk_max: Number(document.getElementById('amnezia_junk_max').value || 0),
+    init_padding: Number(document.getElementById('amnezia_init_padding').value || 0),
+    response_padding: Number(document.getElementById('amnezia_response_padding').value || 0),
+    cookie_padding: Number(document.getElementById('amnezia_cookie_padding').value || 0),
+    transport_padding: Number(document.getElementById('amnezia_transport_padding').value || 0),
+    init_header: document.getElementById('amnezia_init_header').value.trim(),
+    response_header: document.getElementById('amnezia_response_header').value.trim(),
+    cookie_header: document.getElementById('amnezia_cookie_header').value.trim(),
+    transport_header: document.getElementById('amnezia_transport_header').value.trim(),
+    initiation_packets: [1, 2, 3, 4, 5].map(i => document.getElementById('amnezia_i' + i).value.trim())
+  };
+}
+
+function applyAmnezia() {
+  run(() => post('/api/device/amnezia', readAmneziaForm()));
+}
+
+function loadSuggestedAmnezia() {
+  setAmneziaForm(suggestedAmnezia);
+  showMessage('suggested profile loaded into form', false);
+}
+
+function resetAmnezia() {
+  setAmneziaForm(defaultAmnezia);
+  showMessage('plain WireGuard defaults loaded into form', false);
 }
 
 function applyPeer() {
@@ -1443,10 +1827,13 @@ function probeTunnel() {
   })();
 }
 
+setAmneziaForm(suggestedAmnezia);
 refresh();
 </script>
 </body>
 </html>`
+
+var indexTemplate = template.Must(template.New("index").Parse(indexHTML))
 
 func init() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
