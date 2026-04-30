@@ -1,9 +1,10 @@
 # Testing
 
-This repository has two test layers:
+This repository has multiple test layers:
 
 - Fast package tests with `go test -race ./...`
 - A Linux compatibility suite that runs this library against kernel-space WireGuard and upstream `amneziawg-go` in Docker
+- A Linux obfuscation-signature suite that captures Docker traffic and checks standard WireGuard packet signatures with `tshark`
 - A Linux performance suite that benchmarks this library, upstream `wireguard-go`, upstream `amneziawg-go`, and kernel-space WireGuard with `iperf3`
 
 ## Standard Checks
@@ -95,6 +96,62 @@ The runner captures:
 - UAPI request/response logs for the `wgo` and `amneziawg-go` peers
 
 Containers, Docker network, and temporary Docker images are removed during cleanup.
+
+## Obfuscation Signature Suite
+
+Run the obfuscation suite with:
+
+```bash
+just test-obfuscation
+```
+
+Like the compatibility suite, the current `Justfile` uses `sudo` because the runner needs Docker access and privileged containers.
+
+### What It Tests
+
+The obfuscation suite runs one pair of userspace peers built from this repository in two scenarios:
+
+- Vanilla WireGuard defaults on both sides
+- Matching non-default AmneziaWG parameters on both sides
+
+For each scenario it:
+
+1. Starts two privileged `wgo` peer containers on an isolated Docker network.
+2. Configures the peers through the real UAPI socket.
+3. Starts a dedicated analyzer container in one peer's network namespace and captures the outer UDP traffic on `eth0`.
+4. Sends traffic through the tunnel with `ping`, so the capture includes handshake and transport packets.
+5. Extracts UDP payloads from the resulting `pcapng` with `tshark` and checks them against standard WireGuard outer-packet signatures.
+
+The expected assertions are:
+
+- Vanilla traffic must expose standard WireGuard initiation, response, and transport signatures.
+- Traffic produced with non-default AmneziaWG headers/padding must not expose those standard WireGuard signatures.
+
+The runner is [tests/obfuscation/run.sh](/home/moth/projects/wgo/tests/obfuscation/run.sh).
+
+### Prerequisites
+
+The obfuscation suite is Linux-only and expects:
+
+- Docker installed and usable by the invoking user or through `sudo`
+- Support for privileged containers
+- Enough privileges for Docker to create TUN devices inside the peer containers
+
+### Artifacts
+
+Temporary outputs are written under:
+
+```text
+.tmp/obfuscation/
+```
+
+Each run stores:
+
+- Peer container logs
+- `ip addr` / `ip route` / `wg show` snapshots
+- UAPI request/response logs
+- The raw packet capture (`pcapng`)
+- A signature-analysis summary with captured packet counts and counts of standard WireGuard packet signatures
 
 ## Performance Suite
 
