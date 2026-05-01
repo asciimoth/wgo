@@ -352,7 +352,7 @@ In practice, the examples in this repository prefer the direct `Device` methods 
 
 ## AmneziaWG Extension
 
-This repository now implements the AmneziaWG 2.0 obfuscation extension described in [amnezia_wg_extension.md](/home/moth/projects/wgo/amnezia_wg_extension.md), using the current `amneziawg-go` behavior as the compatibility target where that differs from public docs.
+This repository now implements the AmneziaWG 2.0 obfuscation extension  using the current [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) behavior as the compatibility target where that differs from public docs.
 
 The configuration model is now hierarchical:
 

@@ -1,58 +1,30 @@
-# [WireGuard](https://www.wireguard.com/) lib for go 
+# [WireGuard](https://www.wireguard.com/) library for Go
 
 > [!IMPORTANT]
-> This project contains code extracted from the original
+> This project is a fork of the original
 > [wireguard-go](https://git.zx2c4.com/wireguard-go) project
 > with some modifications.
 > All credit goes to the original wireguard-go authors.
 
-## Typed Device Configuration
+## Things done
+- replaced the built-in TUN and conn implementations with reusable [tuntap](https://github.com/asciimoth/tuntap) and [batchudp](https://github.com/asciimoth/batchudp) libraries
+- support on-the-fly attach/detach/swap operations for `Bind` and `Tun` instances
+- added usage [examples](./examples)
+- added `Device` configuration methods matching UAPI get/set options
+- added leveled logging
+- implemented [amnesiawg-go](https://github.com/amnezia-vpn/amneziawg-go)-compatible obfuscation
+    - added support for per-peer obfuscation options (with a [nuance](./ARCHITECTURE.md#amneziawg-extension))
+- added more end-to-end and [compatibility](./tests/compat) tests with other WireGuard implementations
+- added [performance tests](./tests/perf) with a [comparison](./performance-log.md) against other WireGuard implementations
 
-`Device` can now be configured directly without going through UAPI text.
+## TODO
+- [ ] add WASM based web demo
+- [ ] add a way to pass unknown non-WireGuard traffic to external code so different protocols can share the same port
+- [ ] [PQC](https://github.com/WireGuard/wireguard-go/pull/133)
+- [ ] onion routing
+- [ ] wireguard over tcp
+- [ ] peer auto-discovery
+    - [wireguard endpoint discovery nat traversal](https://www.jordanwhited.com/posts/wireguard-endpoint-discovery-nat-traversal/)
+    - [wgsd](https://coredns.io/explugins/wgsd/)
+- [ ] use [bufpool](https://github.com/asciimoth/bufpool) to optimize allocations
 
-```go
-var localPrivateKey device.NoisePrivateKey
-if err := localPrivateKey.FromHex("<local-private-key-hex>"); err != nil {
-	log.Fatal(err)
-}
-
-var peerKey device.NoisePublicKey
-if err := peerKey.FromHex("<peer-public-key-hex>"); err != nil {
-	log.Fatal(err)
-}
-
-if err := dev.SetPrivateKey(localPrivateKey); err != nil {
-	log.Fatal(err)
-}
-if err := dev.SetListenPort(51820); err != nil {
-	log.Fatal(err)
-}
-
-peer, err := dev.NewPeer(peerKey)
-if err != nil {
-	log.Fatal(err)
-}
-_ = peer
-
-if err := dev.SetPeerProtocolVersion(peerKey, 1); err != nil {
-	log.Fatal(err)
-}
-if err := dev.ReplacePeerAllowedIPs(peerKey, []netip.Prefix{
-	netip.MustParsePrefix("10.44.0.2/32"),
-}); err != nil {
-	log.Fatal(err)
-}
-if err := dev.SetPeerEndpoint(peerKey, "198.51.100.10:51820"); err != nil {
-	log.Fatal(err)
-}
-
-cfg := dev.Config()
-fmt.Println("listen port:", cfg.ListenPort)
-fmt.Println("peer endpoint:", cfg.Peers[0].Endpoint)
-```
-
-For complete runnable examples using the typed methods, see:
-
-- [examples/internal/e2e/e2e.go](/home/moth/projects/wgo/examples/internal/e2e/e2e.go)
-- [examples/http_request/main.go](/home/moth/projects/wgo/examples/http_request/main.go)
-- [examples/web_admin/main.go](/home/moth/projects/wgo/examples/web_admin/main.go) for a localhost web admin panel that starts with no attached TUN or bind and can attach native resources at runtime
