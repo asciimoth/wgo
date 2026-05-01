@@ -5,10 +5,6 @@ nd = "nd"
 oif = "oif"
 ba = "ba"
 
-# Typos in original wireguard-go code; TODO: Fix
-Initation = "Initation"
-mis = "mis"
-
 [files]
 extend-exclude = ["*_test.go"]
 
