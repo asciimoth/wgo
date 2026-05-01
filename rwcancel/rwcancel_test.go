@@ -1,5 +1,9 @@
 //go:build !windows && !wasm
 
+// SPDX-License-Identifier: MIT
+//
+// Copyright (C) 2026 AsciiMoth
+
 package rwcancel
 
 import (

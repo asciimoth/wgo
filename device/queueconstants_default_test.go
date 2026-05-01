@@ -1,5 +1,9 @@
 //go:build !android && !ios && !windows
 
+// SPDX-License-Identifier: MIT
+//
+// Copyright (C) 2026 AsciiMoth
+
 package device
 
 import (

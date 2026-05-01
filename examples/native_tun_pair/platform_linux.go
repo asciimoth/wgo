@@ -1,5 +1,9 @@
 //go:build linux
 
+// SPDX-License-Identifier: MIT
+//
+// Copyright (C) 2026 AsciiMoth
+
 package main
 
 import (
