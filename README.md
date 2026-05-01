@@ -19,7 +19,7 @@
 - added [performance tests](./tests/perf) with a [comparison](./performance-log.md) against other WireGuard implementations
 
 ## TODO
-- [ ] add WASM based web demo
+- [x] add WASM based web demo
 - [ ] add a way to pass unknown non-WireGuard traffic to external code so different protocols can share the same port
 - [ ] [PQC](https://github.com/WireGuard/wireguard-go/pull/133)
 - [ ] onion routing
