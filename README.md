@@ -1,4 +1,5 @@
 # [WireGuard](https://www.wireguard.com/) library for Go
+[![Go Reference](https://pkg.go.dev/badge/github.com/asciimoth/wgo.svg)](https://pkg.go.dev/github.com/asciimoth/wgo)  
 
 > [!IMPORTANT]
 > This project is a fork of the original
