@@ -45,7 +45,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() {
+		_ = listener.Close()
+	}()
 
 	serverDone := make(chan error, 1)
 	go func() {
@@ -98,7 +100,9 @@ func doRequest(label string, clientNet *vtun.VTun, url string) error {
 	if err != nil {
 		return fmt.Errorf("%s request: %w", label, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

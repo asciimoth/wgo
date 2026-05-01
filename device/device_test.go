@@ -9,11 +9,12 @@ package device
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	mrand "math/rand"
 	"net"
 	"net/netip"
 	"os"
@@ -58,11 +59,11 @@ func uapiCfg(cfg ...string) string {
 // The configs use distinct, probably-usable ports.
 func genConfigs(tb testing.TB) (cfgs, endpointCfgs [2]string) {
 	var key1, key2 NoisePrivateKey
-	_, err := rand.Read(key1[:])
+	_, err := crand.Read(key1[:])
 	if err != nil {
 		tb.Errorf("unable to generate private key random bytes: %v", err)
 	}
-	_, err = rand.Read(key2[:])
+	_, err = crand.Read(key2[:])
 	if err != nil {
 		tb.Errorf("unable to generate private key random bytes: %v", err)
 	}
@@ -400,7 +401,9 @@ func runTCPPingPong(tb testing.TB, clientNet, serverNet *vtun.VTun, serverIP net
 	if err != nil {
 		tb.Fatalf("ListenTCP: %v", err)
 	}
-	defer listener.Close()
+	defer func() {
+		_ = listener.Close()
+	}()
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -409,7 +412,9 @@ func runTCPPingPong(tb testing.TB, clientNet, serverNet *vtun.VTun, serverIP net
 			serverErr <- fmt.Errorf("accept: %w", err)
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		buf := make([]byte, 256)
 		for i := range 5 {
@@ -431,7 +436,7 @@ func runTCPPingPong(tb testing.TB, clientNet, serverNet *vtun.VTun, serverIP net
 				serverErr <- fmt.Errorf("set write deadline round %d: %w", i, err)
 				return
 			}
-			if _, err := conn.Write([]byte(fmt.Sprintf("pong %d over tcp", i))); err != nil {
+			if _, err := fmt.Fprintf(conn, "pong %d over tcp", i); err != nil {
 				serverErr <- fmt.Errorf("write round %d: %w", i, err)
 				return
 			}
@@ -443,14 +448,16 @@ func runTCPPingPong(tb testing.TB, clientNet, serverNet *vtun.VTun, serverIP net
 	if err != nil {
 		tb.Fatalf("DialTCP: %v", err)
 	}
-	defer client.Close()
+	defer func() {
+		_ = client.Close()
+	}()
 
 	buf := make([]byte, 256)
 	for i := range 5 {
 		if err := client.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
 			tb.Fatalf("client set write deadline round %d: %v", i, err)
 		}
-		if _, err := client.Write([]byte(fmt.Sprintf("ping %d over tcp", i))); err != nil {
+		if _, err := fmt.Fprintf(client, "ping %d over tcp", i); err != nil {
 			tb.Fatalf("client write round %d: %v", i, err)
 		}
 		if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -483,13 +490,17 @@ func runUDPPingPong(tb testing.TB, clientNet, serverNet *vtun.VTun, serverIP net
 	if err != nil {
 		tb.Fatalf("ListenUDP: %v", err)
 	}
-	defer serverConn.Close()
+	defer func() {
+		_ = serverConn.Close()
+	}()
 
 	clientConn, err := clientNet.DialUDP(ctx, "udp4", "", serverConn.LocalAddr().String())
 	if err != nil {
 		tb.Fatalf("DialUDP: %v", err)
 	}
-	defer clientConn.Close()
+	defer func() {
+		_ = clientConn.Close()
+	}()
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -595,7 +606,9 @@ func TestUpDown(t *testing.T) {
 		pair := genTestPair(t, false)
 		for i := range pair {
 			for k := range pair[i].dev.peers.keyMap {
-				pair[i].dev.IpcSet(fmt.Sprintf("public_key=%s\npersistent_keepalive_interval=1\n", hex.EncodeToString(k[:])))
+				if err := pair[i].dev.IpcSet(fmt.Sprintf("public_key=%s\npersistent_keepalive_interval=1\n", hex.EncodeToString(k[:]))); err != nil {
+					t.Errorf("failed to update peer keepalive: %v", err)
+				}
 			}
 		}
 		var wg sync.WaitGroup
@@ -607,17 +620,19 @@ func TestUpDown(t *testing.T) {
 					if err := d.Up(); err != nil {
 						t.Errorf("failed up bring up device: %v", err)
 					}
-					time.Sleep(time.Duration(rand.Intn(int(time.Nanosecond * (0x10000 - 1)))))
+					time.Sleep(time.Duration(mrand.Intn(int(time.Nanosecond * (0x10000 - 1)))))
 					if err := d.Down(); err != nil {
 						t.Errorf("failed to bring down device: %v", err)
 					}
-					time.Sleep(time.Duration(rand.Intn(int(time.Nanosecond * (0x10000 - 1)))))
+					time.Sleep(time.Duration(mrand.Intn(int(time.Nanosecond * (0x10000 - 1)))))
 				}
 			}(pair[i].dev)
 		}
 		wg.Wait()
 		for i := range pair {
-			pair[i].dev.Up()
+			if err := pair[i].dev.Up(); err != nil {
+				t.Errorf("failed to bring up device during teardown: %v", err)
+			}
 			pair[i].dev.Close()
 		}
 	}
@@ -697,7 +712,9 @@ func TestConcurrencySafety(t *testing.T) {
 		const iters = 10
 		for i := 0; i < iters; i++ {
 			for _, peer := range pair {
-				peer.dev.BindUpdate()
+				if err := peer.dev.BindUpdate(); err != nil {
+					t.Errorf("BindUpdate failed: %v", err)
+				}
 				peer.dev.SendKeepalivesToPeersWithCurrentKeypair()
 			}
 		}
@@ -771,7 +788,9 @@ func BenchmarkUAPIGet(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pair[0].dev.IpcGetOperation(io.Discard)
+		if err := pair[0].dev.IpcGetOperation(io.Discard); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -779,7 +798,7 @@ func goroutineLeakCheck(t *testing.T) {
 	goroutines := func() (int, []byte) {
 		p := pprof.Lookup("goroutine")
 		b := new(bytes.Buffer)
-		p.WriteTo(b, 1)
+		_ = p.WriteTo(b, 1)
 		return p.Count(), b.Bytes()
 	}
 
@@ -1494,7 +1513,9 @@ func TestDeviceReplaceBindReparsesPeerEndpoints(t *testing.T) {
 
 	key0 := mustPrivateKey(t, 0)
 	key1 := mustPrivateKey(t, 1)
-	dev.SetPrivateKey(key0)
+	if err := dev.SetPrivateKey(key0); err != nil {
+		t.Fatalf("SetPrivateKey: %v", err)
+	}
 
 	peer, err := dev.NewPeer(key1.publicKey())
 	if err != nil {
@@ -1595,7 +1616,9 @@ func TestDeviceReplaceBindWithClosedBindCanRecover(t *testing.T) {
 
 	key0 := mustPrivateKey(t, 0)
 	key1 := mustPrivateKey(t, 1)
-	dev.SetPrivateKey(key0)
+	if err := dev.SetPrivateKey(key0); err != nil {
+		t.Fatalf("SetPrivateKey: %v", err)
+	}
 
 	peer, err := dev.NewPeer(key1.publicKey())
 	if err != nil {
@@ -1802,7 +1825,9 @@ func TestVTunOffsetsEndToEnd(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer vt0.Close()
+			defer func() {
+				_ = vt0.Close()
+			}()
 
 			vt1, err := (&vtun.Opts{
 				LocalAddrs:     []netip.Addr{netip.MustParseAddr("10.44.0.2")},
@@ -1813,7 +1838,9 @@ func TestVTunOffsetsEndToEnd(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer vt1.Close()
+			defer func() {
+				_ = vt1.Close()
+			}()
 
 			newDevicePairForTUNs(t, vt0, vt1, [2]netip.Addr{
 				netip.MustParseAddr("10.44.0.1"),
@@ -1824,13 +1851,17 @@ func TestVTunOffsetsEndToEnd(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer listener.Close()
+			defer func() {
+				_ = listener.Close()
+			}()
 
 			conn, err := vt0.DialUDPAddrPort(netip.MustParseAddrPort("10.44.0.1:8000"), netip.MustParseAddrPort("10.44.0.2:9000"))
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer conn.Close()
+			defer func() {
+				_ = conn.Close()
+			}()
 
 			want := []byte("vtun offsets payload")
 			if _, err := conn.Write(want); err != nil {

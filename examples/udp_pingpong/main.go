@@ -30,13 +30,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer serverConn.Close()
+	defer func() {
+		_ = serverConn.Close()
+	}()
 
 	clientConn, err := pair.FirstNet.DialUDP(ctx, "udp4", "", serverConn.LocalAddr().String())
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer clientConn.Close()
+	defer func() {
+		_ = clientConn.Close()
+	}()
 
 	serverDone := make(chan error, 1)
 	go func() {

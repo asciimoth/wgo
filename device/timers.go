@@ -102,7 +102,9 @@ func expiredRetransmitHandshake(peer *Peer) {
 		/* We clear the endpoint address src address, in case this is the cause of trouble. */
 		peer.markEndpointSrcForClearing()
 
-		peer.SendHandshakeInitiation(true)
+		if err := peer.SendHandshakeInitiation(true); err != nil {
+			peer.device.log.Debugf("%s - Failed to retry handshake: %v", peer, err)
+		}
 	}
 }
 
@@ -120,7 +122,9 @@ func expiredNewHandshake(peer *Peer) {
 	peer.device.log.Debugf("%s - Retrying handshake because we stopped hearing back after %d seconds", peer, int((KeepaliveTimeout + RekeyTimeout).Seconds()))
 	/* We clear the endpoint address src address, in case this is the cause of trouble. */
 	peer.markEndpointSrcForClearing()
-	peer.SendHandshakeInitiation(false)
+	if err := peer.SendHandshakeInitiation(false); err != nil {
+		peer.device.log.Debugf("%s - Failed to send handshake retry: %v", peer, err)
+	}
 }
 
 func expiredZeroKeyMaterial(peer *Peer) {

@@ -33,13 +33,13 @@ type trieEntry struct {
 }
 
 func commonBits(ip1, ip2 []byte) uint8 {
-	size := len(ip1)
-	if size == net.IPv4len {
+	switch len(ip1) {
+	case net.IPv4len:
 		a := binary.BigEndian.Uint32(ip1)
 		b := binary.BigEndian.Uint32(ip2)
 		x := a ^ b
 		return uint8(bits.LeadingZeros32(x))
-	} else if size == net.IPv6len {
+	case net.IPv6len:
 		a := binary.BigEndian.Uint64(ip1)
 		b := binary.BigEndian.Uint64(ip2)
 		x := a ^ b
@@ -50,7 +50,7 @@ func commonBits(ip1, ip2 []byte) uint8 {
 		b = binary.BigEndian.Uint64(ip2[8:])
 		x = a ^ b
 		return 64 + uint8(bits.LeadingZeros64(x))
-	} else {
+	default:
 		panic("Wrong size bit string")
 	}
 }

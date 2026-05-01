@@ -38,7 +38,7 @@ func (device *Device) startRouteListener(bind conn.Bind) (*rwcancel.RWCancel, er
 	}
 	netlinkCancel, err := rwcancel.NewRWCancel(netlinkSock)
 	if err != nil {
-		unix.Close(netlinkSock)
+		_ = unix.Close(netlinkSock)
 		return nil, err
 	}
 
@@ -56,7 +56,9 @@ func (device *Device) routineRouteListener(_ conn.Bind, netlinkSock int, netlink
 	var reqPeerLock sync.Mutex
 
 	defer netlinkCancel.Close()
-	defer unix.Close(netlinkSock)
+	defer func() {
+		_ = unix.Close(netlinkSock)
+	}()
 
 	for msg := make([]byte, 1<<16); ; {
 		var err error
@@ -90,10 +92,7 @@ func (device *Device) routineRouteListener(_ conn.Bind, netlinkSock int, netlink
 					}
 					if hdr.Len > unix.SizeofNlMsghdr+unix.SizeofRtMsg {
 						attr := remain[unix.SizeofNlMsghdr+unix.SizeofRtMsg:]
-						for {
-							if uint(len(attr)) < uint(unix.SizeofRtAttr) {
-								break
-							}
+						for uint(len(attr)) >= uint(unix.SizeofRtAttr) {
 							attrhdr := *(*unix.RtAttr)(unsafe.Pointer(&attr[0]))
 							if attrhdr.Len < unix.SizeofRtAttr || uint(len(attr)) < uint(attrhdr.Len) {
 								break
@@ -217,7 +216,7 @@ func createNetlinkRouteSocket() (int, error) {
 	}
 	err = unix.Bind(sock, saddr)
 	if err != nil {
-		unix.Close(sock)
+		_ = unix.Close(sock)
 		return -1, err
 	}
 	return sock, nil

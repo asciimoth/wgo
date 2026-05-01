@@ -82,7 +82,9 @@ func (s *tunnelTrafficState) serveEcho(listener net.Listener) {
 }
 
 func (s *tunnelTrafficState) handleEchoConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	log.Printf("[web_admin tunnel] echo accepted local=%s remote=%s", conn.LocalAddr(), conn.RemoteAddr())
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -199,7 +201,9 @@ func (a *adminApp) probeTunnel(req tunnelProbeRequest) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("dial %s from %s: %w", remoteAddr, localIP, err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return "", err

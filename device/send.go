@@ -253,7 +253,9 @@ func (peer *Peer) keepKeyFreshSending() {
 	}
 	nonce := keypair.sendNonce.Load()
 	if nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > RekeyAfterTime) {
-		peer.SendHandshakeInitiation(false)
+		if err := peer.SendHandshakeInitiation(false); err != nil {
+			peer.device.log.Debugf("%v - Failed to send handshake initiation: %v", peer, err)
+		}
 	}
 }
 
@@ -274,7 +276,7 @@ func (device *Device) RoutineReadFromTUN(tun *tunState) {
 		bufs        = make([][]byte, batchSize)
 		readBufs    = make([][]byte, batchSize)
 		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
-		count       = 0
+		count       int
 		sizes       = make([]int, batchSize)
 		offset      = tun.readOffset
 	)
@@ -429,7 +431,9 @@ top:
 
 	keypair := peer.keypairs.Current()
 	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
-		peer.SendHandshakeInitiation(false)
+		if err := peer.SendHandshakeInitiation(false); err != nil {
+			peer.device.log.Debugf("%v - Failed to send handshake initiation: %v", peer, err)
+		}
 		return
 	}
 

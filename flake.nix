@@ -40,7 +40,7 @@
             };
             govet.enable = true;
             gofmt.enable = true;
-            # golangci-lint.enable = true;
+            golangci-lint.enable = true;
             gotidy = {
               enable = true;
               description = "Makes sure go.mod matches the source code";

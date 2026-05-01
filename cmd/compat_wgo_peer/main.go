@@ -84,7 +84,9 @@ func run() error {
 		_ = network.Down()
 		return fmt.Errorf("open uapi socket: %w", err)
 	}
-	defer socketFile.Close()
+	defer func() {
+		_ = socketFile.Close()
+	}()
 
 	listener, err := ipc.UAPIListen(ifName, socketFile)
 	if err != nil {

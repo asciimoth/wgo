@@ -66,12 +66,16 @@ func (device *Device) RoutineTUNEventReader(tun *tunState) {
 
 		if event&gtun.EventUp != 0 {
 			device.log.Debugf("Interface up requested")
-			device.Up()
+			if err := device.Up(); err != nil {
+				device.log.Errf("Failed to bring interface up: %v", err)
+			}
 		}
 
 		if event&gtun.EventDown != 0 {
 			device.log.Debugf("Interface down requested")
-			device.Down()
+			if err := device.Down(); err != nil {
+				device.log.Errf("Failed to bring interface down: %v", err)
+			}
 		}
 	}
 }

@@ -80,7 +80,9 @@ func (peer *Peer) keepKeyFreshReceiving() {
 	keypair := peer.keypairs.Current()
 	if keypair != nil && keypair.isInitiator && time.Since(keypair.created) > (RejectAfterTime-KeepaliveTimeout-RekeyTimeout) {
 		peer.timers.sentLastMinuteHandshake.Store(true)
-		peer.SendHandshakeInitiation(false)
+		if err := peer.SendHandshakeInitiation(false); err != nil {
+			peer.device.log.Debugf("%v - Failed to send handshake initiation: %v", peer, err)
+		}
 	}
 }
 
@@ -133,7 +135,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				return
 			}
 			device.log.Debugf("Failed to receive %s packet: %v", recvName, err)
-			if neterr, ok := err.(net.Error); ok && !neterr.Temporary() {
+			if neterr, ok := err.(net.Error); ok && !neterr.Timeout() {
 				return
 			}
 			if deathSpiral < 10 {
@@ -349,7 +351,9 @@ func (device *Device) RoutineHandshake(id int) {
 				// verify MAC2 field
 
 				if !device.cookieChecker.CheckMAC2(elem.packet, elem.endpoint.DstToBytes()) {
-					device.SendHandshakeCookie(&elem)
+					if err := device.SendHandshakeCookie(&elem); err != nil {
+						device.log.Debugf("Failed to send handshake cookie: %v", err)
+					}
 					goto skip
 				}
 
@@ -399,7 +403,9 @@ func (device *Device) RoutineHandshake(id int) {
 			device.log.Debugf("%v - Received handshake initiation", peer)
 			peer.rxBytes.Add(uint64(len(elem.packet)))
 
-			peer.SendHandshakeResponse()
+			if err := peer.SendHandshakeResponse(); err != nil {
+				device.log.Debugf("%v - Failed to send handshake response: %v", peer, err)
+			}
 
 		case MessageResponseType:
 

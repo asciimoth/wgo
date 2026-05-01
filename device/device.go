@@ -494,7 +494,9 @@ func (device *Device) Close() {
 	device.stopTUN(device.tun.device.Swap(nil))
 
 	device.state.Lock()
-	device.downLocked()
+	if err := device.downLocked(); err != nil {
+		device.log.Errf("Failed to bring device down while closing: %v", err)
+	}
 	device.state.Unlock()
 
 	// Remove peers before closing queues,
@@ -542,7 +544,7 @@ func closeBindLocked(device *Device) error {
 	var err error
 	netc := &device.net
 	if netc.netlinkCancel != nil {
-		netc.netlinkCancel.Cancel()
+		_ = netc.netlinkCancel.Cancel()
 	}
 	if netc.bind != nil {
 		err = ghelpers.ClosedNetworkErrToNil(netc.bind.Close())
@@ -616,7 +618,7 @@ func (device *Device) BindUpdate() error {
 
 	netc.netlinkCancel, err = device.startRouteListener(netc.bind)
 	if err != nil {
-		netc.bind.Close()
+		_ = netc.bind.Close()
 		netc.port = 0
 		return err
 	}

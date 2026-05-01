@@ -100,6 +100,7 @@ var errInvalidPublicKey = errors.New("invalid public key")
 func (sk *NoisePrivateKey) sharedSecret(pk NoisePublicKey) (ss [NoisePublicKeySize]byte, err error) {
 	apk := (*[NoisePublicKeySize]byte)(&pk)
 	ask := (*[NoisePrivateKeySize]byte)(sk)
+	//nolint:staticcheck // WireGuard requires low-order point rejection semantics that are checked below.
 	curve25519.ScalarMult(&ss, ask, apk)
 	if isZero(ss[:]) {
 		return ss, errInvalidPublicKey

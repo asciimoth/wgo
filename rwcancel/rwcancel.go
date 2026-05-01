@@ -112,6 +112,6 @@ func (rw *RWCancel) Cancel() (err error) {
 }
 
 func (rw *RWCancel) Close() {
-	rw.closingReader.Close()
-	rw.closingWriter.Close()
+	_ = rw.closingReader.Close()
+	_ = rw.closingWriter.Close()
 }

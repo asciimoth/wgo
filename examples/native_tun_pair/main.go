@@ -185,7 +185,9 @@ func (p *nativePair) runTraffic() error {
 	if err != nil {
 		return fmt.Errorf("listen on first tunnel address: %w", err)
 	}
-	defer listener.Close()
+	defer func() {
+		_ = listener.Close()
+	}()
 
 	log.Printf("listening on %s", listener.Addr())
 
@@ -196,7 +198,9 @@ func (p *nativePair) runTraffic() error {
 			serverDone <- err
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		log.Printf("server accepted connection from %s", conn.RemoteAddr())
 
@@ -244,7 +248,9 @@ func (p *nativePair) runTraffic() error {
 	if err != nil {
 		return fmt.Errorf("dial through second tunnel address: %w", err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	log.Printf("client connected local=%s remote=%s", conn.LocalAddr(), conn.RemoteAddr())
 

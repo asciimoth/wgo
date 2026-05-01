@@ -182,7 +182,7 @@ func (t *chTun) MTU() (int, error)         { return t.c.mtu, nil }
 func (t *chTun) Name() (string, error)     { return "loopbackTun1", nil }
 func (t *chTun) Events() <-chan gtun.Event { return t.c.events }
 func (t *chTun) Close() error {
-	t.Write(nil, -1)
+	_, _ = t.Write(nil, -1)
 	return nil
 }
 

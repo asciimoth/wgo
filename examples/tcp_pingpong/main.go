@@ -31,7 +31,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() {
+		_ = listener.Close()
+	}()
 
 	serverDone := make(chan error, 1)
 	go func() {
@@ -40,7 +42,9 @@ func main() {
 			serverDone <- err
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		buf := make([]byte, 256)
 		for i := 0; i < 5; i++ {
@@ -76,7 +80,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	buf := make([]byte, 256)
 	for i := 0; i < 5; i++ {

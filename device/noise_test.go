@@ -45,7 +45,7 @@ func randDevice(t *testing.T) *Device {
 		_ = network.Down()
 	})
 	device := NewDevice(tun.TUN(), conn.NewDefaultBind(network), logger)
-	device.SetPrivateKey(sk)
+	assertNil(t, device.SetPrivateKey(sk))
 	return device
 }
 

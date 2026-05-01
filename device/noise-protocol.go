@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
+	//nolint:staticcheck // WireGuard protocol message sizes are defined in terms of Poly1305 tags.
 	"golang.org/x/crypto/poly1305"
 
 	"github.com/asciimoth/wgo/tai64n"
@@ -625,7 +626,8 @@ func (peer *Peer) BeginSymmetricSession() error {
 	var sendKey [chacha20poly1305.KeySize]byte
 	var recvKey [chacha20poly1305.KeySize]byte
 
-	if handshake.state == handshakeResponseConsumed {
+	switch handshake.state {
+	case handshakeResponseConsumed:
 		KDF2(
 			&sendKey,
 			&recvKey,
@@ -633,7 +635,7 @@ func (peer *Peer) BeginSymmetricSession() error {
 			nil,
 		)
 		isInitiator = true
-	} else if handshake.state == handshakeResponseCreated {
+	case handshakeResponseCreated:
 		KDF2(
 			&recvKey,
 			&sendKey,
@@ -641,7 +643,7 @@ func (peer *Peer) BeginSymmetricSession() error {
 			nil,
 		)
 		isInitiator = false
-	} else {
+	default:
 		return fmt.Errorf("invalid state for keypair derivation: %v", handshake.state)
 	}
 

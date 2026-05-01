@@ -612,7 +612,9 @@ func (device *Device) IpcSet(uapiConf string) error {
 }
 
 func (device *Device) IpcHandle(socket net.Conn) {
-	defer socket.Close()
+	defer func() {
+		_ = socket.Close()
+	}()
 
 	buffered := func(s io.ReadWriter) *bufio.ReadWriter {
 		reader := bufio.NewReader(s)
@@ -654,10 +656,16 @@ func (device *Device) IpcHandle(socket net.Conn) {
 		}
 		if status != nil {
 			device.log.Errf("%v", status)
-			fmt.Fprintf(buffered, "errno=%d\n\n", status.ErrorCode())
+			if _, err = fmt.Fprintf(buffered, "errno=%d\n\n", status.ErrorCode()); err != nil {
+				return
+			}
 		} else {
-			fmt.Fprintf(buffered, "errno=0\n\n")
+			if _, err = fmt.Fprintf(buffered, "errno=0\n\n"); err != nil {
+				return
+			}
 		}
-		buffered.Flush()
+		if err = buffered.Flush(); err != nil {
+			return
+		}
 	}
 }

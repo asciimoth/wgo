@@ -92,7 +92,7 @@ func UAPIListen(name string, file *os.File) (net.Listener, error) {
 
 	uapi.inotifyRWCancel, err = rwcancel.NewRWCancel(uapi.inotifyFd)
 	if err != nil {
-		unix.Close(uapi.inotifyFd)
+		_ = unix.Close(uapi.inotifyFd)
 		return nil, err
 	}
 
