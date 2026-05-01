@@ -17,7 +17,6 @@ import (
 	"time"
 
 	conn "github.com/asciimoth/batchudp"
-	"github.com/asciimoth/tuntap"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -370,7 +369,7 @@ func (device *Device) RoutineReadFromTUN(tun *tunState) {
 		}
 
 		if readErr != nil {
-			if errors.Is(readErr, tuntap.ErrTooManySegments) {
+			if isTooManySegmentsError(readErr) {
 				// TODO: record stat for this
 				// This will happen if MSS is surprisingly small (< 576)
 				// coincident with reasonably high throughput.

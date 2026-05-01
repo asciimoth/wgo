@@ -6,4 +6,4 @@ package rwcancel
 
 type RWCancel struct{}
 
-func (*RWCancel) Cancel() {}
+func (*RWCancel) Cancel() error { return nil }
