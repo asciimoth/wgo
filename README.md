@@ -17,6 +17,7 @@
     - added support for per-peer obfuscation options (with a [nuance](./ARCHITECTURE.md#amneziawg-extension))
 - added more end-to-end and [compatibility](./tests/compat) tests with other WireGuard implementations
 - added [performance tests](./tests/perf) with a [comparison](./performance-log.md) against other WireGuard implementations
+- [WASM builds supported](https://asciimoth.github.io/wg-web-demo/)
 
 ## TODO
 - [x] add WASM based web demo
