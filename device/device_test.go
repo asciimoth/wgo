@@ -27,9 +27,8 @@ import (
 
 	conn "github.com/asciimoth/batchudp"
 	"github.com/asciimoth/batchudp/bindtest"
+	"github.com/asciimoth/gonnect"
 	"github.com/asciimoth/gonnect-netstack/vtun"
-	"github.com/asciimoth/gonnect/loopback"
-	"github.com/asciimoth/gonnect/native"
 	gtun "github.com/asciimoth/gonnect/tun"
 )
 
@@ -206,7 +205,7 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 	var binds [2]conn.Bind
 	if realSocket {
 		for i := range binds {
-			network := (&native.Config{}).Build()
+			network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
 			tb.Cleanup(func() {
 				_ = network.Down()
 			})
@@ -347,7 +346,7 @@ func newEndToEndBinds(tb testing.TB, mode e2eBindMode) [2]conn.Bind {
 	case e2eBindModeNativeDefault:
 		var binds [2]conn.Bind
 		for i := range binds {
-			network := (&native.Config{}).Build()
+			network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
 			tb.Cleanup(func() {
 				_ = network.Down()
 			})
@@ -355,7 +354,7 @@ func newEndToEndBinds(tb testing.TB, mode e2eBindMode) [2]conn.Bind {
 		}
 		return binds
 	case e2eBindModeLoopbackDefault:
-		network := loopback.NewLoopbackNetwok()
+		network := gonnect.NewLoopbackNetwok()
 		tb.Cleanup(func() {
 			_ = network.Down()
 		})

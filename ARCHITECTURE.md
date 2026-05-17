@@ -93,7 +93,7 @@ Concrete providers now come from external packages:
 
 - `github.com/asciimoth/tuntap` for native OS TUN devices
 - `github.com/asciimoth/gonnect-netstack/vtun` for userspace virtual TUNs
-- `github.com/asciimoth/gonnect/native` when the host wants a default OS-backed network for `batchudp`
+- `github.com/asciimoth/gonnect.NativeNetwork` when the host wants a default OS-backed network for `batchudp`
 - package-local test helpers in `device/*_test.go`
 
 At the TUN boundary, `device` keeps two concepts separate:

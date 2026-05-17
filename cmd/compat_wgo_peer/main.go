@@ -18,7 +18,7 @@ import (
 	"time"
 
 	conn "github.com/asciimoth/batchudp"
-	"github.com/asciimoth/gonnect/native"
+	"github.com/asciimoth/gonnect"
 	"github.com/asciimoth/tuntap"
 	"github.com/asciimoth/wgo/device"
 	"github.com/asciimoth/wgo/ipc"
@@ -57,31 +57,27 @@ func run() error {
 		return err
 	}
 
-	network := (&native.Config{}).Build()
+	network := (&gonnect.NativeConfig{}).Build()
 	bind := conn.NewDefaultBind(network)
 	logger, err := parseLogLevel(cfg.logLevel)
 	if err != nil {
 		_ = tunDev.Close()
-		_ = network.Down()
 		return err
 	}
 	dev := device.NewDevice(tunDev, bind, device.NewLogger(logger, "compat/wgo: "))
 
 	if err := dev.SetListenPort(uint16(cfg.listenPort)); err != nil {
 		dev.Close()
-		_ = network.Down()
 		return fmt.Errorf("set listen port: %w", err)
 	}
 	if err := dev.Up(); err != nil {
 		dev.Close()
-		_ = network.Down()
 		return fmt.Errorf("bring device up: %w", err)
 	}
 
 	socketFile, err := ipc.UAPIOpen(ifName)
 	if err != nil {
 		dev.Close()
-		_ = network.Down()
 		return fmt.Errorf("open uapi socket: %w", err)
 	}
 	defer func() {
@@ -91,7 +87,6 @@ func run() error {
 	listener, err := ipc.UAPIListen(ifName, socketFile)
 	if err != nil {
 		dev.Close()
-		_ = network.Down()
 		return fmt.Errorf("listen on uapi socket: %w", err)
 	}
 
@@ -110,9 +105,6 @@ func run() error {
 
 	_ = listener.Close()
 	dev.Close()
-	if downErr := network.Down(); downErr != nil && err == nil {
-		err = downErr
-	}
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
 		return nil
 	}

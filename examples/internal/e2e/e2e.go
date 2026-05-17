@@ -11,9 +11,8 @@ import (
 	"time"
 
 	conn "github.com/asciimoth/batchudp"
+	"github.com/asciimoth/gonnect"
 	"github.com/asciimoth/gonnect-netstack/vtun"
-	"github.com/asciimoth/gonnect/loopback"
-	"github.com/asciimoth/gonnect/native"
 	"github.com/asciimoth/wgo/device"
 	"golang.org/x/crypto/curve25519"
 )
@@ -41,7 +40,7 @@ type networkDowner interface {
 }
 
 func New() (*Pair, error) {
-	network := loopback.NewLoopbackNetwok()
+	network := gonnect.NewLoopbackNetwok()
 
 	firstTun, err := buildVTun(firstIP, 0, 0)
 	if err != nil {
@@ -89,7 +88,7 @@ func (p *Pair) SwapSecondVTun(mwo, mro int) error {
 }
 
 func (p *Pair) SwapBindsToNative() error {
-	network := (&native.Config{}).Build()
+	network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
 	firstBind := conn.NewDefaultBind(network)
 	secondBind := conn.NewDefaultBind(network)
 

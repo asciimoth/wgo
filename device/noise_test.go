@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	conn "github.com/asciimoth/batchudp"
-	"github.com/asciimoth/gonnect/native"
+	"github.com/asciimoth/gonnect"
 )
 
 func TestCurveWrappers(t *testing.T) {
@@ -40,7 +40,7 @@ func randDevice(t *testing.T) *Device {
 	}
 	tun := newChannelTUN()
 	logger := NewLogger(LogLevelError, "")
-	network := (&native.Config{}).Build()
+	network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
 	t.Cleanup(func() {
 		_ = network.Down()
 	})

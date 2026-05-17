@@ -16,7 +16,6 @@ import (
 
 	conn "github.com/asciimoth/batchudp"
 	"github.com/asciimoth/gonnect"
-	"github.com/asciimoth/gonnect/native"
 	gtun "github.com/asciimoth/gonnect/tun"
 )
 
@@ -138,7 +137,7 @@ func (b *loggingBind) BatchSize() int {
 }
 
 type recordingNetwork struct {
-	*native.Network
+	*gonnect.DetachedNetwork
 
 	mu         sync.Mutex
 	listenAddr map[string]string
@@ -146,19 +145,19 @@ type recordingNetwork struct {
 
 func newRecordingNetwork() *recordingNetwork {
 	return &recordingNetwork{
-		Network:    (&native.Config{}).Build(),
-		listenAddr: make(map[string]string),
+		DetachedNetwork: gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build()),
+		listenAddr:      make(map[string]string),
 	}
 }
 
 func (n *recordingNetwork) ListenUDP(ctx context.Context, network, laddr string) (gonnect.UDPConn, error) {
-	conn, err := n.Network.ListenUDP(ctx, network, laddr)
+	conn, err := n.DetachedNetwork.ListenUDP(ctx, network, laddr)
 	n.record(network, conn, err)
 	return conn, err
 }
 
 func (n *recordingNetwork) ListenUDPConfig(ctx context.Context, lc *gonnect.ListenConfig, network, laddr string) (gonnect.UDPConn, error) {
-	conn, err := n.Network.ListenUDPConfig(ctx, lc, network, laddr)
+	conn, err := n.DetachedNetwork.ListenUDPConfig(ctx, lc, network, laddr)
 	n.record(network, conn, err)
 	return conn, err
 }

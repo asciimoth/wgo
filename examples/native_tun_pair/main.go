@@ -16,7 +16,7 @@ import (
 	"time"
 
 	conn "github.com/asciimoth/batchudp"
-	"github.com/asciimoth/gonnect/native"
+	"github.com/asciimoth/gonnect"
 	gtun "github.com/asciimoth/gonnect/tun"
 	"github.com/asciimoth/tuntap"
 	"github.com/asciimoth/wgo/device"
@@ -41,8 +41,8 @@ type nativePair struct {
 	secondName string
 	firstDev   *device.Device
 	secondDev  *device.Device
-	firstNet   *native.Network
-	secondNet  *native.Network
+	firstNet   *gonnect.DetachedNetwork
+	secondNet  *gonnect.DetachedNetwork
 	cleanup    []func() error
 }
 
@@ -88,8 +88,8 @@ func newNativePair() (*nativePair, error) {
 		return nil, fmt.Errorf("create second native tun: %w", err)
 	}
 
-	firstNet := (&native.Config{}).Build()
-	secondNet := (&native.Config{}).Build()
+	firstNet := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
+	secondNet := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
 
 	pair := &nativePair{
 		firstName:  firstName,

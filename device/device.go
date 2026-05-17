@@ -14,7 +14,7 @@ import (
 	"time"
 
 	conn "github.com/asciimoth/batchudp"
-	ghelpers "github.com/asciimoth/gonnect/helpers"
+	"github.com/asciimoth/gonnect"
 	gtun "github.com/asciimoth/gonnect/tun"
 	"github.com/asciimoth/wgo/ratelimiter"
 	"github.com/asciimoth/wgo/rwcancel"
@@ -547,7 +547,7 @@ func closeBindLocked(device *Device) error {
 		_ = netc.netlinkCancel.Cancel()
 	}
 	if netc.bind != nil {
-		err = ghelpers.ClosedNetworkErrToNil(netc.bind.Close())
+		err = gonnect.ClosedNetworkErrToNil(netc.bind.Close())
 	}
 	netc.stopping.Wait()
 	return err
