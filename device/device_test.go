@@ -941,6 +941,8 @@ func (t *fakeTUNDeviceSized) ensureInit() {
 	}
 }
 
+func (t *fakeTUNDeviceSized) IsNative() bool { return false }
+
 func (t *fakeTUNDeviceSized) File() *os.File { return nil }
 func (t *fakeTUNDeviceSized) Read(bufs [][]byte, sizes []int, offset int) (n int, err error) {
 	t.ensureInit()
@@ -986,6 +988,8 @@ func newFakeBlockingEventTUN(mtu int) *fakeBlockingEventTUN {
 		releaseMTU: make(chan struct{}),
 	}
 }
+
+func (t *fakeBlockingEventTUN) IsNative() bool { return false }
 
 func (t *fakeBlockingEventTUN) MTU() (int, error) {
 	if t.mtuCalls.Add(1) == 1 {

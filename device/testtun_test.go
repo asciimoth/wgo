@@ -135,6 +135,8 @@ type chTun struct {
 	c *channelTUN
 }
 
+func (t *chTun) IsNative() bool { return false }
+
 func (t *chTun) File() *os.File { return nil }
 
 func (t *chTun) Read(packets [][]byte, sizes []int, offset int) (int, error) {
