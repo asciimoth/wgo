@@ -40,7 +40,7 @@ func randDevice(t *testing.T) *Device {
 	}
 	tun := newChannelTUN()
 	logger := NewLogger(LogLevelError, "")
-	network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
+	network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
 	t.Cleanup(func() {
 		_ = network.Down()
 	})

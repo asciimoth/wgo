@@ -205,7 +205,7 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 	var binds [2]conn.Bind
 	if realSocket {
 		for i := range binds {
-			network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
+			network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
 			tb.Cleanup(func() {
 				_ = network.Down()
 			})
@@ -346,7 +346,7 @@ func newEndToEndBinds(tb testing.TB, mode e2eBindMode) [2]conn.Bind {
 	case e2eBindModeNativeDefault:
 		var binds [2]conn.Bind
 		for i := range binds {
-			network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
+			network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
 			tb.Cleanup(func() {
 				_ = network.Down()
 			})

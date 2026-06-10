@@ -88,8 +88,8 @@ func newNativePair() (*nativePair, error) {
 		return nil, fmt.Errorf("create second native tun: %w", err)
 	}
 
-	firstNet := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
-	secondNet := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
+	firstNet := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
+	secondNet := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
 
 	pair := &nativePair{
 		firstName:  firstName,

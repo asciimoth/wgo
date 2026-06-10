@@ -88,7 +88,7 @@ func (p *Pair) SwapSecondVTun(mwo, mro int) error {
 }
 
 func (p *Pair) SwapBindsToNative() error {
-	network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build())
+	network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
 	firstBind := conn.NewDefaultBind(network)
 	secondBind := conn.NewDefaultBind(network)
 
