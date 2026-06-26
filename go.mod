@@ -3,10 +3,10 @@ module github.com/asciimoth/wgo
 go 1.25.5
 
 require (
-	github.com/asciimoth/batchudp v0.1.14
-	github.com/asciimoth/gonnect v0.28.0
-	github.com/asciimoth/gonnect-netstack v0.4.27
-	github.com/asciimoth/tuntap v0.3.14
+	github.com/asciimoth/batchudp v0.1.16
+	github.com/asciimoth/gonnect v0.29.0
+	github.com/asciimoth/gonnect-netstack v0.4.28
+	github.com/asciimoth/tuntap v0.3.16
 	golang.org/x/crypto v0.51.0
 	golang.org/x/net v0.54.0
 	golang.org/x/sys v0.44.0
