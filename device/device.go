@@ -61,6 +61,26 @@ type Device struct {
 		keyMap       map[NoisePublicKey]*Peer
 	}
 
+	stats struct {
+		sync.RWMutex
+		subscribers map[uint64]RuntimeStatsCallback
+		nextSubID   uint64
+		notify      chan struct{}
+
+		rxBytes   atomic.Uint64
+		txBytes   atomic.Uint64
+		rxPackets atomic.Uint64
+		txPackets atomic.Uint64
+
+		byteDelta   atomic.Uint64
+		packetDelta atomic.Uint64
+
+		lastNotifyRxBytes   atomic.Uint64
+		lastNotifyTxBytes   atomic.Uint64
+		lastNotifyRxPackets atomic.Uint64
+		lastNotifyTxPackets atomic.Uint64
+	}
+
 	rate struct {
 		underLoadUntil atomic.Int64
 		limiter        ratelimiter.Ratelimiter
@@ -176,6 +196,7 @@ func removePeerLocked(device *Device, peer *Peer, key NoisePublicKey) {
 
 	// remove from peer map
 	delete(device.peers.keyMap, key)
+	device.signalRuntimeStats()
 }
 
 // changeState attempts to change the device state to match want.
@@ -405,6 +426,10 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
 		device.tun.mtu.Store(int32(DefaultMTU))
 	}
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
+	device.stats.subscribers = make(map[uint64]RuntimeStatsCallback)
+	device.stats.notify = make(chan struct{}, 1)
+	device.stats.byteDelta.Store(DefaultRuntimeStatsByteDelta)
+	device.stats.packetDelta.Store(DefaultRuntimeStatsPacketDelta)
 	device.rate.limiter.Init()
 	device.indexTable.Init()
 	device.headers.init = &magicHeader{start: MessageInitiationType, end: MessageInitiationType}
@@ -422,6 +447,8 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
 	device.queue.decryption = newInboundQueue()
 
 	// start workers
+
+	go device.routineRuntimeStatsNotifier()
 
 	cpus := runtime.NumCPU()
 	device.state.stopping.Wait()

@@ -402,6 +402,7 @@ func (device *Device) RoutineHandshake(id int) {
 
 			device.log.Debugf("%v - Received handshake initiation", peer)
 			peer.rxBytes.Add(uint64(len(elem.packet)))
+			peer.device.accountRuntimeStatsRx(uint64(len(elem.packet)), 1)
 
 			if err := peer.SendHandshakeResponse(); err != nil {
 				device.log.Debugf("%v - Failed to send handshake response: %v", peer, err)
@@ -432,6 +433,7 @@ func (device *Device) RoutineHandshake(id int) {
 
 			device.log.Debugf("%v - Received handshake response", peer)
 			peer.rxBytes.Add(uint64(len(elem.packet)))
+			peer.device.accountRuntimeStatsRx(uint64(len(elem.packet)), 1)
 
 			// update timers
 
@@ -475,6 +477,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		validTailPacket := -1
 		dataPacketReceived := false
 		rxBytesLen := uint64(0)
+		rxPackets := uint64(0)
 		for i, elem := range elemsContainer.elems {
 			if elem.packet == nil {
 				// decryption failed
@@ -492,6 +495,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				peer.SendStagedPackets()
 			}
 			rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
+			rxPackets++
 
 			if len(elem.packet) == 0 {
 				device.log.Debugf("%v - Receiving keepalive packet", peer)
@@ -542,6 +546,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		}
 
 		peer.rxBytes.Add(rxBytesLen)
+		peer.device.accountRuntimeStatsRx(rxBytesLen, rxPackets)
 		if validTailPacket >= 0 {
 			peer.SetEndpointFromPacket(elemsContainer.elems[validTailPacket].endpoint)
 			peer.keepKeyFreshReceiving()

@@ -185,6 +185,8 @@ func (peer *Peer) timersHandshakeComplete() {
 	peer.timers.handshakeAttempts.Store(0)
 	peer.timers.sentLastMinuteHandshake.Store(false)
 	peer.lastHandshakeNano.Store(time.Now().UnixNano())
+	peer.device.signalRuntimeStats()
+	time.AfterFunc(RejectAfterTime+time.Millisecond, peer.device.signalRuntimeStats)
 }
 
 /* Should be called after an ephemeral key is created, which is before sending a handshake response or after receiving a handshake response. */

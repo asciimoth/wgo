@@ -116,6 +116,7 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	// add
 	device.peers.keyMap[pk] = peer
 	_ = device.refreshPeerAmneziaWGSnapshotLocked(peer)
+	device.signalRuntimeStats()
 
 	return peer, nil
 }
@@ -150,6 +151,7 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 			totalLen += uint64(len(b))
 		}
 		peer.txBytes.Add(totalLen)
+		peer.device.accountRuntimeStatsTx(totalLen, uint64(len(buffers)))
 	}
 	return err
 }
@@ -247,6 +249,7 @@ func (peer *Peer) Start() {
 	go peer.RoutineSequentialReceiver(batchSize)
 
 	peer.isRunning.Store(true)
+	peer.device.signalRuntimeStats()
 }
 
 func (peer *Peer) ZeroAndFlushAll() {
@@ -312,6 +315,7 @@ func (peer *Peer) Stop() {
 	peer.device.queue.encryption.wg.Done() // no more writes to encryption queue from us
 
 	peer.ZeroAndFlushAll()
+	peer.device.signalRuntimeStats()
 }
 
 func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {

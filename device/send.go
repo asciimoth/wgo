@@ -160,7 +160,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	sendBuffer = append(sendBuffer, packet)
 	err = peer.SendBuffers(sendBuffer)
 	if err != nil {
-		peer.device.log.Errf("%v - Failed to send handshake initiation: %v", peer, err)
+		peer.device.log.Debugf("%v - Failed to send handshake initiation: %v", peer, err)
 	}
 	peer.timersHandshakeInitiated()
 
@@ -632,7 +632,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 			}
 		}
 		if err != nil {
-			device.log.Errf("%v - Failed to send data packets: %v", peer, err)
+			device.log.Debugf("%v - Failed to send data packets: %v", peer, err)
 			continue
 		}
 

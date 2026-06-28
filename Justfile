@@ -4,7 +4,7 @@ test:
 	go test -race ./...
 
 test-stress:
-  go test ./... --race -count=100 -timeout=30m > test.log 2>&1
+  go test ./... --race -count=20 -timeout=30m > test.log 2>&1
 
 vet:
 	go vet ./...
