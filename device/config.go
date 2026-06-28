@@ -8,10 +8,14 @@ package device
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+
+	conn "github.com/asciimoth/batchudp"
 )
 
 type DeviceConfig struct {
@@ -48,6 +52,181 @@ type AmneziaWGConfigPatch struct {
 	CookiePadding     *int
 	TransportPadding  *int
 	InitiationPackets [amneziaPacketCount]*string
+}
+
+// EndpointParser validates endpoint strings using bind-specific endpoint parsing.
+type EndpointParser interface {
+	ParseEndpoint(string) (conn.Endpoint, error)
+}
+
+// ValidationOptions configures optional dependencies for pure config validation.
+type ValidationOptions struct {
+	EndpointParser EndpointParser
+}
+
+// ValidateConfig validates a full device configuration without mutating a Device.
+func ValidateConfig(cfg DeviceConfig) error {
+	return ValidateConfigWithOptions(cfg, ValidationOptions{})
+}
+
+// ValidateConfigWithOptions validates a full device configuration with optional parser dependencies.
+func ValidateConfigWithOptions(cfg DeviceConfig, opts ValidationOptions) error {
+	if err := ValidateAmneziaWGConfig(cfg.AmneziaWG); err != nil {
+		return fmt.Errorf("amneziawg: %w", err)
+	}
+	if len(cfg.Peers) > MaxPeers {
+		return fmt.Errorf("peers: too many peers")
+	}
+
+	seen := make(map[NoisePublicKey]struct{}, len(cfg.Peers))
+	for _, peer := range cfg.Peers {
+		if _, ok := seen[peer.PublicKey]; ok {
+			return fmt.Errorf("peer %s: duplicate public key", validationPeerName(peer.PublicKey))
+		}
+		seen[peer.PublicKey] = struct{}{}
+
+		if err := validatePeerConfig(peer, opts); err != nil {
+			return fmt.Errorf("peer %s: %w", validationPeerName(peer.PublicKey), err)
+		}
+	}
+	return nil
+}
+
+// ValidatePeerConfig validates a single peer configuration without mutating a Device.
+func ValidatePeerConfig(peer PeerConfig) error {
+	return validatePeerConfig(peer, ValidationOptions{})
+}
+
+// ValidateAmneziaWGConfig validates a complete AmneziaWG configuration.
+func ValidateAmneziaWGConfig(cfg AmneziaWGConfig) error {
+	return validateAmneziaWGConfig(cfg)
+}
+
+// ValidateAmneziaWGConfigPatch validates patch-local AmneziaWG values.
+func ValidateAmneziaWGConfigPatch(patch AmneziaWGConfigPatch) error {
+	override, err := patch.toIPC()
+	if err != nil {
+		return err
+	}
+	return validateAmneziaWGConfigPatch(override)
+}
+
+func validatePeerConfig(peer PeerConfig, opts ValidationOptions) error {
+	if peer.ProtocolVersion != 1 {
+		return fmt.Errorf("protocol version: invalid protocol version: %v", peer.ProtocolVersion)
+	}
+	if err := validateEndpoint(peer.Endpoint, opts.EndpointParser); err != nil {
+		return fmt.Errorf("endpoint: %w", err)
+	}
+	for _, prefix := range peer.AllowedIPs {
+		if !prefix.IsValid() {
+			return fmt.Errorf("allowed IPs: invalid allowed ip: %v", prefix)
+		}
+	}
+	if peer.AmneziaWG != nil {
+		if err := ValidateAmneziaWGConfig(*peer.AmneziaWG); err != nil {
+			return fmt.Errorf("amneziawg: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateEndpoint(endpoint string, parser EndpointParser) error {
+	if endpoint == "" {
+		return nil
+	}
+	if parser != nil {
+		if _, err := parser.ParseEndpoint(endpoint); err != nil {
+			return err
+		}
+		return nil
+	}
+	if _, err := netip.ParseAddrPort(endpoint); err != nil {
+		host, port, splitErr := net.SplitHostPort(endpoint)
+		if splitErr != nil {
+			return splitErr
+		}
+		if host == "" {
+			return fmt.Errorf("missing host in address")
+		}
+		if _, portErr := strconv.ParseUint(port, 10, 16); portErr != nil {
+			return fmt.Errorf("invalid port %q: %w", port, portErr)
+		}
+	}
+	return nil
+}
+
+func validateAmneziaWGConfigPatch(patch ipcSetAmneziaWG) error {
+	for _, field := range []struct {
+		name  string
+		value *int
+	}{
+		{"junk count", patch.junkCount},
+		{"junk min", patch.junkMin},
+		{"junk max", patch.junkMax},
+	} {
+		if field.value != nil && *field.value < 0 {
+			return fmt.Errorf("%s must be non-negative", field.name)
+		}
+	}
+	for _, field := range []struct {
+		name  string
+		value *int
+	}{
+		{"init padding", patch.initPadding},
+		{"response padding", patch.responsePadding},
+		{"cookie padding", patch.cookiePadding},
+		{"transport padding", patch.transportPadding},
+	} {
+		if field.value != nil && *field.value < 0 {
+			return fmt.Errorf("%s must be non-negative", field.name)
+		}
+	}
+	for _, field := range []struct {
+		name   string
+		header *magicHeader
+	}{
+		{"init header", patch.initHeader},
+		{"response header", patch.responseHeader},
+		{"cookie header", patch.cookieHeader},
+		{"transport header", patch.transportHeader},
+	} {
+		if field.header != nil && field.header.end < field.header.start {
+			return fmt.Errorf("%s range end must be >= start", field.name)
+		}
+	}
+	headers := []*magicHeader{patch.initHeader, patch.responseHeader, patch.cookieHeader, patch.transportHeader}
+	for i := 0; i < len(headers); i++ {
+		if headers[i] == nil {
+			continue
+		}
+		for j := i + 1; j < len(headers); j++ {
+			if headers[j] == nil {
+				continue
+			}
+			left := headers[i]
+			right := headers[j]
+			if left.start <= right.end && right.start <= left.end {
+				return fmt.Errorf("headers must not overlap")
+			}
+		}
+	}
+	if patch.junkCount != nil && *patch.junkCount > 0 {
+		if patch.junkMin != nil && *patch.junkMin <= 0 {
+			return fmt.Errorf("junk min must be positive when junk is enabled")
+		}
+		if patch.junkMax != nil && *patch.junkMax <= 0 {
+			return fmt.Errorf("junk max must be positive when junk is enabled")
+		}
+	}
+	return nil
+}
+
+func validationPeerName(key NoisePublicKey) string {
+	if key.IsZero() {
+		return "<zero>"
+	}
+	return fmt.Sprintf("%x", key[:])
 }
 
 func (device *Device) PrivateKey() NoisePrivateKey {

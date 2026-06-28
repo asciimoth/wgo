@@ -332,6 +332,14 @@ The primary configuration surface for embedders is the typed `Device` API. Commo
 - `Device.Config()`
 - `Device.PeerConfig(NoisePublicKey)`
 
+Pure validation helpers allow embedders to check candidate configs before mutating a live device:
+
+- `ValidateConfig(DeviceConfig)`
+- `ValidateConfigWithOptions(DeviceConfig, ValidationOptions)`
+- `ValidatePeerConfig(PeerConfig)`
+- `ValidateAmneziaWGConfig(AmneziaWGConfig)`
+- `ValidateAmneziaWGConfigPatch(AmneziaWGConfigPatch)`
+
 The UAPI compatibility surface remains:
 
 - `Device.IpcGetOperation(io.Writer)`

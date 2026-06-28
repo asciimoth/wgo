@@ -6,10 +6,14 @@
 package device
 
 import (
+	"errors"
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	conn "github.com/asciimoth/batchudp"
 )
 
 func TestDeviceTypedConfigMethods(t *testing.T) {
@@ -145,6 +149,130 @@ func TestDeviceTypedConfigMethods(t *testing.T) {
 		cfg.Peers[0].PersistentKeepaliveInterval != peerCfg.PersistentKeepaliveInterval ||
 		!slices.Equal(cfg.Peers[0].AllowedIPs, peerCfg.AllowedIPs) {
 		t.Fatalf("Config().Peers[0] = %+v, want %+v", cfg.Peers[0], peerCfg)
+	}
+}
+
+func TestValidateConfig(t *testing.T) {
+	privateKey := mustPrivateKey(t, 31)
+	peerPrivateKey := mustPrivateKey(t, 32)
+	peerKey := peerPrivateKey.publicKey()
+
+	cfg := DeviceConfig{
+		PrivateKey: privateKey,
+		ListenPort: 51820,
+		Fwmark:     23,
+		AmneziaWG:  DefaultAmneziaWGConfig(),
+		Peers: []PeerConfig{
+			{
+				PublicKey:                   peerKey,
+				ProtocolVersion:             1,
+				Endpoint:                    "127.0.0.1:51820",
+				PersistentKeepaliveInterval: 25,
+				AllowedIPs: []netip.Prefix{
+					netip.MustParsePrefix("10.0.0.0/24"),
+					netip.MustParsePrefix("fd00::/64"),
+				},
+			},
+		},
+	}
+
+	if err := ValidateConfig(cfg); err != nil {
+		t.Fatalf("ValidateConfig(valid) = %v", err)
+	}
+
+	cfg.Peers = append(cfg.Peers, cfg.Peers[0])
+	err := ValidateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "duplicate public key") {
+		t.Fatalf("ValidateConfig(duplicate peer) = %v, want duplicate public key", err)
+	}
+}
+
+func TestValidateConfigWithOptionsEndpointParser(t *testing.T) {
+	peerPrivateKey := mustPrivateKey(t, 33)
+	peerKey := peerPrivateKey.publicKey()
+	cfg := DeviceConfig{
+		AmneziaWG: DefaultAmneziaWGConfig(),
+		Peers: []PeerConfig{
+			{
+				PublicKey:       peerKey,
+				ProtocolVersion: 1,
+				Endpoint:        "127.0.0.1:51820",
+			},
+		},
+	}
+
+	parser := &validationEndpointParser{}
+	if err := ValidateConfigWithOptions(cfg, ValidationOptions{EndpointParser: parser}); err != nil {
+		t.Fatalf("ValidateConfigWithOptions(valid parser) = %v", err)
+	}
+	if parser.got != cfg.Peers[0].Endpoint {
+		t.Fatalf("endpoint parser got %q, want %q", parser.got, cfg.Peers[0].Endpoint)
+	}
+
+	parser.err = errors.New("parser rejected endpoint")
+	err := ValidateConfigWithOptions(cfg, ValidationOptions{EndpointParser: parser})
+	if err == nil || !strings.Contains(err.Error(), "peer ") || !strings.Contains(err.Error(), "endpoint: parser rejected endpoint") {
+		t.Fatalf("ValidateConfigWithOptions(parser error) = %v, want scoped parser error", err)
+	}
+
+	cfg.Peers[0].Endpoint = "127.0.0.1"
+	err = ValidateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "endpoint") {
+		t.Fatalf("ValidateConfig(malformed endpoint) = %v, want endpoint error", err)
+	}
+}
+
+func TestValidatePeerConfig(t *testing.T) {
+	peerPrivateKey := mustPrivateKey(t, 34)
+	peer := PeerConfig{
+		PublicKey:       peerPrivateKey.publicKey(),
+		ProtocolVersion: 1,
+		AllowedIPs:      []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")},
+	}
+	if err := ValidatePeerConfig(peer); err != nil {
+		t.Fatalf("ValidatePeerConfig(valid) = %v", err)
+	}
+
+	peer.ProtocolVersion = 2
+	err := ValidatePeerConfig(peer)
+	if err == nil || !strings.Contains(err.Error(), "protocol version") {
+		t.Fatalf("ValidatePeerConfig(protocol version) = %v, want protocol version error", err)
+	}
+
+	peer.ProtocolVersion = 1
+	peer.AllowedIPs = []netip.Prefix{{}}
+	err = ValidatePeerConfig(peer)
+	if err == nil || !strings.Contains(err.Error(), "allowed IPs") {
+		t.Fatalf("ValidatePeerConfig(allowed IP) = %v, want allowed IP error", err)
+	}
+}
+
+func TestValidateAmneziaWGConfigAPI(t *testing.T) {
+	cfg := DefaultAmneziaWGConfig()
+	cfg.InitHeader = AmneziaWGHeaderRange{Start: 1, End: 5}
+	cfg.ResponseHeader = AmneziaWGHeaderRange{Start: 4, End: 9}
+	err := ValidateAmneziaWGConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "headers must not overlap") {
+		t.Fatalf("ValidateAmneziaWGConfig(overlap) = %v, want overlap error", err)
+	}
+
+	patch := AmneziaWGConfigPatch{
+		InitHeader:     headerPtr(AmneziaWGHeaderRange{Start: 10, End: 20}),
+		ResponseHeader: headerPtr(AmneziaWGHeaderRange{Start: 15, End: 30}),
+	}
+	err = ValidateAmneziaWGConfigPatch(patch)
+	if err == nil || !strings.Contains(err.Error(), "headers must not overlap") {
+		t.Fatalf("ValidateAmneziaWGConfigPatch(overlap) = %v, want overlap error", err)
+	}
+
+	patch = AmneziaWGConfigPatch{
+		InitiationPackets: [amneziaPacketCount]*string{
+			strPtr("<b zz>"),
+		},
+	}
+	err = ValidateAmneziaWGConfigPatch(patch)
+	if err == nil || !strings.Contains(err.Error(), "parse initiation packet 1") {
+		t.Fatalf("ValidateAmneziaWGConfigPatch(packet) = %v, want packet parse error", err)
 	}
 }
 
@@ -570,6 +698,19 @@ func TestActivatePeerStartsPeerWhenDeviceIsUp(t *testing.T) {
 	if !peer.isRunning.Load() {
 		t.Fatal("ActivatePeer() did not start the peer while device was up")
 	}
+}
+
+type validationEndpointParser struct {
+	got string
+	err error
+}
+
+func (p *validationEndpointParser) ParseEndpoint(s string) (conn.Endpoint, error) {
+	p.got = s
+	if p.err != nil {
+		return nil, p.err
+	}
+	return fakeBindEndpoint{bindID: "validation", dst: s}, nil
 }
 
 func sortPrefixes(prefixes []netip.Prefix) {
