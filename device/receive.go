@@ -39,6 +39,73 @@ type QueueInboundElementsContainer struct {
 	elems []*QueueInboundElement
 }
 
+type ReceiveError struct {
+	Name  string
+	Err   error
+	Fatal bool
+}
+
+// SubscribeReceiveErrors registers cb for receive-loop errors and returns an
+// unsubscribe function. Callbacks are invoked asynchronously.
+func (device *Device) SubscribeReceiveErrors(cb func(ReceiveError)) func() {
+	if cb == nil {
+		return func() {}
+	}
+
+	device.receiveErrors.Lock()
+	device.receiveErrors.nextSubID++
+	id := device.receiveErrors.nextSubID
+	device.receiveErrors.subscribers[id] = cb
+	device.receiveErrors.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			device.receiveErrors.Lock()
+			delete(device.receiveErrors.subscribers, id)
+			device.receiveErrors.Unlock()
+		})
+	}
+}
+
+// ReceiveErrorShouldRecover reports whether an unexpected receive error is a
+// candidate for caller-controlled bind recovery.
+func ReceiveErrorShouldRecover(err error) bool {
+	if err == nil || errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+		return false
+	}
+	return true
+}
+
+func (device *Device) reportReceiveError(receiveError ReceiveError) {
+	if receiveError.Err == nil || errors.Is(receiveError.Err, net.ErrClosed) {
+		return
+	}
+
+	device.receiveErrors.RLock()
+	callbacks := make([]func(ReceiveError), 0, len(device.receiveErrors.subscribers))
+	for _, cb := range device.receiveErrors.subscribers {
+		callbacks = append(callbacks, cb)
+	}
+	device.receiveErrors.RUnlock()
+
+	for _, cb := range callbacks {
+		go device.callReceiveErrorCallback(cb, receiveError)
+	}
+}
+
+func (device *Device) callReceiveErrorCallback(cb func(ReceiveError), receiveError ReceiveError) {
+	defer func() {
+		if recover() != nil {
+			device.log.Debugf("receive error callback panicked")
+		}
+	}()
+	cb(receiveError)
+}
+
 func buildTUNWriteBuffers(tun *tunState, elems []*QueueInboundElement, bufs [][]byte) [][]byte {
 	bufs = bufs[:0]
 	for _, elem := range elems {
@@ -135,14 +202,17 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				return
 			}
 			device.log.Debugf("Failed to receive %s packet: %v", recvName, err)
-			if neterr, ok := err.(net.Error); ok && !neterr.Timeout() {
+			if ReceiveErrorShouldRecover(err) {
+				device.reportReceiveError(ReceiveError{Name: recvName, Err: err, Fatal: true})
 				return
 			}
 			if deathSpiral < 10 {
 				deathSpiral++
+				device.reportReceiveError(ReceiveError{Name: recvName, Err: err, Fatal: false})
 				time.Sleep(time.Second / 3)
 				continue
 			}
+			device.reportReceiveError(ReceiveError{Name: recvName, Err: err, Fatal: true})
 			return
 		}
 		deathSpiral = 0

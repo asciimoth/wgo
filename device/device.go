@@ -81,6 +81,12 @@ type Device struct {
 		lastNotifyTxPackets atomic.Uint64
 	}
 
+	receiveErrors struct {
+		sync.RWMutex
+		subscribers map[uint64]func(ReceiveError)
+		nextSubID   uint64
+	}
+
 	rate struct {
 		underLoadUntil atomic.Int64
 		limiter        ratelimiter.Ratelimiter
@@ -428,6 +434,7 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
 	device.stats.subscribers = make(map[uint64]RuntimeStatsCallback)
 	device.stats.notify = make(chan struct{}, 1)
+	device.receiveErrors.subscribers = make(map[uint64]func(ReceiveError))
 	device.stats.byteDelta.Store(DefaultRuntimeStatsByteDelta)
 	device.stats.packetDelta.Store(DefaultRuntimeStatsPacketDelta)
 	device.rate.limiter.Init()

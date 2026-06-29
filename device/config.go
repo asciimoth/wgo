@@ -39,6 +39,12 @@ type PeerConfig struct {
 	AmneziaWG                   *AmneziaWGConfig
 }
 
+type ApplyConfigOptions struct {
+	ReplacePeers   bool
+	ApplyEndpoints bool
+	ActivatePeers  bool
+}
+
 type AmneziaWGConfigPatch struct {
 	JunkCount         *int
 	JunkMin           *int
@@ -286,6 +292,95 @@ func (device *Device) SetAmneziaWGConfigPatch(patch AmneziaWGConfigPatch) error 
 	return device.setAmneziaWGConfigLocked(cfg)
 }
 
+// ApplyConfig reconciles the device with cfg according to opts.
+func (device *Device) ApplyConfig(cfg DeviceConfig, opts ApplyConfigOptions) error {
+	validationOpts := ValidationOptions{}
+	if opts.ApplyEndpoints {
+		device.net.RLock()
+		bind := device.net.bind
+		device.net.RUnlock()
+		if bind != nil {
+			validationOpts.EndpointParser = bind
+		}
+		for _, peer := range cfg.Peers {
+			if peer.Endpoint != "" && bind == nil {
+				return fmt.Errorf("peer %s: endpoint: no bind attached", validationPeerName(peer.PublicKey))
+			}
+		}
+	}
+	if err := ValidateConfigWithOptions(cfg, validationOpts); err != nil {
+		return err
+	}
+	if device.isClosed() {
+		return fmt.Errorf("device is closed")
+	}
+	if err := device.validateApplyPeerCapacity(cfg, opts); err != nil {
+		return err
+	}
+
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
+
+	if err := device.SetPrivateKey(cfg.PrivateKey); err != nil {
+		return fmt.Errorf("private key: %w", err)
+	}
+	if err := device.setListenPortLocked(cfg.ListenPort); err != nil {
+		return fmt.Errorf("listen port: %w", err)
+	}
+	if err := device.setFwmarkLocked(cfg.Fwmark); err != nil {
+		return fmt.Errorf("fwmark: %w", err)
+	}
+	if err := device.setAmneziaWGConfigLocked(cfg.AmneziaWG); err != nil {
+		return fmt.Errorf("amneziawg: %w", err)
+	}
+
+	if opts.ReplacePeers {
+		device.RemoveAllPeers()
+	}
+
+	for _, peerCfg := range cfg.Peers {
+		if err := device.applyPeerConfigLocked(peerCfg, opts); err != nil {
+			return fmt.Errorf("peer %s: %w", validationPeerName(peerCfg.PublicKey), err)
+		}
+	}
+	return nil
+}
+
+func (device *Device) validateApplyPeerCapacity(cfg DeviceConfig, opts ApplyConfigOptions) error {
+	if opts.ReplacePeers {
+		return nil
+	}
+
+	var self NoisePublicKey
+	if !cfg.PrivateKey.IsZero() {
+		self = cfg.PrivateKey.PublicKey()
+	}
+
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+
+	count := 0
+	for key := range device.peers.keyMap {
+		if !self.IsZero() && key.Equals(self) {
+			continue
+		}
+		count++
+	}
+	for _, peer := range cfg.Peers {
+		if !self.IsZero() && peer.PublicKey.Equals(self) {
+			continue
+		}
+		if _, ok := device.peers.keyMap[peer.PublicKey]; ok {
+			continue
+		}
+		count++
+		if count > MaxPeers {
+			return fmt.Errorf("peers: too many peers")
+		}
+	}
+	return nil
+}
+
 func (device *Device) SetFwmark(mark uint32) error {
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
@@ -427,15 +522,66 @@ func (device *Device) ActivatePeer(publicKey NoisePublicKey) error {
 	if err != nil {
 		return err
 	}
-	if !device.isUp() {
+	device.activatePeerLocked(peer)
+	return nil
+}
+
+func (device *Device) applyPeerConfigLocked(cfg PeerConfig, opts ApplyConfigOptions) error {
+	device.staticIdentity.RLock()
+	self := device.staticIdentity.publicKey
+	device.staticIdentity.RUnlock()
+	if !self.IsZero() && cfg.PublicKey.Equals(self) {
 		return nil
+	}
+
+	peer := device.lookupPeerLocked(cfg.PublicKey)
+	if peer == nil {
+		var err error
+		peer, err = device.NewPeer(cfg.PublicKey)
+		if err != nil {
+			return fmt.Errorf("create: %w", err)
+		}
+	}
+
+	if err := device.setPeerPresharedKeyLocked(cfg.PublicKey, cfg.PresharedKey); err != nil {
+		return fmt.Errorf("preshared key: %w", err)
+	}
+	if err := device.setPeerProtocolVersionLocked(cfg.PublicKey, cfg.ProtocolVersion); err != nil {
+		return fmt.Errorf("protocol version: %w", err)
+	}
+	if err := device.replacePeerAllowedIPsLocked(cfg.PublicKey, cfg.AllowedIPs); err != nil {
+		return fmt.Errorf("allowed IPs: %w", err)
+	}
+	if _, err := device.setPeerPersistentKeepaliveIntervalLocked(cfg.PublicKey, cfg.PersistentKeepaliveInterval, false); err != nil {
+		return fmt.Errorf("persistent keepalive interval: %w", err)
+	}
+	if err := device.setPeerAmneziaWGConfigLocked(cfg.PublicKey, cfg.AmneziaWG); err != nil {
+		return fmt.Errorf("amneziawg: %w", err)
+	}
+	if opts.ApplyEndpoints {
+		if cfg.Endpoint == "" {
+			peer.endpoint.Lock()
+			peer.endpoint.val = nil
+			peer.endpoint.Unlock()
+		} else if err := device.setPeerEndpointLocked(cfg.PublicKey, cfg.Endpoint); err != nil {
+			return fmt.Errorf("endpoint: %w", err)
+		}
+	}
+	if opts.ActivatePeers {
+		device.activatePeerLocked(peer)
+	}
+	return nil
+}
+
+func (device *Device) activatePeerLocked(peer *Peer) {
+	if !device.isUp() {
+		return
 	}
 	peer.Start()
 	if peer.persistentKeepaliveInterval.Load() > 0 {
 		peer.SendKeepalive()
 	}
 	peer.SendStagedPackets()
-	return nil
 }
 
 func (device *Device) setListenPortLocked(port uint16) error {

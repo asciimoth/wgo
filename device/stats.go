@@ -47,6 +47,19 @@ type RuntimeStats struct {
 	LastHandshakeTime time.Time
 }
 
+// Equal reports whether two runtime stats snapshots describe the same device
+// state, ignoring the snapshot timestamp.
+func (stats RuntimeStats) Equal(other RuntimeStats) bool {
+	return stats.PeerCount == other.PeerCount &&
+		stats.ActivePeerCount == other.ActivePeerCount &&
+		stats.ConnectedPeerCount == other.ConnectedPeerCount &&
+		stats.RxBytes == other.RxBytes &&
+		stats.TxBytes == other.TxBytes &&
+		stats.RxPackets == other.RxPackets &&
+		stats.TxPackets == other.TxPackets &&
+		stats.LastHandshakeTime.Equal(other.LastHandshakeTime)
+}
+
 // RuntimeStatsCallback receives device runtime stats snapshots. Callbacks are
 // invoked from a device-owned goroutine, not from packet processing goroutines.
 type RuntimeStatsCallback func(RuntimeStats)

@@ -700,6 +700,151 @@ func TestActivatePeerStartsPeerWhenDeviceIsUp(t *testing.T) {
 	}
 }
 
+func TestDeviceApplyConfigReplaceAndActivate(t *testing.T) {
+	tunDev := newChannelTUN()
+	bind := &fakeTransitionBind{id: "bind0", size: 1}
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+	t.Cleanup(dev.Close)
+	waitForDeviceUp(t, dev)
+
+	oldPeerKey := mustPrivateKey(t, 110).PublicKey()
+	if _, err := dev.NewPeer(oldPeerKey); err != nil {
+		t.Fatalf("NewPeer(old): %v", err)
+	}
+
+	privateKey := mustPrivateKey(t, 111)
+	peerKey := mustPrivateKey(t, 112).PublicKey()
+	var presharedKey NoisePresharedKey
+	for i := range presharedKey {
+		presharedKey[i] = byte(i + 33)
+	}
+	peerAmnezia := DefaultAmneziaWGConfig()
+	peerAmnezia.InitPadding = 9
+	cfg := DeviceConfig{
+		PrivateKey: privateKey,
+		ListenPort: 51821,
+		Fwmark:     44,
+		AmneziaWG:  DefaultAmneziaWGConfig(),
+		Peers: []PeerConfig{
+			{
+				PublicKey:                   peerKey,
+				PresharedKey:                presharedKey,
+				ProtocolVersion:             1,
+				Endpoint:                    "127.0.0.1:12345",
+				PersistentKeepaliveInterval: 15,
+				AllowedIPs: []netip.Prefix{
+					netip.MustParsePrefix("10.44.0.0/24"),
+					netip.MustParsePrefix("fd44::/64"),
+				},
+				AmneziaWG: &peerAmnezia,
+			},
+		},
+	}
+
+	err := dev.ApplyConfig(cfg, ApplyConfigOptions{
+		ReplacePeers:   true,
+		ApplyEndpoints: true,
+		ActivatePeers:  true,
+	})
+	if err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+	if !dev.PrivateKey().Equals(privateKey) {
+		t.Fatal("ApplyConfig did not apply the private key")
+	}
+	if dev.ListenPort() != 51821 {
+		t.Fatalf("ListenPort() = %d, want 51821", dev.ListenPort())
+	}
+	if dev.Fwmark() != 44 {
+		t.Fatalf("Fwmark() = %d, want 44", dev.Fwmark())
+	}
+	if _, ok := dev.PeerConfig(oldPeerKey); ok {
+		t.Fatal("ApplyConfig with ReplacePeers left the old peer configured")
+	}
+	peerCfg, ok := dev.PeerConfig(peerKey)
+	if !ok {
+		t.Fatal("ApplyConfig did not create the configured peer")
+	}
+	if peerCfg.PresharedKey != presharedKey ||
+		peerCfg.ProtocolVersion != 1 ||
+		peerCfg.Endpoint != "127.0.0.1:12345" ||
+		peerCfg.PersistentKeepaliveInterval != 15 ||
+		peerCfg.AmneziaWG == nil ||
+		peerCfg.AmneziaWG.InitPadding != 9 {
+		t.Fatalf("PeerConfig() after ApplyConfig = %+v", peerCfg)
+	}
+	wantAllowedIPs := append([]netip.Prefix(nil), cfg.Peers[0].AllowedIPs...)
+	sortPrefixes(wantAllowedIPs)
+	if !slices.Equal(peerCfg.AllowedIPs, wantAllowedIPs) {
+		t.Fatalf("PeerConfig().AllowedIPs = %v, want %v", peerCfg.AllowedIPs, wantAllowedIPs)
+	}
+	peer := dev.LookupPeer(peerKey)
+	if peer == nil || !peer.isRunning.Load() {
+		t.Fatal("ApplyConfig with ActivatePeers did not start the configured peer")
+	}
+}
+
+func TestDeviceApplyConfigEndpointOptionAndValidation(t *testing.T) {
+	tunDev := newChannelTUN()
+	bind := &fakeTransitionBind{id: "bind0", size: 1}
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+	t.Cleanup(dev.Close)
+	waitForDeviceUp(t, dev)
+
+	privateKey := mustPrivateKey(t, 120)
+	if err := dev.SetPrivateKey(privateKey); err != nil {
+		t.Fatalf("SetPrivateKey: %v", err)
+	}
+	peerKey := mustPrivateKey(t, 121).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	if err := dev.SetPeerEndpoint(peerKey, "127.0.0.1:10000"); err != nil {
+		t.Fatalf("SetPeerEndpoint: %v", err)
+	}
+
+	cfg := DeviceConfig{
+		PrivateKey: mustPrivateKey(t, 122),
+		AmneziaWG:  DefaultAmneziaWGConfig(),
+		Peers: []PeerConfig{
+			{
+				PublicKey:       peerKey,
+				ProtocolVersion: 1,
+				Endpoint:        "127.0.0.1:20000",
+			},
+		},
+	}
+	if err := dev.ApplyConfig(cfg, ApplyConfigOptions{}); err != nil {
+		t.Fatalf("ApplyConfig without endpoints: %v", err)
+	}
+	peerCfg, ok := dev.PeerConfig(peerKey)
+	if !ok {
+		t.Fatal("PeerConfig() reported missing peer")
+	}
+	if peerCfg.Endpoint != "127.0.0.1:10000" {
+		t.Fatalf("endpoint = %q, want existing endpoint preserved", peerCfg.Endpoint)
+	}
+
+	invalid := cfg
+	invalid.PrivateKey = mustPrivateKey(t, 123)
+	invalid.Peers[0].ProtocolVersion = 2
+	err := dev.ApplyConfig(invalid, ApplyConfigOptions{})
+	if err == nil || !strings.Contains(err.Error(), "protocol version") {
+		t.Fatalf("ApplyConfig(invalid protocol) = %v, want protocol error", err)
+	}
+	if got := dev.PrivateKey(); got.Equals(invalid.PrivateKey) {
+		t.Fatal("ApplyConfig mutated private key before validation failed")
+	}
+
+	noBindDev := NewDevice(newChannelTUN().TUN(), nil, NewLogger(LogLevelError, ""))
+	t.Cleanup(noBindDev.Close)
+	waitForDeviceUp(t, noBindDev)
+	err = noBindDev.ApplyConfig(cfg, ApplyConfigOptions{ApplyEndpoints: true})
+	if err == nil || !strings.Contains(err.Error(), "no bind attached") {
+		t.Fatalf("ApplyConfig(endpoint without bind) = %v, want no bind error", err)
+	}
+}
+
 type validationEndpointParser struct {
 	got string
 	err error
