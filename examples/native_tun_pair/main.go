@@ -88,14 +88,14 @@ func newNativePair() (*nativePair, error) {
 		return nil, fmt.Errorf("create second native tun: %w", err)
 	}
 
-	firstNet := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
-	secondNet := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
+	firstNet := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil, nil)
+	secondNet := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil, nil)
 
 	pair := &nativePair{
 		firstName:  firstName,
 		secondName: secondName,
-		firstDev:   device.NewDevice(firstTun, conn.NewDefaultBind(firstNet), device.NewLogger(device.LogLevelDebug, "example/first: ")),
-		secondDev:  device.NewDevice(secondTun, conn.NewDefaultBind(secondNet), device.NewLogger(device.LogLevelDebug, "example/second: ")),
+		firstDev:   device.NewDevice(firstTun, conn.NewDefaultBind(firstNet), device.NewLogger(device.LogLevelDebug, "example/first: "), nil),
+		secondDev:  device.NewDevice(secondTun, conn.NewDefaultBind(secondNet), device.NewLogger(device.LogLevelDebug, "example/second: "), nil),
 		firstNet:   firstNet,
 		secondNet:  secondNet,
 		cleanup:    []func() error{secondCleanup, firstCleanup},

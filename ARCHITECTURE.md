@@ -27,7 +27,7 @@ network := (&native.Config{}).Build()
 defer network.Down()
 
 bind := batchudp.NewDefaultBind(network)
-dev := device.NewDevice(tunDevice, bind, logger)
+dev := device.NewDevice(tunDevice, bind, logger, nil)
 ```
 
 `device.Device` is the central coordinator. It owns:
@@ -135,7 +135,7 @@ These packages are small, focused dependencies of `device` and transport code.
 
 ### Construction
 
-`device.NewDevice(tunDevice, bind, logger)` initializes the protocol engine and starts background workers immediately.
+`device.NewDevice(tunDevice, bind, logger, spawner)` initializes the protocol engine and starts background workers immediately. Pass a `gonnect.Spawner` to track long-lived workers, or `nil` to preserve direct goroutine spawning.
 
 During construction it:
 

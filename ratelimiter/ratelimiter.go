@@ -33,6 +33,22 @@ type Ratelimiter struct {
 	table     map[netip.Addr]*RatelimiterEntry
 }
 
+// Spawner starts long-lived background workers. It matches gonnect.Spawner's
+// Spawn method without making this package depend on gonnect directly.
+type Spawner interface {
+	Spawn(worker func(), name string) (uint64, error)
+}
+
+func spawnWorker(spawner Spawner, worker func(), name string) {
+	if spawner == nil {
+		go worker()
+		return
+	}
+	if _, err := spawner.Spawn(worker, name); err != nil {
+		go worker()
+	}
+}
+
 func (rate *Ratelimiter) Close() {
 	rate.mu.Lock()
 	defer rate.mu.Unlock()
@@ -42,7 +58,11 @@ func (rate *Ratelimiter) Close() {
 	}
 }
 
-func (rate *Ratelimiter) Init() {
+// Init resets the limiter and starts its garbage-collection worker.
+//
+// When spawner is non-nil, the worker is started through it so callers can
+// observe the same lifecycle as other long-lived networking workers.
+func (rate *Ratelimiter) Init(spawner Spawner) {
 	rate.mu.Lock()
 	defer rate.mu.Unlock()
 
@@ -61,7 +81,7 @@ func (rate *Ratelimiter) Init() {
 	stopReset := rate.stopReset // store in case Init is called again.
 
 	// Start garbage collection routine.
-	go func() {
+	spawnWorker(spawner, func() {
 		ticker := time.NewTicker(time.Second)
 		ticker.Stop()
 		for {
@@ -78,7 +98,7 @@ func (rate *Ratelimiter) Init() {
 				}
 			}
 		}
-	}()
+	}, "wgo: ratelimiter garbage collector")
 }
 
 func (rate *Ratelimiter) cleanup() (empty bool) {

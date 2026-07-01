@@ -7,6 +7,7 @@ package ratelimiter
 
 import (
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 )
@@ -15,6 +16,43 @@ type result struct {
 	allowed bool
 	text    string
 	wait    time.Duration
+}
+
+type recordingSpawner struct {
+	mu    sync.Mutex
+	names []string
+}
+
+func (s *recordingSpawner) Spawn(worker func(), name string) (uint64, error) {
+	s.mu.Lock()
+	s.names = append(s.names, name)
+	id := uint64(len(s.names))
+	s.mu.Unlock()
+	go worker()
+	return id, nil
+}
+
+func (s *recordingSpawner) hasName(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, got := range s.names {
+		if got == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRatelimiterInitUsesSpawner(t *testing.T) {
+	var rate Ratelimiter
+	spawner := &recordingSpawner{}
+
+	rate.Init(spawner)
+	defer rate.Close()
+
+	if !spawner.hasName("wgo: ratelimiter garbage collector") {
+		t.Fatal("expected garbage collector to be spawned through spawner")
+	}
 }
 
 func TestRatelimiter(t *testing.T) {
@@ -104,7 +142,7 @@ func TestRatelimiter(t *testing.T) {
 		rate.cleanup()
 	}
 
-	rate.Init()
+	rate.Init(nil)
 	defer rate.Close()
 
 	for i, res := range expectedResults {

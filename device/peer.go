@@ -245,8 +245,8 @@ func (peer *Peer) Start() {
 	// Use the device batch size, not the bind batch size, as the device size is
 	// the size of the batch pools.
 	batchSize := peer.device.BatchSize()
-	go peer.RoutineSequentialSender(batchSize)
-	go peer.RoutineSequentialReceiver(batchSize)
+	device.spawnWorker(func() { peer.RoutineSequentialSender(batchSize) }, fmt.Sprintf("wgo: %v sequential sender", peer))
+	device.spawnWorker(func() { peer.RoutineSequentialReceiver(batchSize) }, fmt.Sprintf("wgo: %v sequential receiver", peer))
 
 	peer.isRunning.Store(true)
 	peer.device.signalRuntimeStats()

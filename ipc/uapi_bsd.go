@@ -13,6 +13,7 @@ import (
 	"os"
 	"unsafe"
 
+	"github.com/asciimoth/gonnect"
 	"golang.org/x/sys/unix"
 )
 
@@ -53,7 +54,10 @@ func (l *UAPIListener) Addr() net.Addr {
 	return l.listener.Addr()
 }
 
-func UAPIListen(name string, file *os.File) (net.Listener, error) {
+// UAPIListen creates a UAPI listener from file.
+//
+// Long-lived listener workers are started with spawner when it is non-nil.
+func UAPIListen(name string, file *os.File, spawner gonnect.Spawner) (net.Listener, error) {
 	// wrap file in listener
 
 	listener, err := net.FileListener(file)
@@ -85,7 +89,7 @@ func UAPIListen(name string, file *os.File) (net.Listener, error) {
 		return nil, err
 	}
 
-	go func(l *UAPIListener) {
+	spawnWorker(spawner, func() {
 		event := unix.Kevent_t{
 			Filter: unix.EVFILT_VNODE,
 			Flags:  unix.EV_ADD | unix.EV_ENABLE | unix.EV_ONESHOT,
@@ -100,33 +104,33 @@ func UAPIListen(name string, file *os.File) (net.Listener, error) {
 		for {
 			// start with lstat to avoid race condition
 			if _, err := os.Lstat(socketPath); os.IsNotExist(err) {
-				l.connErr <- err
+				uapi.connErr <- err
 				return
 			}
 			if (kerr != nil || n != 1) && kerr != unix.EINTR {
 				if kerr != nil {
-					l.connErr <- kerr
+					uapi.connErr <- kerr
 				} else {
-					l.connErr <- errors.New("kqueue returned empty")
+					uapi.connErr <- errors.New("kqueue returned empty")
 				}
 				return
 			}
 			n, kerr = unix.Kevent(uapi.kqueueFd, []unix.Kevent_t{event}, events, nil)
 		}
-	}(uapi)
+	}, "wgo: UAPI socket deletion watcher")
 
 	// watch for new connections
 
-	go func(l *UAPIListener) {
+	spawnWorker(spawner, func() {
 		for {
-			conn, err := l.listener.Accept()
+			conn, err := uapi.listener.Accept()
 			if err != nil {
-				l.connErr <- err
+				uapi.connErr <- err
 				break
 			}
-			l.connNew <- conn
+			uapi.connNew <- conn
 		}
-	}(uapi)
+	}, "wgo: UAPI accept loop")
 
 	return uapi, nil
 }

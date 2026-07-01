@@ -16,12 +16,12 @@ const DefaultMTU = 1420
 
 func (device *Device) RoutineTUNEventReader(tun *tunState) {
 	defer func() {
-		device.log.Debugf("Routine: event worker - stopped")
+		device.logWorkerLifecyclef("Routine: event worker - stopped")
 		tun.wg.Done()
 		device.state.stopping.Done()
 	}()
 
-	device.log.Debugf("Routine: event worker - started")
+	device.logWorkerLifecyclef("Routine: event worker - started")
 
 	for {
 		var (

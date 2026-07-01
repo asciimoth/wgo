@@ -54,6 +54,62 @@ func uapiCfg(cfg ...string) string {
 	return buf.String()
 }
 
+type recordingSpawner struct {
+	mu    sync.Mutex
+	names []string
+}
+
+func (s *recordingSpawner) Spawn(worker func(), name string) (uint64, error) {
+	s.mu.Lock()
+	s.names = append(s.names, name)
+	id := uint64(len(s.names))
+	s.mu.Unlock()
+	go worker()
+	return id, nil
+}
+
+func (s *recordingSpawner) SpawnWg(worker func(), wg *sync.WaitGroup, name string) (uint64, error) {
+	s.mu.Lock()
+	s.names = append(s.names, name)
+	id := uint64(len(s.names))
+	s.mu.Unlock()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		worker()
+	}()
+	return id, nil
+}
+
+func (s *recordingSpawner) hasName(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, got := range s.names {
+		if got == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestNewDeviceUsesSpawnerForBackgroundWorkers(t *testing.T) {
+	spawner := &recordingSpawner{}
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), spawner)
+	dev.Close()
+
+	for _, name := range []string{
+		"wgo: ratelimiter garbage collector",
+		"wgo: runtime stats notifier",
+		"wgo: encryption worker 1",
+		"wgo: decryption worker 1",
+		"wgo: handshake worker 1",
+	} {
+		if !spawner.hasName(name) {
+			t.Fatalf("expected worker %q to be spawned through spawner", name)
+		}
+	}
+}
+
 // genConfigs generates a pair of configs that connect to each other.
 // The configs use distinct, probably-usable ports.
 func genConfigs(tb testing.TB) (cfgs, endpointCfgs [2]string) {
@@ -205,7 +261,7 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 	var binds [2]conn.Bind
 	if realSocket {
 		for i := range binds {
-			network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
+			network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil, nil)
 			tb.Cleanup(func() {
 				_ = network.Down()
 			})
@@ -223,7 +279,7 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 		if _, ok := tb.(*testing.B); ok && !testing.Verbose() {
 			level = LogLevelError
 		}
-		p.dev = NewDevice(p.tun.TUN(), binds[i], NewLogger(level, fmt.Sprintf("dev%d: ", i)))
+		p.dev = NewDevice(p.tun.TUN(), binds[i], NewLogger(level, fmt.Sprintf("dev%d: ", i)), nil)
 		if err := p.dev.IpcSet(cfg[i]); err != nil {
 			tb.Errorf("failed to configure device %d: %v", i, err)
 			p.dev.Close()
@@ -310,8 +366,8 @@ func newDevicePairForTUNsAndBinds(tb testing.TB, tun0, tun1 gtun.Tun, ips [2]net
 	}
 
 	devs := [2]*Device{
-		NewDevice(tun0, binds[0], NewLogger(LogLevelError, "dev0: ")),
-		NewDevice(tun1, binds[1], NewLogger(LogLevelError, "dev1: ")),
+		NewDevice(tun0, binds[0], NewLogger(LogLevelError, "dev0: "), nil),
+		NewDevice(tun1, binds[1], NewLogger(LogLevelError, "dev1: "), nil),
 	}
 	for i := range devs {
 		if err := devs[i].IpcSet(cfgs[i]); err != nil {
@@ -346,7 +402,7 @@ func newEndToEndBinds(tb testing.TB, mode e2eBindMode) [2]conn.Bind {
 	case e2eBindModeNativeDefault:
 		var binds [2]conn.Bind
 		for i := range binds {
-			network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
+			network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil, nil)
 			tb.Cleanup(func() {
 				_ = network.Down()
 			})
@@ -1067,11 +1123,11 @@ func TestNewDeviceTunOffsetStrategy(t *testing.T) {
 						t.Fatal("expected panic")
 					}
 				}()
-				NewDevice(tunDev, &fakeBindSized{1}, NewLogger(LogLevelError, ""))
+				NewDevice(tunDev, &fakeBindSized{1}, NewLogger(LogLevelError, ""), nil)
 				return
 			}
 
-			dev := NewDevice(tunDev, &fakeBindSized{1}, NewLogger(LogLevelError, ""))
+			dev := NewDevice(tunDev, &fakeBindSized{1}, NewLogger(LogLevelError, ""), nil)
 			t.Cleanup(dev.Close)
 			tunState := dev.currentTUN()
 			if tunState == nil {
@@ -1103,7 +1159,7 @@ func TestNewDeviceTunOffsetStrategy(t *testing.T) {
 func TestNewDeviceWithoutInitialAttachments(t *testing.T) {
 	t.Parallel()
 
-	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""))
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 
 	if dev.currentTUN() != nil {
@@ -1140,7 +1196,7 @@ func TestDeviceDownIgnoresClosedBindError(t *testing.T) {
 	t.Parallel()
 
 	tunDev := newChannelTUN()
-	dev := NewDevice(tunDev.TUN(), &fakeClosedErrBind{size: 1}, NewLogger(LogLevelError, ""))
+	dev := NewDevice(tunDev.TUN(), &fakeClosedErrBind{size: 1}, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -1153,7 +1209,7 @@ func TestDeviceSetFwmarkReturnsErrorOnBindSetMarkPanic(t *testing.T) {
 	t.Parallel()
 
 	tunDev := newChannelTUN()
-	dev := NewDevice(tunDev.TUN(), &fakePanicSetMarkBind{size: 1}, NewLogger(LogLevelError, ""))
+	dev := NewDevice(tunDev.TUN(), &fakePanicSetMarkBind{size: 1}, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -1167,7 +1223,7 @@ func TestDeviceAttachBindReturnsErrorOnBindSetMarkPanic(t *testing.T) {
 	t.Parallel()
 
 	tunDev := newChannelTUN()
-	dev := NewDevice(tunDev.TUN(), nil, NewLogger(LogLevelError, ""))
+	dev := NewDevice(tunDev.TUN(), nil, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -1185,7 +1241,7 @@ func TestDeviceCloseDoesNotDeadlockWithConcurrentTUNEvent(t *testing.T) {
 	t.Parallel()
 
 	tunDev := newFakeBlockingEventTUN(DefaultMTU)
-	dev := NewDevice(tunDev, nil, NewLogger(LogLevelError, ""))
+	dev := NewDevice(tunDev, nil, NewLogger(LogLevelError, ""), nil)
 
 	tunDev.events <- gtun.EventMTUUpdate | gtun.EventUp
 
@@ -1511,7 +1567,7 @@ func TestDeviceReplaceBindReparsesPeerEndpoints(t *testing.T) {
 
 	bind0 := &fakeTransitionBind{id: "bind0", size: 1}
 	bind1 := &fakeTransitionBind{id: "bind1", size: 1}
-	dev := NewDevice(tunDev, bind0, NewLogger(LogLevelError, ""))
+	dev := NewDevice(tunDev, bind0, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 
 	key0 := mustPrivateKey(t, 0)
@@ -1614,7 +1670,7 @@ func TestDeviceReplaceBindWithClosedBindCanRecover(t *testing.T) {
 
 	bind0 := &fakeTransitionBind{id: "bind0", size: 1}
 	bind1 := &fakeTransitionBind{id: "bind1", size: 1}
-	dev := NewDevice(tunDev, bind0, NewLogger(LogLevelError, "dev0: "))
+	dev := NewDevice(tunDev, bind0, NewLogger(LogLevelError, "dev0: "), nil)
 	t.Cleanup(dev.Close)
 
 	key0 := mustPrivateKey(t, 0)

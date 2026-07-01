@@ -11,7 +11,7 @@ import (
 )
 
 func TestRuntimeStatsPeerCounts(t *testing.T) {
-	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""))
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 
 	privateKey := mustPrivateKey(t, 1)
@@ -53,7 +53,7 @@ func TestRuntimeStatsPeerCounts(t *testing.T) {
 }
 
 func TestRuntimeStatsSubscriptionTrafficThresholds(t *testing.T) {
-	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""))
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 	dev.SetRuntimeStatsThresholds(RuntimeStatsThresholds{
 		ByteDelta:   100,

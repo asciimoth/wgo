@@ -64,7 +64,7 @@ func run() error {
 		_ = tunDev.Close()
 		return err
 	}
-	dev := device.NewDevice(tunDev, bind, device.NewLogger(logger, "compat/wgo: "))
+	dev := device.NewDevice(tunDev, bind, device.NewLogger(logger, "compat/wgo: "), nil)
 
 	if err := dev.SetListenPort(uint16(cfg.listenPort)); err != nil {
 		dev.Close()
@@ -84,7 +84,7 @@ func run() error {
 		_ = socketFile.Close()
 	}()
 
-	listener, err := ipc.UAPIListen(ifName, socketFile)
+	listener, err := ipc.UAPIListen(ifName, socketFile, nil)
 	if err != nil {
 		dev.Close()
 		return fmt.Errorf("listen on uapi socket: %w", err)

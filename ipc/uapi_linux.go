@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 
+	"github.com/asciimoth/gonnect"
 	"github.com/asciimoth/wgo/rwcancel"
 	"golang.org/x/sys/unix"
 )
@@ -51,7 +52,10 @@ func (l *UAPIListener) Addr() net.Addr {
 	return l.listener.Addr()
 }
 
-func UAPIListen(name string, file *os.File) (net.Listener, error) {
+// UAPIListen creates a UAPI listener from file.
+//
+// Long-lived listener workers are started with spawner when it is non-nil.
+func UAPIListen(name string, file *os.File, spawner gonnect.Spawner) (net.Listener, error) {
 	// wrap file in listener
 
 	listener, err := net.FileListener(file)
@@ -96,35 +100,35 @@ func UAPIListen(name string, file *os.File) (net.Listener, error) {
 		return nil, err
 	}
 
-	go func(l *UAPIListener) {
+	spawnWorker(spawner, func() {
 		var buf [0]byte
 		for {
 			defer uapi.inotifyRWCancel.Close()
 			// start with lstat to avoid race condition
 			if _, err := os.Lstat(socketPath); os.IsNotExist(err) {
-				l.connErr <- err
+				uapi.connErr <- err
 				return
 			}
 			_, err := uapi.inotifyRWCancel.Read(buf[:])
 			if err != nil {
-				l.connErr <- err
+				uapi.connErr <- err
 				return
 			}
 		}
-	}(uapi)
+	}, "wgo: UAPI socket deletion watcher")
 
 	// watch for new connections
 
-	go func(l *UAPIListener) {
+	spawnWorker(spawner, func() {
 		for {
-			conn, err := l.listener.Accept()
+			conn, err := uapi.listener.Accept()
 			if err != nil {
-				l.connErr <- err
+				uapi.connErr <- err
 				break
 			}
-			l.connNew <- conn
+			uapi.connNew <- conn
 		}
-	}(uapi)
+	}, "wgo: UAPI accept loop")
 
 	return uapi, nil
 }

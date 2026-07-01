@@ -42,7 +42,9 @@ func (device *Device) startRouteListener(bind conn.Bind) (*rwcancel.RWCancel, er
 		return nil, err
 	}
 
-	go device.routineRouteListener(bind, netlinkSock, netlinkCancel)
+	device.spawnWorker(func() {
+		device.routineRouteListener(bind, netlinkSock, netlinkCancel)
+	}, "wgo: route listener")
 
 	return netlinkCancel, nil
 }

@@ -145,7 +145,7 @@ type recordingNetwork struct {
 
 func newRecordingNetwork() *recordingNetwork {
 	return &recordingNetwork{
-		DetachedNetwork: gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil),
+		DetachedNetwork: gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil, nil),
 		listenAddr:      make(map[string]string),
 	}
 }

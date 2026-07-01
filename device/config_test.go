@@ -19,7 +19,7 @@ import (
 func TestDeviceTypedConfigMethods(t *testing.T) {
 	tunDev := newChannelTUN()
 	bind := &fakeTransitionBind{id: "bind0", size: 1}
-	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -283,7 +283,7 @@ func TestDeviceTypedConfigMethodErrors(t *testing.T) {
 	t.Run("missing peer", func(t *testing.T) {
 		tunDev := newChannelTUN()
 		bind := &fakeTransitionBind{id: "bind0", size: 1}
-		dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+		dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
 		t.Cleanup(dev.Close)
 		waitForDeviceUp(t, dev)
 
@@ -310,7 +310,7 @@ func TestDeviceTypedConfigMethodErrors(t *testing.T) {
 	t.Run("peer amnezia override", func(t *testing.T) {
 		tunDev := newChannelTUN()
 		bind := &fakeTransitionBind{id: "bind0", size: 1}
-		dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+		dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
 		t.Cleanup(dev.Close)
 		waitForDeviceUp(t, dev)
 
@@ -354,7 +354,7 @@ func TestDeviceTypedConfigMethodErrors(t *testing.T) {
 	t.Run("amnezia patch methods", func(t *testing.T) {
 		tunDev := newChannelTUN()
 		bind := &fakeTransitionBind{id: "bind0", size: 1}
-		dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+		dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
 		t.Cleanup(dev.Close)
 		waitForDeviceUp(t, dev)
 
@@ -465,7 +465,7 @@ func TestDeviceTypedConfigMethodErrors(t *testing.T) {
 	t.Run("invalid protocol version", func(t *testing.T) {
 		tunDev := newChannelTUN()
 		bind := &fakeTransitionBind{id: "bind0", size: 1}
-		dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+		dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
 		t.Cleanup(dev.Close)
 		waitForDeviceUp(t, dev)
 
@@ -479,7 +479,7 @@ func TestDeviceTypedConfigMethodErrors(t *testing.T) {
 
 	t.Run("missing bind", func(t *testing.T) {
 		tunDev := newChannelTUN()
-		dev := NewDevice(tunDev.TUN(), nil, NewLogger(LogLevelError, ""))
+		dev := NewDevice(tunDev.TUN(), nil, NewLogger(LogLevelError, ""), nil)
 		t.Cleanup(dev.Close)
 		waitForDeviceUp(t, dev)
 
@@ -494,7 +494,7 @@ func TestDeviceTypedConfigMethodErrors(t *testing.T) {
 	t.Run("invalid allowed ip", func(t *testing.T) {
 		tunDev := newChannelTUN()
 		bind := &fakeTransitionBind{id: "bind0", size: 1}
-		dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+		dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
 		t.Cleanup(dev.Close)
 		waitForDeviceUp(t, dev)
 
@@ -516,7 +516,7 @@ func TestDeviceTypedConfigMethodErrors(t *testing.T) {
 func TestDevicePeerAmneziaWGConfigTransitions(t *testing.T) {
 	tunDev := newChannelTUN()
 	bind := &fakeTransitionBind{id: "bind0", size: 1}
-	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -678,7 +678,7 @@ func TestDevicePeerAmneziaWGConfigTransitions(t *testing.T) {
 func TestActivatePeerStartsPeerWhenDeviceIsUp(t *testing.T) {
 	tunDev := newChannelTUN()
 	bind := &fakeTransitionBind{id: "bind0", size: 1}
-	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -703,7 +703,7 @@ func TestActivatePeerStartsPeerWhenDeviceIsUp(t *testing.T) {
 func TestDeviceApplyConfigReplaceAndActivate(t *testing.T) {
 	tunDev := newChannelTUN()
 	bind := &fakeTransitionBind{id: "bind0", size: 1}
-	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -787,7 +787,7 @@ func TestDeviceApplyConfigReplaceAndActivate(t *testing.T) {
 func TestDeviceApplyConfigEndpointOptionAndValidation(t *testing.T) {
 	tunDev := newChannelTUN()
 	bind := &fakeTransitionBind{id: "bind0", size: 1}
-	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""))
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -836,7 +836,7 @@ func TestDeviceApplyConfigEndpointOptionAndValidation(t *testing.T) {
 		t.Fatal("ApplyConfig mutated private key before validation failed")
 	}
 
-	noBindDev := NewDevice(newChannelTUN().TUN(), nil, NewLogger(LogLevelError, ""))
+	noBindDev := NewDevice(newChannelTUN().TUN(), nil, NewLogger(LogLevelError, ""), nil)
 	t.Cleanup(noBindDev.Close)
 	waitForDeviceUp(t, noBindDev)
 	err = noBindDev.ApplyConfig(cfg, ApplyConfigOptions{ApplyEndpoints: true})

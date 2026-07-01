@@ -40,11 +40,11 @@ func randDevice(t *testing.T) *Device {
 	}
 	tun := newChannelTUN()
 	logger := NewLogger(LogLevelError, "")
-	network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
+	network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil, nil)
 	t.Cleanup(func() {
 		_ = network.Down()
 	})
-	device := NewDevice(tun.TUN(), conn.NewDefaultBind(network), logger)
+	device := NewDevice(tun.TUN(), conn.NewDefaultBind(network), logger, nil)
 	assertNil(t, device.SetPrivateKey(sk))
 	return device
 }

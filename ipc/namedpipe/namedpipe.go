@@ -18,6 +18,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/asciimoth/gonnect"
 	"golang.org/x/sys/windows"
 )
 
@@ -385,6 +386,10 @@ type ListenConfig struct {
 	// SecurityDescriptor contains a Windows security descriptor. If nil, the default from RtlDefaultNpAcl is used.
 	SecurityDescriptor *windows.SECURITY_DESCRIPTOR
 
+	// Spawner starts long-lived listener workers. If nil, workers are started
+	// with direct goroutine spawning.
+	Spawner gonnect.Spawner
+
 	// MessageMode determines whether the pipe is in byte or message mode. In either
 	// case the pipe is read in byte mode by default. The only practical difference in
 	// this implementation is that CloseWrite is only supported for message mode pipes;
@@ -425,7 +430,7 @@ func (c *ListenConfig) Listen(path string) (net.Listener, error) {
 			}
 		}
 	}
-	go l.listenerRoutine()
+	spawnWorker(c.Spawner, l.listenerRoutine, "wgo: named pipe listener")
 	return l, nil
 }
 

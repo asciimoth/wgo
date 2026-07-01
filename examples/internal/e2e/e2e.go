@@ -62,8 +62,8 @@ func New() (*Pair, error) {
 		SecondNet: secondTun,
 		FirstIP:   firstIP,
 		SecondIP:  secondIP,
-		firstDev:  device.NewDevice(firstTun, firstBind, device.NewLogger(device.LogLevelError, "example/first: ")),
-		secondDev: device.NewDevice(secondTun, secondBind, device.NewLogger(device.LogLevelError, "example/second: ")),
+		firstDev:  device.NewDevice(firstTun, firstBind, device.NewLogger(device.LogLevelError, "example/first: "), nil),
+		secondDev: device.NewDevice(secondTun, secondBind, device.NewLogger(device.LogLevelError, "example/second: "), nil),
 		networks:  []networkDowner{network},
 	}
 
@@ -88,7 +88,7 @@ func (p *Pair) SwapSecondVTun(mwo, mro int) error {
 }
 
 func (p *Pair) SwapBindsToNative() error {
-	network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil)
+	network := gonnect.DetachNetwork((&gonnect.NativeConfig{}).Build(), nil, nil)
 	firstBind := conn.NewDefaultBind(network)
 	secondBind := conn.NewDefaultBind(network)
 

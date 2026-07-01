@@ -260,13 +260,13 @@ func (peer *Peer) keepKeyFreshSending() {
 
 func (device *Device) RoutineReadFromTUN(tun *tunState) {
 	defer func() {
-		device.log.Debugf("Routine: TUN reader - stopped")
+		device.logWorkerLifecyclef("Routine: TUN reader - stopped")
 		tun.wg.Done()
 		device.state.stopping.Done()
 		device.queue.encryption.wg.Done()
 	}()
 
-	device.log.Debugf("Routine: TUN reader - started")
+	device.logWorkerLifecyclef("Routine: TUN reader - started")
 
 	var (
 		batchSize   = device.BatchSize()
@@ -530,8 +530,8 @@ func (device *Device) RoutineEncryption(id int) {
 	var paddingZeros [PaddingMultiple]byte
 	var nonce [chacha20poly1305.NonceSize]byte
 
-	defer device.log.Debugf("Routine: encryption worker %d - stopped", id)
-	device.log.Debugf("Routine: encryption worker %d - started", id)
+	defer device.logWorkerLifecyclef("Routine: encryption worker %d - stopped", id)
+	device.logWorkerLifecyclef("Routine: encryption worker %d - started", id)
 
 	for elemsContainer := range device.queue.encryption.c {
 		for _, elem := range elemsContainer.elems {
@@ -568,10 +568,10 @@ func (device *Device) RoutineEncryption(id int) {
 func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	device := peer.device
 	defer func() {
-		defer device.log.Debugf("%v - Routine: sequential sender - stopped", peer)
+		defer device.logWorkerLifecyclef("%v - Routine: sequential sender - stopped", peer)
 		peer.stopping.Done()
 	}()
-	device.log.Debugf("%v - Routine: sequential sender - started", peer)
+	device.logWorkerLifecyclef("%v - Routine: sequential sender - started", peer)
 
 	bufs := make([][]byte, 0, maxBatchSize)
 

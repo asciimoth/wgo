@@ -9,6 +9,7 @@ package ipc
 import (
 	"net"
 
+	"github.com/asciimoth/gonnect"
 	"github.com/asciimoth/wgo/ipc/namedpipe"
 	"golang.org/x/sys/windows"
 )
@@ -60,9 +61,13 @@ func init() {
 	}
 }
 
-func UAPIListen(name string) (net.Listener, error) {
+// UAPIListen creates a Windows UAPI listener.
+//
+// Long-lived listener workers are started with spawner when it is non-nil.
+func UAPIListen(name string, spawner gonnect.Spawner) (net.Listener, error) {
 	listener, err := (&namedpipe.ListenConfig{
 		SecurityDescriptor: UAPISecurityDescriptor,
+		Spawner:            spawner,
 	}).Listen(`\\.\pipe\ProtectedPrefix\Administrators\WireGuard\` + name)
 	if err != nil {
 		return nil, err
@@ -74,16 +79,16 @@ func UAPIListen(name string) (net.Listener, error) {
 		connErr:  make(chan error, 1),
 	}
 
-	go func(l *UAPIListener) {
+	spawnWorker(spawner, func() {
 		for {
-			conn, err := l.listener.Accept()
+			conn, err := uapi.listener.Accept()
 			if err != nil {
-				l.connErr <- err
+				uapi.connErr <- err
 				break
 			}
-			l.connNew <- conn
+			uapi.connNew <- conn
 		}
-	}(uapi)
+	}, "wgo: UAPI accept loop")
 
 	return uapi, nil
 }

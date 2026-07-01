@@ -161,13 +161,13 @@ func (peer *Peer) keepKeyFreshReceiving() {
 func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.ReceiveFunc) {
 	recvName := recv.PrettyName()
 	defer func() {
-		device.log.Debugf("Routine: receive incoming %s - stopped", recvName)
+		device.logWorkerLifecyclef("Routine: receive incoming %s - stopped", recvName)
 		device.queue.decryption.wg.Done()
 		device.queue.handshake.wg.Done()
 		device.net.stopping.Done()
 	}()
 
-	device.log.Debugf("Routine: receive incoming %s - started", recvName)
+	device.logWorkerLifecyclef("Routine: receive incoming %s - started", recvName)
 
 	// receive datagrams until conn is closed
 
@@ -332,8 +332,8 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 func (device *Device) RoutineDecryption(id int) {
 	var nonce [chacha20poly1305.NonceSize]byte
 
-	defer device.log.Debugf("Routine: decryption worker %d - stopped", id)
-	device.log.Debugf("Routine: decryption worker %d - started", id)
+	defer device.logWorkerLifecyclef("Routine: decryption worker %d - stopped", id)
+	device.logWorkerLifecyclef("Routine: decryption worker %d - started", id)
 
 	for elemsContainer := range device.queue.decryption.c {
 		for _, elem := range elemsContainer.elems {
@@ -364,10 +364,10 @@ func (device *Device) RoutineDecryption(id int) {
  */
 func (device *Device) RoutineHandshake(id int) {
 	defer func() {
-		device.log.Debugf("Routine: handshake worker %d - stopped", id)
+		device.logWorkerLifecyclef("Routine: handshake worker %d - stopped", id)
 		device.queue.encryption.wg.Done()
 	}()
-	device.log.Debugf("Routine: handshake worker %d - started", id)
+	device.logWorkerLifecyclef("Routine: handshake worker %d - started", id)
 
 	for elem := range device.queue.handshake.c {
 
@@ -531,10 +531,10 @@ func (device *Device) RoutineHandshake(id int) {
 func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 	device := peer.device
 	defer func() {
-		device.log.Debugf("%v - Routine: sequential receiver - stopped", peer)
+		device.logWorkerLifecyclef("%v - Routine: sequential receiver - stopped", peer)
 		peer.stopping.Done()
 	}()
-	device.log.Debugf("%v - Routine: sequential receiver - started", peer)
+	device.logWorkerLifecyclef("%v - Routine: sequential receiver - started", peer)
 
 	bufs := make([][]byte, 0, maxBatchSize)
 	packets := make([]*QueueInboundElement, 0, maxBatchSize)

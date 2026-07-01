@@ -119,6 +119,7 @@ type Device struct {
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
 	log      Logger
+	spawner  gonnect.Spawner
 
 	junk struct {
 		min   int
@@ -393,7 +394,12 @@ func newTunState(tunDevice gtun.Tun) (*tunState, error) {
 	return state, nil
 }
 
-func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
+// NewDevice creates a WireGuard device and starts its background workers.
+//
+// Long-lived workers are started with spawner when it is non-nil, allowing the
+// caller to observe and manage worker lifecycle through gonnect. Passing nil
+// preserves direct goroutine spawning.
+func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger, spawner gonnect.Spawner) *Device {
 	var (
 		tunState *tunState
 		err      error
@@ -409,6 +415,7 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
 	device.log = loggerOrNop(logger)
+	device.spawner = spawner
 	device.net.bind = bind
 	device.batchSize = 256
 	if device.batchSize < conn.IdealBatchSize {
@@ -437,7 +444,7 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
 	device.receiveErrors.subscribers = make(map[uint64]func(ReceiveError))
 	device.stats.byteDelta.Store(DefaultRuntimeStatsByteDelta)
 	device.stats.packetDelta.Store(DefaultRuntimeStatsPacketDelta)
-	device.rate.limiter.Init()
+	device.rate.limiter.Init(spawner)
 	device.indexTable.Init()
 	device.headers.init = &magicHeader{start: MessageInitiationType, end: MessageInitiationType}
 	device.headers.response = &magicHeader{start: MessageResponseType, end: MessageResponseType}
@@ -455,15 +462,16 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger) *Device {
 
 	// start workers
 
-	go device.routineRuntimeStatsNotifier()
+	device.spawnWorker(device.routineRuntimeStatsNotifier, "wgo: runtime stats notifier")
 
 	cpus := runtime.NumCPU()
 	device.state.stopping.Wait()
 	device.queue.encryption.wg.Add(cpus) // One for each RoutineHandshake
 	for i := 0; i < cpus; i++ {
-		go device.RoutineEncryption(i + 1)
-		go device.RoutineDecryption(i + 1)
-		go device.RoutineHandshake(i + 1)
+		id := i + 1
+		device.spawnWorker(func() { device.RoutineEncryption(id) }, fmt.Sprintf("wgo: encryption worker %d", id))
+		device.spawnWorker(func() { device.RoutineDecryption(id) }, fmt.Sprintf("wgo: decryption worker %d", id))
+		device.spawnWorker(func() { device.RoutineHandshake(id) }, fmt.Sprintf("wgo: handshake worker %d", id))
 	}
 
 	if tunState != nil {
@@ -678,7 +686,8 @@ func (device *Device) BindUpdate() error {
 	device.queue.handshake.wg.Add(len(recvFns))  // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
 	batchSize := netc.bind.BatchSize()
 	for _, fn := range recvFns {
-		go device.RoutineReceiveIncoming(batchSize, fn)
+		recvName := fmt.Sprintf("%T", fn)
+		device.spawnWorker(func() { device.RoutineReceiveIncoming(batchSize, fn) }, "wgo: receive incoming "+recvName)
 	}
 
 	device.log.Debugf("UDP bind has been updated")
@@ -724,8 +733,8 @@ func (device *Device) startTUN(tun *tunState) {
 	tun.wg.Add(2)
 	device.state.stopping.Add(2)      // RoutineReadFromTUN + RoutineTUNEventReader
 	device.queue.encryption.wg.Add(1) // RoutineReadFromTUN
-	go device.RoutineReadFromTUN(tun)
-	go device.RoutineTUNEventReader(tun)
+	device.spawnWorker(func() { device.RoutineReadFromTUN(tun) }, "wgo: TUN reader")
+	device.spawnWorker(func() { device.RoutineTUNEventReader(tun) }, "wgo: TUN event reader")
 }
 
 func (device *Device) stopTUN(tun *tunState) {
