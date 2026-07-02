@@ -92,9 +92,21 @@ func (s *recordingSpawner) hasName(name string) bool {
 	return false
 }
 
+func (s *recordingSpawner) countPrefix(prefix string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var count int
+	for _, got := range s.names {
+		if len(got) >= len(prefix) && got[:len(prefix)] == prefix {
+			count++
+		}
+	}
+	return count
+}
+
 func TestNewDeviceUsesSpawnerForBackgroundWorkers(t *testing.T) {
 	spawner := &recordingSpawner{}
-	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), spawner)
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), spawner, DeviceOptions{WorkerCount: 1})
 	dev.Close()
 
 	for _, name := range []string{
@@ -106,6 +118,41 @@ func TestNewDeviceUsesSpawnerForBackgroundWorkers(t *testing.T) {
 	} {
 		if !spawner.hasName(name) {
 			t.Fatalf("expected worker %q to be spawned through spawner", name)
+		}
+	}
+}
+
+func TestNewDeviceDefaultWorkerCountUsesGOMAXPROCS(t *testing.T) {
+	prev := runtime.GOMAXPROCS(2)
+	defer runtime.GOMAXPROCS(prev)
+
+	spawner := &recordingSpawner{}
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), spawner, DeviceOptions{})
+	dev.Close()
+
+	for _, prefix := range []string{
+		"wgo: encryption worker ",
+		"wgo: decryption worker ",
+		"wgo: handshake worker ",
+	} {
+		if got, want := spawner.countPrefix(prefix), 2; got != want {
+			t.Fatalf("worker count for %q = %d, want %d", prefix, got, want)
+		}
+	}
+}
+
+func TestNewDeviceExplicitWorkerCount(t *testing.T) {
+	spawner := &recordingSpawner{}
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), spawner, DeviceOptions{WorkerCount: 3})
+	dev.Close()
+
+	for _, prefix := range []string{
+		"wgo: encryption worker ",
+		"wgo: decryption worker ",
+		"wgo: handshake worker ",
+	} {
+		if got, want := spawner.countPrefix(prefix), 3; got != want {
+			t.Fatalf("worker count for %q = %d, want %d", prefix, got, want)
 		}
 	}
 }
@@ -279,7 +326,7 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 		if _, ok := tb.(*testing.B); ok && !testing.Verbose() {
 			level = LogLevelError
 		}
-		p.dev = NewDevice(p.tun.TUN(), binds[i], NewLogger(level, fmt.Sprintf("dev%d: ", i)), nil)
+		p.dev = NewDevice(p.tun.TUN(), binds[i], NewLogger(level, fmt.Sprintf("dev%d: ", i)), nil, DeviceOptions{})
 		if err := p.dev.IpcSet(cfg[i]); err != nil {
 			tb.Errorf("failed to configure device %d: %v", i, err)
 			p.dev.Close()
@@ -366,8 +413,8 @@ func newDevicePairForTUNsAndBinds(tb testing.TB, tun0, tun1 gtun.Tun, ips [2]net
 	}
 
 	devs := [2]*Device{
-		NewDevice(tun0, binds[0], NewLogger(LogLevelError, "dev0: "), nil),
-		NewDevice(tun1, binds[1], NewLogger(LogLevelError, "dev1: "), nil),
+		NewDevice(tun0, binds[0], NewLogger(LogLevelError, "dev0: "), nil, DeviceOptions{}),
+		NewDevice(tun1, binds[1], NewLogger(LogLevelError, "dev1: "), nil, DeviceOptions{}),
 	}
 	for i := range devs {
 		if err := devs[i].IpcSet(cfgs[i]); err != nil {
@@ -1084,6 +1131,93 @@ func TestBatchSize(t *testing.T) {
 	}
 }
 
+func TestNewDeviceBatchSizeOptions(t *testing.T) {
+	defaultBatchSize := defaultDeviceBatchSize
+	if defaultBatchSize < conn.IdealBatchSize {
+		defaultBatchSize = conn.IdealBatchSize
+	}
+
+	tests := []struct {
+		name    string
+		tun     *fakeTUNDeviceSized
+		bind    conn.Bind
+		options DeviceOptions
+		want    int
+	}{
+		{
+			name:    "zero value uses default batch size",
+			options: DeviceOptions{WorkerCount: 1},
+			want:    defaultBatchSize,
+		},
+		{
+			name:    "explicit low batch size",
+			options: DeviceOptions{BatchSize: 1, WorkerCount: 1},
+			want:    1,
+		},
+		{
+			name: "explicit batch size is raised for attached tun and bind",
+			tun: &fakeTUNDeviceSized{
+				size: 7,
+			},
+			bind:    &fakeBindSized{size: 5},
+			options: DeviceOptions{BatchSize: 2, WorkerCount: 1},
+			want:    7,
+		},
+		{
+			name:    "non-positive batch size uses default",
+			options: DeviceOptions{BatchSize: -1, WorkerCount: 1},
+			want:    defaultBatchSize,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var tunDevice gtun.Tun
+			if tt.tun != nil {
+				tt.tun.ensureInit()
+				tunDevice = tt.tun
+			}
+
+			dev := NewDevice(tunDevice, tt.bind, NewLogger(LogLevelError, ""), nil, tt.options)
+			t.Cleanup(dev.Close)
+
+			if got := dev.BatchSize(); got != tt.want {
+				t.Fatalf("BatchSize() = %d, want %d", got, tt.want)
+			}
+
+			inbound := dev.GetInboundElementsContainer()
+			if got := cap(inbound.elems); got != tt.want {
+				t.Fatalf("inbound container cap = %d, want %d", got, tt.want)
+			}
+			dev.PutInboundElementsContainer(inbound)
+
+			outbound := dev.GetOutboundElementsContainer()
+			if got := cap(outbound.elems); got != tt.want {
+				t.Fatalf("outbound container cap = %d, want %d", got, tt.want)
+			}
+			dev.PutOutboundElementsContainer(outbound)
+		})
+	}
+}
+
+func TestDeviceRejectsReplacementBatchAboveDeviceBatchSize(t *testing.T) {
+	tunDev := &fakeTUNDeviceSized{size: 1}
+	tunDev.ensureInit()
+
+	dev := NewDevice(tunDev, &fakeBindSized{size: 1}, NewLogger(LogLevelError, ""), nil, DeviceOptions{BatchSize: 2, WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	replacementTUN := &fakeTUNDeviceSized{size: 3}
+	replacementTUN.ensureInit()
+	if err := dev.ReplaceTUN(replacementTUN); err == nil {
+		t.Fatal("ReplaceTUN() error = nil, want error for oversized batch")
+	}
+
+	if err := dev.ReplaceBind(&fakeBindSized{size: 3}); err == nil {
+		t.Fatal("ReplaceBind() error = nil, want error for oversized batch")
+	}
+}
+
 func TestNewDeviceTunOffsetStrategy(t *testing.T) {
 	t.Parallel()
 
@@ -1123,11 +1257,11 @@ func TestNewDeviceTunOffsetStrategy(t *testing.T) {
 						t.Fatal("expected panic")
 					}
 				}()
-				NewDevice(tunDev, &fakeBindSized{1}, NewLogger(LogLevelError, ""), nil)
+				NewDevice(tunDev, &fakeBindSized{1}, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 				return
 			}
 
-			dev := NewDevice(tunDev, &fakeBindSized{1}, NewLogger(LogLevelError, ""), nil)
+			dev := NewDevice(tunDev, &fakeBindSized{1}, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 			t.Cleanup(dev.Close)
 			tunState := dev.currentTUN()
 			if tunState == nil {
@@ -1159,7 +1293,7 @@ func TestNewDeviceTunOffsetStrategy(t *testing.T) {
 func TestNewDeviceWithoutInitialAttachments(t *testing.T) {
 	t.Parallel()
 
-	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 
 	if dev.currentTUN() != nil {
@@ -1196,7 +1330,7 @@ func TestDeviceDownIgnoresClosedBindError(t *testing.T) {
 	t.Parallel()
 
 	tunDev := newChannelTUN()
-	dev := NewDevice(tunDev.TUN(), &fakeClosedErrBind{size: 1}, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(tunDev.TUN(), &fakeClosedErrBind{size: 1}, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -1209,7 +1343,7 @@ func TestDeviceSetFwmarkReturnsErrorOnBindSetMarkPanic(t *testing.T) {
 	t.Parallel()
 
 	tunDev := newChannelTUN()
-	dev := NewDevice(tunDev.TUN(), &fakePanicSetMarkBind{size: 1}, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(tunDev.TUN(), &fakePanicSetMarkBind{size: 1}, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -1223,7 +1357,7 @@ func TestDeviceAttachBindReturnsErrorOnBindSetMarkPanic(t *testing.T) {
 	t.Parallel()
 
 	tunDev := newChannelTUN()
-	dev := NewDevice(tunDev.TUN(), nil, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(tunDev.TUN(), nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -1241,7 +1375,7 @@ func TestDeviceCloseDoesNotDeadlockWithConcurrentTUNEvent(t *testing.T) {
 	t.Parallel()
 
 	tunDev := newFakeBlockingEventTUN(DefaultMTU)
-	dev := NewDevice(tunDev, nil, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(tunDev, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 
 	tunDev.events <- gtun.EventMTUUpdate | gtun.EventUp
 
@@ -1567,7 +1701,7 @@ func TestDeviceReplaceBindReparsesPeerEndpoints(t *testing.T) {
 
 	bind0 := &fakeTransitionBind{id: "bind0", size: 1}
 	bind1 := &fakeTransitionBind{id: "bind1", size: 1}
-	dev := NewDevice(tunDev, bind0, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(tunDev, bind0, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 
 	key0 := mustPrivateKey(t, 0)
@@ -1670,7 +1804,7 @@ func TestDeviceReplaceBindWithClosedBindCanRecover(t *testing.T) {
 
 	bind0 := &fakeTransitionBind{id: "bind0", size: 1}
 	bind1 := &fakeTransitionBind{id: "bind1", size: 1}
-	dev := NewDevice(tunDev, bind0, NewLogger(LogLevelError, "dev0: "), nil)
+	dev := NewDevice(tunDev, bind0, NewLogger(LogLevelError, "dev0: "), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 
 	key0 := mustPrivateKey(t, 0)

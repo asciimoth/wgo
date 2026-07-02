@@ -36,7 +36,7 @@ func TestReceiveErrorShouldRecover(t *testing.T) {
 }
 
 func TestReceiveErrorSubscriptionReportsFatalError(t *testing.T) {
-	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 
 	updates := make(chan ReceiveError, 1)
@@ -68,7 +68,7 @@ func TestReceiveErrorSubscriptionReportsFatalError(t *testing.T) {
 }
 
 func TestReceiveErrorSubscriptionSkipsClosedError(t *testing.T) {
-	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 
 	updates := make(chan ReceiveError, 1)

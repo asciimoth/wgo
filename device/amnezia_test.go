@@ -18,7 +18,7 @@ import (
 func TestDeviceAmneziaWGTypedConfigMethods(t *testing.T) {
 	tunDev := newChannelTUN()
 	bind := &fakeTransitionBind{id: "bind0", size: 1}
-	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -92,7 +92,7 @@ func TestAmneziaWGObfChainParsesReferenceQuirks(t *testing.T) {
 func TestAmneziaWGSendHandshakeInitiationSendsConfiguredPreludes(t *testing.T) {
 	tunDev := newChannelTUN()
 	bind := &recordingBind{id: "bind0", size: 1}
-	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -146,7 +146,7 @@ func TestAmneziaWGSendHandshakeInitiationSendsConfiguredPreludes(t *testing.T) {
 func TestAmneziaWGPerPeerOverrideUsesPeerSnapshotAndFallsBackToDeviceDefault(t *testing.T) {
 	tunDev := newChannelTUN()
 	bind := &recordingBind{id: "bind0", size: 1}
-	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 
@@ -229,7 +229,7 @@ func TestAmneziaWGPerPeerOverrideUsesPeerSnapshotAndFallsBackToDeviceDefault(t *
 func TestDeterminePacketTypeAndPaddingAcceptsPeerSpecificOverrides(t *testing.T) {
 	tunDev := newChannelTUN()
 	bind := &fakeTransitionBind{id: "bind0", size: 1}
-	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil)
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)
 	waitForDeviceUp(t, dev)
 

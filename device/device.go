@@ -146,6 +146,28 @@ type Device struct {
 	amneziaSnapshot atomic.Pointer[amneziaWGSnapshot]
 }
 
+const defaultDeviceBatchSize = 256
+
+// DeviceOptions controls construction-time sizing for a Device.
+//
+// The zero value preserves the high-throughput batch sizing used by previous
+// releases while deriving the default worker count from runtime.GOMAXPROCS(0),
+// which reflects the scheduler parallelism available to this process.
+type DeviceOptions struct {
+	// BatchSize controls the number of packet slots allocated for TUN and bind
+	// processing batches. Values less than 1 use the historical default. Smaller
+	// positive values can reduce retained memory in idle or low-throughput
+	// devices, but may reduce peak packet throughput.
+	//
+	// The effective batch size is always raised to at least the batch size
+	// required by the initially attached TUN and bind.
+	BatchSize int
+
+	// WorkerCount controls how many encryption, decryption, and handshake
+	// workers are started. Values less than 1 use runtime.GOMAXPROCS(0).
+	WorkerCount int
+}
+
 type tunState struct {
 	device gtun.Tun
 
@@ -394,12 +416,42 @@ func newTunState(tunDevice gtun.Tun) (*tunState, error) {
 	return state, nil
 }
 
+func effectiveDeviceBatchSize(tunDevice gtun.Tun, bind conn.Bind, options DeviceOptions) int {
+	batchSize := options.BatchSize
+	if batchSize <= 0 {
+		batchSize = defaultDeviceBatchSize
+		if batchSize < conn.IdealBatchSize {
+			batchSize = conn.IdealBatchSize
+		}
+	}
+	if bind != nil && batchSize < bind.BatchSize() {
+		batchSize = bind.BatchSize()
+	}
+	if tunDevice != nil {
+		if tunBatchSize := tunDevice.BatchSize(); batchSize < tunBatchSize {
+			batchSize = tunBatchSize
+		}
+	}
+	return batchSize
+}
+
+func effectiveDeviceWorkerCount(options DeviceOptions) int {
+	workerCount := options.WorkerCount
+	if workerCount < 1 {
+		workerCount = runtime.GOMAXPROCS(0)
+	}
+	if workerCount < 1 {
+		return 1
+	}
+	return workerCount
+}
+
 // NewDevice creates a WireGuard device and starts its background workers.
 //
 // Long-lived workers are started with spawner when it is non-nil, allowing the
 // caller to observe and manage worker lifecycle through gonnect. Passing nil
 // preserves direct goroutine spawning.
-func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger, spawner gonnect.Spawner) *Device {
+func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger, spawner gonnect.Spawner, options DeviceOptions) *Device {
 	var (
 		tunState *tunState
 		err      error
@@ -417,17 +469,8 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger, spawner gonnec
 	device.log = loggerOrNop(logger)
 	device.spawner = spawner
 	device.net.bind = bind
-	device.batchSize = 256
-	if device.batchSize < conn.IdealBatchSize {
-		device.batchSize = conn.IdealBatchSize
-	}
-	if bind != nil && device.batchSize < bind.BatchSize() {
-		device.batchSize = bind.BatchSize()
-	}
+	device.batchSize = effectiveDeviceBatchSize(tunDevice, bind, options)
 	if tunDevice != nil {
-		if tunBatchSize := tunDevice.BatchSize(); device.batchSize < tunBatchSize {
-			device.batchSize = tunBatchSize
-		}
 		device.tun.device.Store(tunState)
 		mtu, err := tunDevice.MTU()
 		if err != nil {
@@ -464,10 +507,10 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger, spawner gonnec
 
 	device.spawnWorker(device.routineRuntimeStatsNotifier, "wgo: runtime stats notifier")
 
-	cpus := runtime.NumCPU()
+	workers := effectiveDeviceWorkerCount(options)
 	device.state.stopping.Wait()
-	device.queue.encryption.wg.Add(cpus) // One for each RoutineHandshake
-	for i := 0; i < cpus; i++ {
+	device.queue.encryption.wg.Add(workers) // One for each RoutineHandshake
+	for i := 0; i < workers; i++ {
 		id := i + 1
 		device.spawnWorker(func() { device.RoutineEncryption(id) }, fmt.Sprintf("wgo: encryption worker %d", id))
 		device.spawnWorker(func() { device.RoutineDecryption(id) }, fmt.Sprintf("wgo: decryption worker %d", id))

@@ -62,8 +62,8 @@ func New() (*Pair, error) {
 		SecondNet: secondTun,
 		FirstIP:   firstIP,
 		SecondIP:  secondIP,
-		firstDev:  device.NewDevice(firstTun, firstBind, device.NewLogger(device.LogLevelError, "example/first: "), nil),
-		secondDev: device.NewDevice(secondTun, secondBind, device.NewLogger(device.LogLevelError, "example/second: "), nil),
+		firstDev:  device.NewDevice(firstTun, firstBind, device.NewLogger(device.LogLevelError, "example/first: "), nil, device.DeviceOptions{}),
+		secondDev: device.NewDevice(secondTun, secondBind, device.NewLogger(device.LogLevelError, "example/second: "), nil, device.DeviceOptions{}),
 		networks:  []networkDowner{network},
 	}
 

@@ -3,7 +3,7 @@ module github.com/asciimoth/wgo
 go 1.25.5
 
 require (
-	github.com/asciimoth/batchudp v0.2.1
+	github.com/asciimoth/batchudp v0.3.0
 	github.com/asciimoth/gonnect v0.31.0
 	github.com/asciimoth/gonnect-netstack v0.4.30
 	github.com/asciimoth/tuntap v0.3.18

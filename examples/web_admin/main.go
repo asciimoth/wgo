@@ -210,7 +210,7 @@ func newAdminApp() (*adminApp, error) {
 		return nil, err
 	}
 
-	dev := device.NewDevice(nil, nil, device.NewLogger(device.LogLevelError, "example/web-admin: "), nil)
+	dev := device.NewDevice(nil, nil, device.NewLogger(device.LogLevelError, "example/web-admin: "), nil, device.DeviceOptions{})
 	if err := dev.Up(); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("bring device up: %w", err)

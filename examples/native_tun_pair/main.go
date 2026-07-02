@@ -94,8 +94,8 @@ func newNativePair() (*nativePair, error) {
 	pair := &nativePair{
 		firstName:  firstName,
 		secondName: secondName,
-		firstDev:   device.NewDevice(firstTun, conn.NewDefaultBind(firstNet), device.NewLogger(device.LogLevelDebug, "example/first: "), nil),
-		secondDev:  device.NewDevice(secondTun, conn.NewDefaultBind(secondNet), device.NewLogger(device.LogLevelDebug, "example/second: "), nil),
+		firstDev:   device.NewDevice(firstTun, conn.NewDefaultBind(firstNet), device.NewLogger(device.LogLevelDebug, "example/first: "), nil, device.DeviceOptions{}),
+		secondDev:  device.NewDevice(secondTun, conn.NewDefaultBind(secondNet), device.NewLogger(device.LogLevelDebug, "example/second: "), nil, device.DeviceOptions{}),
 		firstNet:   firstNet,
 		secondNet:  secondNet,
 		cleanup:    []func() error{secondCleanup, firstCleanup},

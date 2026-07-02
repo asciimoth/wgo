@@ -64,7 +64,7 @@ func run() error {
 		_ = tunDev.Close()
 		return err
 	}
-	dev := device.NewDevice(tunDev, bind, device.NewLogger(logger, "compat/wgo: "), nil)
+	dev := device.NewDevice(tunDev, bind, device.NewLogger(logger, "compat/wgo: "), nil, device.DeviceOptions{})
 
 	if err := dev.SetListenPort(uint16(cfg.listenPort)); err != nil {
 		dev.Close()
