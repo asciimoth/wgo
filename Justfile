@@ -1,5 +1,10 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+typos:
+  typos
+
+check: tidy typos vet test-total
+
 test:
 	go test -race ./...
 
