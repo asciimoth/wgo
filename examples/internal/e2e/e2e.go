@@ -40,7 +40,7 @@ type networkDowner interface {
 }
 
 func New() (*Pair, error) {
-	network := gonnect.NewLoopbackNetwok()
+	network := gonnect.NewLoopbackNetwork()
 
 	firstTun, err := buildVTun(firstIP, 0, 0)
 	if err != nil {

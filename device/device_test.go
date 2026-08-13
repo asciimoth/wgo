@@ -457,7 +457,7 @@ func newEndToEndBinds(tb testing.TB, mode e2eBindMode) [2]conn.Bind {
 		}
 		return binds
 	case e2eBindModeLoopbackDefault:
-		network := gonnect.NewLoopbackNetwok()
+		network := gonnect.NewLoopbackNetwork()
 		tb.Cleanup(func() {
 			_ = network.Down()
 		})
