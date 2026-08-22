@@ -27,7 +27,7 @@ network := (&native.Config{}).Build()
 defer network.Down()
 
 bind := batchudp.NewDefaultBind(network)
-dev := device.NewDevice(tunDevice, bind, logger, nil)
+dev := device.NewDevice(tunDevice, bind, logger, nil, device.DeviceOptions{})
 ```
 
 `device.Device` is the central coordinator. It owns:
@@ -61,10 +61,10 @@ Important responsibilities:
 
 Important internal structures:
 
-- `Device` in [device/device.go](/home/moth/projects/wgo/device/device.go)
-- `Peer` in [device/peer.go](/home/moth/projects/wgo/device/peer.go)
-- `AllowedIPs` trie in [device/allowedips.go](/home/moth/projects/wgo/device/allowedips.go)
-- queue definitions in [device/channels.go](/home/moth/projects/wgo/device/channels.go)
+- `Device` in [device/device.go](device/device.go)
+- `Peer` in [device/peer.go](device/peer.go)
+- `AllowedIPs` trie in [device/allowedips.go](device/allowedips.go)
+- queue definitions in [device/channels.go](device/channels.go)
 
 ### UDP Transport
 
@@ -118,7 +118,7 @@ The active TUN can be replaced at runtime without rebuilding the `Device`, so th
 
 ### `ipc`
 
-`ipc` is intentionally narrow in this repo. It provides platform-specific UAPI listener helpers such as Unix socket setup in [ipc/uapi_unix.go](/home/moth/projects/wgo/ipc/uapi_unix.go) and named pipe support on Windows.
+`ipc` is intentionally narrow in this repo. It provides platform-specific UAPI listener helpers such as Unix socket setup in [ipc/uapi_unix.go](ipc/uapi_unix.go) and named pipe support on Windows.
 
 The actual parsing and execution of `get`/`set` commands lives in `device/uapi.go`, not in `ipc`.
 
@@ -135,7 +135,7 @@ These packages are small, focused dependencies of `device` and transport code.
 
 ### Construction
 
-`device.NewDevice(tunDevice, bind, logger, spawner)` initializes the protocol engine and starts background workers immediately. Pass a `gonnect.Spawner` to track long-lived workers, or `nil` to preserve direct goroutine spawning.
+`device.NewDevice(tunDevice, bind, logger, spawner, options)` initializes the protocol engine and starts background workers immediately. Pass a `gonnect.Spawner` to track long-lived workers, or `nil` to preserve direct goroutine spawning. Pass `device.DeviceOptions{}` to use default batch and worker sizing.
 
 During construction it:
 
@@ -171,7 +171,7 @@ The device batch size is fixed for the lifetime of the device from the maximum o
 
 TUN lifecycle is managed separately from `up`/`down` state:
 
-- `ReplaceTUN()` swaps the active attachment in place, starts fresh TUN reader/event workers for the new attachment, and closes the old TUN to unblock its read loop
+- `ReplaceTUN()` swaps the new attachment into place, starts fresh TUN reader/event workers for it, and then closes the old TUN to unblock its read loop
 - `DetachTUN()` removes the active attachment and leaves the device running without TUN delivery until another TUN is attached
 - `AttachTUN()` attaches a TUN to a currently detached device
 
@@ -188,13 +188,22 @@ Detached-bind behavior:
 - outbound transport sends fail fast and packets are effectively dropped
 - peer `endpoint=` UAPI updates are rejected while detached because endpoint parsing is bind-specific
 
+Receive error recovery:
+
+- `Device.SubscribeReceiveErrors` lets embedders observe receive-loop errors from active bind receive routines
+- callbacks run asynchronously and receive a `ReceiveError` with the receive routine name, the original error, and a `Fatal` flag
+- errors that match `net.ErrClosed` are treated as normal bind shutdown and are not reported
+- timeout errors are treated as transient; repeated transient errors can still become fatal after the receive loop's retry budget is exhausted
+- `ReceiveErrorShouldRecover` reports whether an unexpected receive error is a candidate for caller-controlled bind recovery
+- a fatal receive error stops that receive routine; if the bind should stay available, the embedder must replace or reopen the bind, usually through `ReplaceBind` or `BindUpdate` under its own policy
+
 `Close()` is terminal. It closes the active TUN if present, tears down the bind, removes peers, drains queues, stops background activity, and closes the `Wait()` channel.
 
 ## Data Flow
 
 ### Outbound path
 
-The outbound path starts with packets read from the currently attached TUN by `RoutineReadFromTUN` in [device/send.go](/home/moth/projects/wgo/device/send.go).
+The outbound path starts with packets read from the currently attached TUN by `RoutineReadFromTUN` in [device/send.go](device/send.go).
 
 Flow:
 
@@ -250,6 +259,7 @@ This is enough to keep the `Device`, attached TUN, and UAPI server alive across 
 - endpoint preservation across bind replacement depends on the new bind successfully parsing the old endpoint's string form
 - `ReplaceBind()` is safe but not transactional; if rebinding or reopening fails, the device remains alive but the previous running bind/session state is not restored automatically
 - `AttachBind()` does not recreate remote peer knowledge of a new listen port; if the new bind opens on a different port, remote peers may need an endpoint refresh or a new handshake path to reach it
+- see [REVIEW_FOLLOWUPS.md](REVIEW_FOLLOWUPS.md) for receive-path and bind-contract issues found during local review
 
 Handshake packets and transport packets are deliberately separated early so the device can scale crypto work while keeping protocol ordering constraints.
 
@@ -284,7 +294,7 @@ Important patterns:
 
 - `Device.state` serializes `Up`/`Down`/`Close`
 - `ipcMutex` prevents configuration operations from racing with lifecycle-sensitive sections
-- queue wrappers in [device/channels.go](/home/moth/projects/wgo/device/channels.go) use ref-counted shutdown to avoid closing channels while writers are still active
+- queue wrappers in [device/channels.go](device/channels.go) use ref-counted shutdown to avoid closing channels while writers are still active
 - memory reuse is handled by pools in `device/pools.go` to reduce allocations on packet hot paths
 
 Message buffers intentionally include a small amount of extra TUN staging headroom beyond the protocol `MaxMessageSize`. This headroom exists only to satisfy oversized TUN read/write offsets without changing the WireGuard transport packet format.
@@ -380,14 +390,14 @@ The runtime behavior is:
 
 Receive-side classification is more constrained because the peer is not always known before packet parsing. The implementation handles this by testing the device-global snapshot first and then any peer-specific snapshots already compiled into live peers. That preserves mixed-profile interoperability while keeping the inner WireGuard processing unchanged after padding is stripped.
 
-This also means mixed per-peer profiles are only safe when their receive-side signatures are unambiguous. Matching currently stops at the first snapshot whose `(configured padding, configured header range, expected size)` fits the packet. Validation prevents header overlap within one effective profile, but it does not reject overlaps or other ambiguous combinations across different peers. If two peers can both plausibly match the same incoming wire packet, classification may select the wrong profile and the subsequent handshake or transport decode will fail.
+This also means mixed per-peer profiles are only safe when their receive-side signatures are unambiguous. Matching currently stops at the first snapshot whose `(configured padding, configured header range, expected size)` fits the packet. Validation prevents header overlap within one effective profile, but it does not reject overlaps or other ambiguous combinations across different peers. If two peers can both plausibly match the same incoming wire packet, classification may select the wrong profile and the subsequent handshake or transport decode will fail. Track this as a follow-up in [REVIEW_FOLLOWUPS.md](REVIEW_FOLLOWUPS.md).
 
 The implementation touches four main areas:
 
-- config and state: [device/amnezia.go](/home/moth/projects/wgo/device/amnezia.go), [device/config.go](/home/moth/projects/wgo/device/config.go), and [device/uapi.go](/home/moth/projects/wgo/device/uapi.go) define the typed config model, peer override patches, UAPI keys, CPS parsing for `I1..I5`, and header-overlap validation
-- send path: [device/noise-protocol.go](/home/moth/projects/wgo/device/noise-protocol.go) and [device/send.go](/home/moth/projects/wgo/device/send.go) generate randomized header values, prepend fixed-size random prefixes, emit `I1..I5` and `J*` packets before each initiation, and preserve the keepalive `S4` quirk from `amneziawg-go`, all from the effective per-peer snapshot
-- receive path: [device/receive.go](/home/moth/projects/wgo/device/receive.go) classifies packets by `(configured padding, configured header range, expected size)` before handing the stripped inner message to normal WireGuard processing, checking both the device-default and peer-specific snapshots; mixed per-peer profiles therefore need distinct receive-side signatures
-- cookie handling: [device/cookie.go](/home/moth/projects/wgo/device/cookie.go) now accepts the configured cookie header value so `H3` applies to cookie replies too
+- config and state: [device/amnezia.go](device/amnezia.go), [device/config.go](device/config.go), and [device/uapi.go](device/uapi.go) define the typed config model, peer override patches, UAPI keys, CPS parsing for `I1..I5`, and header-overlap validation
+- send path: [device/noise-protocol.go](device/noise-protocol.go) and [device/send.go](device/send.go) generate randomized header values, prepend fixed-size random prefixes, emit `I1..I5` and `J*` packets before each initiation, and preserve the keepalive `S4` quirk from `amneziawg-go`, all from the effective per-peer snapshot. Receive-side handling for unpadded keepalives when `S4 > 0` is tracked in [REVIEW_FOLLOWUPS.md](REVIEW_FOLLOWUPS.md).
+- receive path: [device/receive.go](device/receive.go) classifies packets by `(configured padding, configured header range, expected size)` before handing the stripped inner message to normal WireGuard processing, checking both the device-default and peer-specific snapshots; mixed per-peer profiles therefore need distinct receive-side signatures
+- cookie handling: [device/cookie.go](device/cookie.go) now accepts the configured cookie header value so `H3` applies to cookie replies too
 
 Vanilla WireGuard support is preserved by the default configuration and by peers that do not override it:
 

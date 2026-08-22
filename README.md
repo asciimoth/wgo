@@ -8,7 +8,7 @@
 > All credit goes to the original wireguard-go authors.
 
 ## Things done
-- replaced the built-in TUN and conn implementations with reusable [tuntap](https://github.com/asciimoth/tuntap) and [batchudp](https://github.com/asciimoth/batchudp) libraries
+- replaced the built-in TUN and conn implementations with reusable [gonnect/tun](https://github.com/asciimoth/gonnect/tree/master/tun) and [batchudp](https://github.com/asciimoth/batchudp) libraries
 - support on-the-fly attach/detach/swap operations for `Bind` and `Tun` instances
 - added usage [examples](./examples)
 - added `Device` configuration methods matching UAPI get/set options
@@ -29,4 +29,3 @@
     - [wireguard endpoint discovery nat traversal](https://www.jordanwhited.com/posts/wireguard-endpoint-discovery-nat-traversal/)
     - [wgsd](https://coredns.io/explugins/wgsd/)
 - [ ] use [bufpool](https://github.com/asciimoth/bufpool) to optimize allocations
-

@@ -48,14 +48,14 @@ It covers two interoperability tracks:
 
 ### How It Works
 
-The runner is [tests/compat/run.sh](/home/moth/projects/wgo/tests/compat/run.sh).
+The runner is [tests/compat/run.sh](tests/compat/run.sh).
 
 For each run it:
 
 1. Builds three temporary Docker images:
-   - [tests/compat/docker/kernel-peer.Dockerfile](/home/moth/projects/wgo/tests/compat/docker/kernel-peer.Dockerfile)
-   - [tests/compat/docker/wgo-peer.Dockerfile](/home/moth/projects/wgo/tests/compat/docker/wgo-peer.Dockerfile)
-   - [tests/compat/docker/amnezia-peer.Dockerfile](/home/moth/projects/wgo/tests/compat/docker/amnezia-peer.Dockerfile)
+   - [tests/compat/docker/kernel-peer.Dockerfile](tests/compat/docker/kernel-peer.Dockerfile)
+   - [tests/compat/docker/wgo-peer.Dockerfile](tests/compat/docker/wgo-peer.Dockerfile)
+   - [tests/compat/docker/amnezia-peer.Dockerfile](tests/compat/docker/amnezia-peer.Dockerfile)
 2. Creates an isolated Docker network.
 3. Starts privileged containers for each track:
    - `kernel-peer`: uses Linux kernel WireGuard via `ip link add ... type wireguard`
@@ -127,7 +127,7 @@ The expected assertions are:
 - Vanilla traffic must expose standard WireGuard initiation, response, and transport signatures.
 - Traffic produced with non-default AmneziaWG headers/padding must not expose those standard WireGuard signatures.
 
-The runner is [tests/obfuscation/run.sh](/home/moth/projects/wgo/tests/obfuscation/run.sh).
+The runner is [tests/obfuscation/run.sh](tests/obfuscation/run.sh).
 
 ### Prerequisites
 
@@ -182,7 +182,7 @@ For each subject it:
 5. Runs `iperf3` TCP and UDP benchmarks in both directions across the WireGuard tunnel.
 6. Stores raw `iperf3` JSON output under `.tmp/perf/` and writes a readable summary report to the repository-root `performance-log.md`.
 
-The runner is [tests/perf/run.sh](/home/moth/projects/wgo/tests/perf/run.sh).
+The runner is [tests/perf/run.sh](tests/perf/run.sh).
 
 ### Performance Artifacts
 

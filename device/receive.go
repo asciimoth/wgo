@@ -9,6 +9,8 @@ package device
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -21,6 +23,7 @@ import (
 
 type QueueHandshakeElement struct {
 	msgType  uint32
+	amnezia  amneziaWGSnapshot
 	packet   []byte
 	endpoint conn.Endpoint
 	buffer   *[MessageBufferSize]byte
@@ -74,7 +77,15 @@ func ReceiveErrorShouldRecover(err error) bool {
 	if err == nil || errors.Is(err, net.ErrClosed) {
 		return false
 	}
-	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+	var neterr net.Error
+	if errors.As(err, &neterr) && neterr.Timeout() {
+		return false
+	}
+	type temporary interface {
+		Temporary() bool
+	}
+	var temperr temporary
+	if errors.As(err, &temperr) && temperr.Temporary() {
 		return false
 	}
 	return true
@@ -123,6 +134,32 @@ func buildTUNWriteBuffers(tun *tunState, elems []*QueueInboundElement, bufs [][]
 		bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
 	}
 	return bufs
+}
+
+func writeTUNBuffers(tun *tunState, bufs [][]byte) error {
+	batchSize := tun.device.BatchSize()
+	if batchSize < 1 {
+		batchSize = len(bufs)
+	}
+	for len(bufs) > 0 {
+		chunkSize := batchSize
+		if chunkSize > len(bufs) {
+			chunkSize = len(bufs)
+		}
+		chunk := bufs[:chunkSize]
+		written, err := tun.device.Write(chunk, tun.writeOffset)
+		if err != nil {
+			return err
+		}
+		if written < 0 || written > len(chunk) {
+			return io.ErrShortWrite
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+		bufs = bufs[written:]
+	}
+	return nil
 }
 
 // clearPointers clears elem fields that contain pointers.
@@ -216,6 +253,11 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			return
 		}
 		deathSpiral = 0
+		if err := validateReceiveBatch(count, maxBatchSize, sizes, endpoints, bufs); err != nil {
+			device.log.Debugf("Invalid receive %s batch: %v", recvName, err)
+			device.reportReceiveError(ReceiveError{Name: recvName, Err: err, Fatal: true})
+			return
+		}
 
 		// handle each packet in the batch
 		for i, size := range sizes[:count] {
@@ -224,7 +266,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			}
 
 			packet := bufsArrs[i][:size]
-			msgType, padding := device.DeterminePacketTypeAndPadding(packet, MessageUnknownType)
+			msgType, padding, amnezia := device.determinePacketTypeAndPadding(packet, MessageUnknownType)
 			if padding > 0 {
 				copy(packet, packet[padding:])
 				packet = packet[:len(packet)-padding]
@@ -304,6 +346,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			select {
 			case device.queue.handshake.c <- QueueHandshakeElement{
 				msgType:  msgType,
+				amnezia:  amnezia,
 				buffer:   bufsArrs[i],
 				packet:   packet,
 				endpoint: endpoints[i],
@@ -327,6 +370,24 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			delete(elemsByPeer, peer)
 		}
 	}
+}
+
+func validateReceiveBatch(count, maxBatchSize int, sizes []int, endpoints []conn.Endpoint, bufs [][]byte) error {
+	// ReceiveFunc is provided by conn.Bind implementations. Validate its batch
+	// contract before slicing buffers so a bad library embedder cannot panic the
+	// receive routine.
+	if count < 0 || count > maxBatchSize {
+		return fmt.Errorf("invalid packet count %d", count)
+	}
+	for i := 0; i < count; i++ {
+		if sizes[i] < 0 || sizes[i] > len(bufs[i]) {
+			return fmt.Errorf("invalid packet size %d at index %d", sizes[i], i)
+		}
+		if sizes[i] >= MinMessageSize && endpoints[i] == nil {
+			return fmt.Errorf("missing endpoint at index %d", i)
+		}
+	}
+	return nil
 }
 
 func (device *Device) RoutineDecryption(id int) {
@@ -631,11 +692,11 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			var err error
 			if tun != nil {
 				bufs = buildTUNWriteBuffers(tun, packets, bufs)
-				_, err = tun.device.Write(bufs, tun.writeOffset)
+				err = writeTUNBuffers(tun, bufs)
 				if err != nil && !device.isClosed() {
 					if nextTun := device.currentTUN(); nextTun != nil && nextTun != tun {
 						bufs = buildTUNWriteBuffers(nextTun, packets, bufs)
-						_, err = nextTun.device.Write(bufs, nextTun.writeOffset)
+						err = writeTUNBuffers(nextTun, bufs)
 					}
 				}
 			}
@@ -654,66 +715,101 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 }
 
 func (device *Device) DeterminePacketTypeAndPadding(packet []byte, expectedType uint32) (uint32, int) {
-	size := len(packet)
-	foundType := uint32(MessageUnknownType)
-	foundPadding := 0
-	device.visitAmneziaWGSnapshots(func(amnezia amneziaWGSnapshot) bool {
-		if expectedType == MessageUnknownType || expectedType == MessageInitiationType {
-			padding := amnezia.paddings.init
-			if size == padding+MessageInitiationSize && size >= padding+4 && amnezia.headers.init.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-				foundType = MessageInitiationType
-				foundPadding = padding
-				return true
-			}
-		}
-		if expectedType == MessageUnknownType || expectedType == MessageResponseType {
-			padding := amnezia.paddings.response
-			if size == padding+MessageResponseSize && size >= padding+4 && amnezia.headers.response.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-				foundType = MessageResponseType
-				foundPadding = padding
-				return true
-			}
-		}
-		if expectedType == MessageUnknownType || expectedType == MessageCookieReplyType {
-			padding := amnezia.paddings.cookie
-			if size == padding+MessageCookieReplySize && size >= padding+4 && amnezia.headers.cookie.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-				foundType = MessageCookieReplyType
-				foundPadding = padding
-				return true
-			}
-		}
-		if expectedType == MessageUnknownType || expectedType == MessageTransportType {
-			padding := amnezia.paddings.transport
-			if size >= padding+MessageTransportHeaderSize && size >= padding+4 && amnezia.headers.transport.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-				foundType = MessageTransportType
-				foundPadding = padding
-				return true
-			}
-		}
-		return false
-	})
-
-	if foundType != MessageUnknownType {
-		return foundType, foundPadding
-	}
-
-	return MessageUnknownType, 0
+	msgType, padding, _ := device.determinePacketTypeAndPadding(packet, expectedType)
+	return msgType, padding
 }
 
-func (device *Device) visitAmneziaWGSnapshots(fn func(amneziaWGSnapshot) bool) {
-	if fn(device.amneziaWGSnapshot()) {
-		return
+func (device *Device) determinePacketTypeAndPadding(packet []byte, expectedType uint32) (uint32, int, amneziaWGSnapshot) {
+	size := len(packet)
+	classifier := device.amneziaReceiveClassifier.Load()
+	if classifier == nil {
+		amnezia := device.amneziaWGSnapshot()
+		if msgType, padding, ok := classifyAmneziaWGPacket(packet, size, expectedType, amnezia); ok {
+			return msgType, padding, amnezia
+		}
+		return MessageUnknownType, 0, amneziaWGSnapshot{}
 	}
 
-	device.peers.RLock()
-	defer device.peers.RUnlock()
-	for _, peer := range device.peers.keyMap {
-		snapshot := peer.amnezia.snapshot.Load()
-		if snapshot == nil {
-			continue
-		}
-		if fn(*snapshot) {
-			return
+	if candidate, ok := classifier.classify(packet, expectedType); ok {
+		return candidate.msgType, candidate.padding, candidate.amnezia
+	}
+	return MessageUnknownType, 0, amneziaWGSnapshot{}
+}
+
+// classify checks only candidates that can match the packet size and header
+// value. The work per unauthenticated datagram stays bounded by the number of
+// valid header offsets, not by the number of configured peer profiles.
+func (classifier *amneziaWGReceiveClassifier) classify(packet []byte, expectedType uint32) (amneziaWGReceiveCandidate, bool) {
+	size := len(packet)
+	var best amneziaWGReceiveCandidate
+	found := false
+
+	if expectedType == MessageUnknownType ||
+		expectedType == MessageInitiationType ||
+		expectedType == MessageResponseType ||
+		expectedType == MessageCookieReplyType {
+		for padding, index := range classifier.fixedBySize[size] {
+			if padding+4 > size {
+				continue
+			}
+			header := binary.LittleEndian.Uint32(packet[padding:])
+			candidate, ok := index.lookup(header, expectedType)
+			if ok && (!found || candidate.order < best.order) {
+				best = candidate
+				found = true
+			}
 		}
 	}
+
+	if expectedType == MessageUnknownType || expectedType == MessageTransportType {
+		maxPadding := size - MessageTransportHeaderSize
+		if maxPadding > maxAmneziaWGTransportPaddingSize {
+			maxPadding = maxAmneziaWGTransportPaddingSize
+		}
+		for padding := 0; padding <= maxPadding; padding++ {
+			index := &classifier.transportByPadding[padding]
+			if index.empty() {
+				continue
+			}
+			header := binary.LittleEndian.Uint32(packet[padding:])
+			candidate, ok := index.lookup(header, expectedType)
+			if ok && (!found || candidate.order < best.order) {
+				best = candidate
+				found = true
+			}
+		}
+	}
+
+	return best, found
+}
+
+func classifyAmneziaWGPacket(packet []byte, size int, expectedType uint32, amnezia amneziaWGSnapshot) (uint32, int, bool) {
+	if expectedType == MessageUnknownType || expectedType == MessageInitiationType {
+		padding := amnezia.paddings.init
+		if amnezia.headers.init != nil && size == padding+MessageInitiationSize && size >= padding+4 && amnezia.headers.init.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+			return MessageInitiationType, padding, true
+		}
+	}
+	if expectedType == MessageUnknownType || expectedType == MessageResponseType {
+		padding := amnezia.paddings.response
+		if amnezia.headers.response != nil && size == padding+MessageResponseSize && size >= padding+4 && amnezia.headers.response.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+			return MessageResponseType, padding, true
+		}
+	}
+	if expectedType == MessageUnknownType || expectedType == MessageCookieReplyType {
+		padding := amnezia.paddings.cookie
+		if amnezia.headers.cookie != nil && size == padding+MessageCookieReplySize && size >= padding+4 && amnezia.headers.cookie.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+			return MessageCookieReplyType, padding, true
+		}
+	}
+	if expectedType == MessageUnknownType || expectedType == MessageTransportType {
+		padding := amnezia.paddings.transport
+		if amnezia.headers.transport != nil && size >= padding+MessageTransportHeaderSize && size >= padding+4 && amnezia.headers.transport.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
+			return MessageTransportType, padding, true
+		}
+		if padding > 0 && amnezia.headers.transport != nil && size >= MessageTransportHeaderSize && amnezia.headers.transport.Validate(binary.LittleEndian.Uint32(packet)) {
+			return MessageTransportType, 0, true
+		}
+	}
+	return MessageUnknownType, 0, false
 }

@@ -18,6 +18,12 @@ import (
 	conn "github.com/asciimoth/batchudp"
 )
 
+// DeviceConfig is a complete device configuration snapshot.
+//
+// Config returns this type with current state. ApplyConfig uses the same type as
+// desired state, but it ignores peer runtime fields such as byte counters and
+// handshake time. Use DefaultAmneziaWGConfig when you build a config manually;
+// the zero AmneziaWGConfig value is not a valid complete profile.
 type DeviceConfig struct {
 	PrivateKey NoisePrivateKey
 	ListenPort uint16
@@ -26,6 +32,11 @@ type DeviceConfig struct {
 	Peers      []PeerConfig
 }
 
+// PeerConfig is a peer configuration snapshot.
+//
+// PublicKey identifies the peer. LastHandshakeTime, TxBytes, and RxBytes are
+// runtime output fields from Config and PeerConfig. ApplyConfig does not write
+// those runtime fields back to the device.
 type PeerConfig struct {
 	PublicKey                   NoisePublicKey
 	PresharedKey                NoisePresharedKey
@@ -39,12 +50,21 @@ type PeerConfig struct {
 	AmneziaWG                   *AmneziaWGConfig
 }
 
+// ApplyConfigOptions controls how ApplyConfig reconciles peers and endpoints.
 type ApplyConfigOptions struct {
-	ReplacePeers   bool
+	// ReplacePeers removes peers that are not present in DeviceConfig.Peers.
+	ReplacePeers bool
+	// ApplyEndpoints applies PeerConfig.Endpoint values. When false, existing
+	// endpoints stay unchanged.
 	ApplyEndpoints bool
-	ActivatePeers  bool
+	// ActivatePeers starts configured peers when the device is up.
+	ActivatePeers bool
 }
 
+// AmneziaWGConfigPatch is a partial AmneziaWG update.
+//
+// Nil fields mean "leave unchanged". A nil InitiationPackets entry leaves that
+// packet spec unchanged. A non-nil empty string clears that packet spec.
 type AmneziaWGConfigPatch struct {
 	JunkCount         *int
 	JunkMin           *int
@@ -94,6 +114,9 @@ func ValidateConfigWithOptions(cfg DeviceConfig, opts ValidationOptions) error {
 		if err := validatePeerConfig(peer, opts); err != nil {
 			return fmt.Errorf("peer %s: %w", validationPeerName(peer.PublicKey), err)
 		}
+	}
+	if err := validateDeviceConfigAmneziaWGReceiveProfiles(cfg); err != nil {
+		return err
 	}
 	return nil
 }
@@ -166,26 +189,32 @@ func validateAmneziaWGConfigPatch(patch ipcSetAmneziaWG) error {
 	for _, field := range []struct {
 		name  string
 		value *int
+		max   int
 	}{
-		{"junk count", patch.junkCount},
-		{"junk min", patch.junkMin},
-		{"junk max", patch.junkMax},
+		{"junk count", patch.junkCount, maxAmneziaWGJunkCount},
+		{"junk min", patch.junkMin, maxAmneziaWGJunkSize},
+		{"junk max", patch.junkMax, maxAmneziaWGJunkSize},
 	} {
-		if field.value != nil && *field.value < 0 {
-			return fmt.Errorf("%s must be non-negative", field.name)
+		if field.value != nil {
+			if err := validateAmneziaWGNonNegativeField(field.name, *field.value, field.max); err != nil {
+				return err
+			}
 		}
 	}
 	for _, field := range []struct {
 		name  string
 		value *int
+		max   int
 	}{
-		{"init padding", patch.initPadding},
-		{"response padding", patch.responsePadding},
-		{"cookie padding", patch.cookiePadding},
-		{"transport padding", patch.transportPadding},
+		{"init padding", patch.initPadding, maxAmneziaWGHandshakePaddingSize},
+		{"response padding", patch.responsePadding, MaxMessageSize - MessageResponseSize},
+		{"cookie padding", patch.cookiePadding, MaxMessageSize - MessageCookieReplySize},
+		{"transport padding", patch.transportPadding, maxAmneziaWGTransportPaddingSize},
 	} {
-		if field.value != nil && *field.value < 0 {
-			return fmt.Errorf("%s must be non-negative", field.name)
+		if field.value != nil {
+			if err := validateAmneziaWGNonNegativeField(field.name, *field.value, field.max); err != nil {
+				return err
+			}
 		}
 	}
 	for _, field := range []struct {
@@ -223,6 +252,17 @@ func validateAmneziaWGConfigPatch(patch ipcSetAmneziaWG) error {
 		}
 		if patch.junkMax != nil && *patch.junkMax <= 0 {
 			return fmt.Errorf("junk max must be positive when junk is enabled")
+		}
+	}
+	if patch.junkMin != nil && patch.junkMax != nil && *patch.junkMin > *patch.junkMax {
+		return fmt.Errorf("junk min must be <= junk max")
+	}
+	for i, chain := range patch.initiationPackets {
+		if !patch.packetSet[i] || chain == nil {
+			continue
+		}
+		if chain.ObfuscatedLen() > maxAmneziaWGInitiationPacketSize {
+			return fmt.Errorf("initiation packet %d length must be <= %d", i+1, maxAmneziaWGInitiationPacketSize)
 		}
 	}
 	return nil
@@ -330,12 +370,11 @@ func (device *Device) ApplyConfig(cfg DeviceConfig, opts ApplyConfigOptions) err
 	if err := device.setFwmarkLocked(cfg.Fwmark); err != nil {
 		return fmt.Errorf("fwmark: %w", err)
 	}
-	if err := device.setAmneziaWGConfigLocked(cfg.AmneziaWG); err != nil {
-		return fmt.Errorf("amneziawg: %w", err)
-	}
-
 	if opts.ReplacePeers {
 		device.RemoveAllPeers()
+	}
+	if err := device.setAmneziaWGConfigLocked(cfg.AmneziaWG); err != nil {
+		return fmt.Errorf("amneziawg: %w", err)
 	}
 
 	for _, peerCfg := range cfg.Peers {
@@ -698,6 +737,9 @@ func (device *Device) setAmneziaWGConfigLocked(cfg AmneziaWGConfig) error {
 	if err := validateAmneziaWGConfig(cfg); err != nil {
 		return err
 	}
+	if err := device.validateAmneziaWGReceiveProfilesForBaseLocked(cfg); err != nil {
+		return err
+	}
 
 	device.junk.count = cfg.JunkCount
 	device.junk.min = cfg.JunkMin
@@ -723,25 +765,38 @@ func (device *Device) setAmneziaWGConfigLocked(cfg AmneziaWGConfig) error {
 	}
 	device.storeAmneziaWGSnapshot()
 	device.refreshPeerAmneziaWGSnapshotsLocked()
+	device.storeAmneziaWGReceiveClassifier()
 	return nil
 }
 
 func validateAmneziaWGConfig(cfg AmneziaWGConfig) error {
-	if cfg.JunkCount < 0 {
-		return fmt.Errorf("junk count must be non-negative")
+	if err := validateAmneziaWGNonNegativeField("junk count", cfg.JunkCount, maxAmneziaWGJunkCount); err != nil {
+		return err
 	}
-	if cfg.JunkMin < 0 {
-		return fmt.Errorf("junk min must be non-negative")
+	if err := validateAmneziaWGNonNegativeField("junk min", cfg.JunkMin, maxAmneziaWGJunkSize); err != nil {
+		return err
 	}
-	if cfg.JunkMax < 0 {
-		return fmt.Errorf("junk max must be non-negative")
+	if err := validateAmneziaWGNonNegativeField("junk max", cfg.JunkMax, maxAmneziaWGJunkSize); err != nil {
+		return err
+	}
+	if cfg.JunkMin > cfg.JunkMax {
+		return fmt.Errorf("junk min must be <= junk max")
 	}
 	if cfg.JunkCount > 0 && (cfg.JunkMin <= 0 || cfg.JunkMax <= 0) {
 		return fmt.Errorf("junk min and max must be positive when junk is enabled")
 	}
-	for _, padding := range []int{cfg.InitPadding, cfg.ResponsePadding, cfg.CookiePadding, cfg.TransportPadding} {
-		if padding < 0 {
-			return fmt.Errorf("padding values must be non-negative")
+	for _, field := range []struct {
+		name  string
+		value int
+		max   int
+	}{
+		{"init padding", cfg.InitPadding, maxAmneziaWGHandshakePaddingSize},
+		{"response padding", cfg.ResponsePadding, MaxMessageSize - MessageResponseSize},
+		{"cookie padding", cfg.CookiePadding, MaxMessageSize - MessageCookieReplySize},
+		{"transport padding", cfg.TransportPadding, maxAmneziaWGTransportPaddingSize},
+	} {
+		if err := validateAmneziaWGNonNegativeField(field.name, field.value, field.max); err != nil {
+			return err
 		}
 	}
 	headers := []AmneziaWGHeaderRange{
@@ -768,9 +823,27 @@ func validateAmneziaWGConfig(cfg AmneziaWGConfig) error {
 		if spec == "" {
 			continue
 		}
-		if _, err := newObfChain(spec); err != nil {
+		chain, err := newObfChain(spec)
+		if err != nil {
 			return fmt.Errorf("parse initiation packet %d: %w", i+1, err)
 		}
+		if chain.ObfuscatedLen() > maxAmneziaWGInitiationPacketSize {
+			return fmt.Errorf("initiation packet %d length must be <= %d", i+1, maxAmneziaWGInitiationPacketSize)
+		}
+	}
+	return nil
+}
+
+func validateAmneziaWGGeneratedLength(length int) error {
+	return validateAmneziaWGNonNegativeField("generated length", length, maxAmneziaWGInitiationPacketSize)
+}
+
+func validateAmneziaWGNonNegativeField(name string, value, max int) error {
+	if value < 0 {
+		return fmt.Errorf("%s must be non-negative", name)
+	}
+	if value > max {
+		return fmt.Errorf("%s must be <= %d", name, max)
 	}
 	return nil
 }
@@ -843,10 +916,14 @@ func (device *Device) setPeerAmneziaWGConfigLocked(publicKey NoisePublicKey, cfg
 	if cfg == nil {
 		peer.amnezia.override = ipcSetAmneziaWG{}
 		peer.amnezia.snapshot.Store(nil)
+		device.storeAmneziaWGReceiveClassifier()
 		return nil
 	}
 
 	if err := validateAmneziaWGConfig(*cfg); err != nil {
+		return err
+	}
+	if err := device.validateAmneziaWGReceiveProfilesForPeerConfigLocked(peer, *cfg); err != nil {
 		return err
 	}
 
@@ -875,18 +952,37 @@ func (device *Device) setPeerAmneziaWGConfigLocked(publicKey NoisePublicKey, cfg
 		override.initiationPackets[i] = chain
 	}
 	peer.amnezia.override = override
-	return device.refreshPeerAmneziaWGSnapshotLocked(peer)
+	if err := device.refreshPeerAmneziaWGSnapshotLocked(peer); err != nil {
+		return err
+	}
+	device.storeAmneziaWGReceiveClassifier()
+	return nil
 }
 
 func (device *Device) setPeerAmneziaWGConfigPatchLocked(peer *Peer, override ipcSetAmneziaWG) error {
 	if !override.hasValues() {
 		peer.amnezia.override = ipcSetAmneziaWG{}
 		peer.amnezia.snapshot.Store(nil)
+		device.storeAmneziaWGReceiveClassifier()
 		return nil
 	}
 
+	previous := peer.amnezia.override
 	peer.amnezia.override = override
-	return device.refreshPeerAmneziaWGSnapshotLocked(peer)
+	if err := device.refreshPeerAmneziaWGSnapshotLocked(peer); err != nil {
+		peer.amnezia.override = previous
+		_ = device.refreshPeerAmneziaWGSnapshotLocked(peer)
+		device.storeAmneziaWGReceiveClassifier()
+		return err
+	}
+	if err := device.validateCurrentAmneziaWGReceiveProfilesLocked(); err != nil {
+		peer.amnezia.override = previous
+		_ = device.refreshPeerAmneziaWGSnapshotLocked(peer)
+		device.storeAmneziaWGReceiveClassifier()
+		return err
+	}
+	device.storeAmneziaWGReceiveClassifier()
+	return nil
 }
 
 func (device *Device) replacePeerAllowedIPsLocked(publicKey NoisePublicKey, allowedIPs []netip.Prefix) error {
@@ -1038,4 +1134,88 @@ func (device *Device) refreshPeerAmneziaWGSnapshotLocked(peer *Peer) error {
 	}
 	peer.amnezia.snapshot.Store(&snapshot)
 	return nil
+}
+
+func validateDeviceConfigAmneziaWGReceiveProfiles(cfg DeviceConfig) error {
+	profiles := []amneziaWGSnapshot{amneziaWGSnapshotFromConfig(cfg.AmneziaWG)}
+	for _, peer := range cfg.Peers {
+		if peer.AmneziaWG == nil {
+			continue
+		}
+		profiles = append(profiles, amneziaWGSnapshotFromConfig(*peer.AmneziaWG))
+	}
+	return validateAmneziaWGReceiveProfiles(profiles)
+}
+
+func (device *Device) validateAmneziaWGReceiveProfilesForBaseLocked(cfg AmneziaWGConfig) error {
+	profiles := []amneziaWGSnapshot{amneziaWGSnapshotFromConfig(cfg)}
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+	for _, peer := range device.peers.keyMap {
+		if !peer.amnezia.override.hasValues() {
+			continue
+		}
+		effective := cfg
+		peer.amnezia.override.merge(&effective)
+		if err := validateAmneziaWGConfig(effective); err != nil {
+			return err
+		}
+		profiles = append(profiles, amneziaWGSnapshotFromConfig(effective))
+	}
+	return validateAmneziaWGReceiveProfiles(profiles)
+}
+
+func (device *Device) validateAmneziaWGReceiveProfilesForPeerConfigLocked(target *Peer, cfg AmneziaWGConfig) error {
+	profiles := []amneziaWGSnapshot{device.amneziaWGSnapshot()}
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+	for _, peer := range device.peers.keyMap {
+		if peer == target {
+			profiles = append(profiles, amneziaWGSnapshotFromConfig(cfg))
+			continue
+		}
+		snapshot := peer.amnezia.snapshot.Load()
+		if snapshot != nil {
+			profiles = append(profiles, *snapshot)
+		}
+	}
+	return validateAmneziaWGReceiveProfiles(profiles)
+}
+
+func (device *Device) validateCurrentAmneziaWGReceiveProfilesLocked() error {
+	profiles := []amneziaWGSnapshot{device.amneziaWGSnapshot()}
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+	for _, peer := range device.peers.keyMap {
+		snapshot := peer.amnezia.snapshot.Load()
+		if snapshot != nil {
+			profiles = append(profiles, *snapshot)
+		}
+	}
+	return validateAmneziaWGReceiveProfiles(profiles)
+}
+
+func amneziaWGSnapshotFromConfig(cfg AmneziaWGConfig) amneziaWGSnapshot {
+	var snapshot amneziaWGSnapshot
+	snapshot.junk.count = cfg.JunkCount
+	snapshot.junk.min = cfg.JunkMin
+	snapshot.junk.max = cfg.JunkMax
+	snapshot.headers.init = &magicHeader{start: cfg.InitHeader.Start, end: cfg.InitHeader.End}
+	snapshot.headers.response = &magicHeader{start: cfg.ResponseHeader.Start, end: cfg.ResponseHeader.End}
+	snapshot.headers.cookie = &magicHeader{start: cfg.CookieHeader.Start, end: cfg.CookieHeader.End}
+	snapshot.headers.transport = &magicHeader{start: cfg.TransportHeader.Start, end: cfg.TransportHeader.End}
+	snapshot.paddings.init = cfg.InitPadding
+	snapshot.paddings.response = cfg.ResponsePadding
+	snapshot.paddings.cookie = cfg.CookiePadding
+	snapshot.paddings.transport = cfg.TransportPadding
+	for i, spec := range cfg.InitiationPackets {
+		if spec == "" {
+			continue
+		}
+		chain, err := newObfChain(spec)
+		if err == nil {
+			snapshot.ipackets[i] = chain
+		}
+	}
+	return snapshot
 }

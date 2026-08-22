@@ -212,7 +212,10 @@ func (peer *Peer) SendHandshakeResponse() error {
 
 func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
 	device.log.Debugf("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
-	amnezia := device.amneziaWGSnapshot()
+	amnezia := initiatingElem.amnezia
+	if amnezia.headers.cookie == nil {
+		amnezia = device.amneziaWGSnapshot()
+	}
 
 	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
 	reply, err := device.cookieChecker.CreateReply(

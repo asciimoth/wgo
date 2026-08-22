@@ -116,6 +116,7 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	// add
 	device.peers.keyMap[pk] = peer
 	_ = device.refreshPeerAmneziaWGSnapshotLocked(peer)
+	device.storeAmneziaWGReceiveClassifierLocked()
 	device.signalRuntimeStats()
 
 	return peer, nil
@@ -131,6 +132,7 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	if peer.device.net.bind == nil {
 		return fmt.Errorf("no bind attached")
 	}
+	bind := peer.device.net.bind
 
 	peer.endpoint.Lock()
 	endpoint := peer.endpoint.val
@@ -144,16 +146,28 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	}
 	peer.endpoint.Unlock()
 
-	err := peer.device.net.bind.Send(buffers, endpoint)
-	if err == nil {
+	batchSize := bind.BatchSize()
+	if batchSize < 1 {
+		batchSize = len(buffers)
+	}
+	for len(buffers) > 0 {
+		chunkSize := batchSize
+		if chunkSize > len(buffers) {
+			chunkSize = len(buffers)
+		}
+		chunk := buffers[:chunkSize]
+		if err := bind.Send(chunk, endpoint); err != nil {
+			return err
+		}
 		var totalLen uint64
-		for _, b := range buffers {
+		for _, b := range chunk {
 			totalLen += uint64(len(b))
 		}
 		peer.txBytes.Add(totalLen)
-		peer.device.accountRuntimeStatsTx(totalLen, uint64(len(buffers)))
+		peer.device.accountRuntimeStatsTx(totalLen, uint64(len(chunk)))
+		buffers = buffers[chunkSize:]
 	}
-	return err
+	return nil
 }
 
 func (peer *Peer) rebindEndpoint(bind conn.Bind) error {

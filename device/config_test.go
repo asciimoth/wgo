@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -187,6 +188,39 @@ func TestValidateConfig(t *testing.T) {
 	}
 }
 
+func TestValidateConfigRejectsAmbiguousAmneziaWGPeerProfiles(t *testing.T) {
+	cfg := DeviceConfig{
+		AmneziaWG: DefaultAmneziaWGConfig(),
+		Peers: []PeerConfig{
+			{
+				PublicKey:       mustPrivateKey(t, 101).PublicKey(),
+				ProtocolVersion: 1,
+				AmneziaWG: func() *AmneziaWGConfig {
+					profile := DefaultAmneziaWGConfig()
+					profile.TransportPadding = 8
+					profile.TransportHeader = AmneziaWGHeaderRange{Start: 7000, End: 7010}
+					return &profile
+				}(),
+			},
+			{
+				PublicKey:       mustPrivateKey(t, 102).PublicKey(),
+				ProtocolVersion: 1,
+				AmneziaWG: func() *AmneziaWGConfig {
+					profile := DefaultAmneziaWGConfig()
+					profile.TransportPadding = 12
+					profile.TransportHeader = AmneziaWGHeaderRange{Start: 7010, End: 7020}
+					return &profile
+				}(),
+			},
+		},
+	}
+
+	err := ValidateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "receive profile ambiguity") {
+		t.Fatalf("ValidateConfig(ambiguous profiles) = %v, want receive profile ambiguity", err)
+	}
+}
+
 func TestValidateConfigWithOptionsEndpointParser(t *testing.T) {
 	peerPrivateKey := mustPrivateKey(t, 33)
 	peerKey := peerPrivateKey.publicKey()
@@ -273,6 +307,198 @@ func TestValidateAmneziaWGConfigAPI(t *testing.T) {
 	err = ValidateAmneziaWGConfigPatch(patch)
 	if err == nil || !strings.Contains(err.Error(), "parse initiation packet 1") {
 		t.Fatalf("ValidateAmneziaWGConfigPatch(packet) = %v, want packet parse error", err)
+	}
+}
+
+func TestValidateAmneziaWGConfigRejectsUnsafeNumericValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*AmneziaWGConfig)
+		wantErr string
+	}{
+		{
+			name: "junk min greater than max",
+			mutate: func(cfg *AmneziaWGConfig) {
+				cfg.JunkMin = 9
+				cfg.JunkMax = 8
+			},
+			wantErr: "junk min must be <= junk max",
+		},
+		{
+			name: "junk count too large",
+			mutate: func(cfg *AmneziaWGConfig) {
+				cfg.JunkCount = maxAmneziaWGJunkCount + 1
+			},
+			wantErr: "junk count must be <=",
+		},
+		{
+			name: "junk max too large",
+			mutate: func(cfg *AmneziaWGConfig) {
+				cfg.JunkMax = maxAmneziaWGJunkSize + 1
+			},
+			wantErr: "junk max must be <=",
+		},
+		{
+			name: "init padding too large",
+			mutate: func(cfg *AmneziaWGConfig) {
+				cfg.InitPadding = maxAmneziaWGHandshakePaddingSize + 1
+			},
+			wantErr: "init padding must be <=",
+		},
+		{
+			name: "transport padding too large",
+			mutate: func(cfg *AmneziaWGConfig) {
+				cfg.TransportPadding = maxAmneziaWGTransportPaddingSize + 1
+			},
+			wantErr: "transport padding must be <=",
+		},
+		{
+			name: "negative generated packet length",
+			mutate: func(cfg *AmneziaWGConfig) {
+				cfg.InitiationPackets[0] = "<r -1>"
+			},
+			wantErr: "generated length must be non-negative",
+		},
+		{
+			name: "generated packet length too large",
+			mutate: func(cfg *AmneziaWGConfig) {
+				cfg.InitiationPackets[0] = "<rc " + strconv.Itoa(maxAmneziaWGInitiationPacketSize+1) + ">"
+			},
+			wantErr: "generated length must be <=",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultAmneziaWGConfig()
+			tt.mutate(&cfg)
+
+			err := ValidateAmneziaWGConfig(cfg)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("ValidateAmneziaWGConfig() = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateAmneziaWGConfigPatchRejectsUnsafeNumericValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		patch   AmneziaWGConfigPatch
+		wantErr string
+	}{
+		{
+			name: "junk min greater than max",
+			patch: AmneziaWGConfigPatch{
+				JunkMin: intPtr(9),
+				JunkMax: intPtr(8),
+			},
+			wantErr: "junk min must be <= junk max",
+		},
+		{
+			name: "transport padding too large",
+			patch: AmneziaWGConfigPatch{
+				TransportPadding: intPtr(maxAmneziaWGTransportPaddingSize + 1),
+			},
+			wantErr: "transport padding must be <=",
+		},
+		{
+			name: "negative generated packet length",
+			patch: AmneziaWGConfigPatch{
+				InitiationPackets: [amneziaPacketCount]*string{
+					strPtr("<rd -1>"),
+				},
+			},
+			wantErr: "generated length must be non-negative",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateAmneziaWGConfigPatch(tt.patch)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("ValidateAmneziaWGConfigPatch() = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestAmneziaWGUAPIRejectsUnsafeNumericValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		conf    string
+		wantErr string
+	}{
+		{
+			name:    "junk min greater than max",
+			conf:    "jc=1\njmin=9\njmax=8\n",
+			wantErr: "junk min must be <= junk max",
+		},
+		{
+			name:    "negative junk count",
+			conf:    "jc=-1\n",
+			wantErr: "jc must be non-negative",
+		},
+		{
+			name:    "transport padding too large",
+			conf:    "s4=" + strconv.Itoa(maxAmneziaWGTransportPaddingSize+1) + "\n",
+			wantErr: "s4 must be <=",
+		},
+		{
+			name:    "negative generated packet length",
+			conf:    "i1=<r -1>\n",
+			wantErr: "generated length must be non-negative",
+		},
+		{
+			name:    "generated packet length too large",
+			conf:    "i1=<rc " + strconv.Itoa(maxAmneziaWGInitiationPacketSize+1) + ">\n",
+			wantErr: "generated length must be <=",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
+			t.Cleanup(dev.Close)
+
+			err := dev.IpcSet(tt.conf)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("IpcSet() = %v, want %q", err, tt.wantErr)
+			}
+			if got, want := dev.AmneziaWGConfig(), DefaultAmneziaWGConfig(); got != want {
+				t.Fatalf("AmneziaWGConfig() after rejected IpcSet = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestAmneziaWGUAPIAcceptsZeroJunkValues(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
+	t.Cleanup(dev.Close)
+
+	cfg := DefaultAmneziaWGConfig()
+	cfg.JunkCount = 2
+	cfg.JunkMin = 11
+	cfg.JunkMax = 23
+	if err := dev.SetAmneziaWGConfig(cfg); err != nil {
+		t.Fatalf("SetAmneziaWGConfig: %v", err)
+	}
+
+	if err := dev.IpcSet("jc=0\njmin=0\njmax=0\n"); err != nil {
+		t.Fatalf("IpcSet(clear junk): %v", err)
+	}
+	got := dev.AmneziaWGConfig()
+	if got.JunkCount != 0 || got.JunkMin != 0 || got.JunkMax != 0 {
+		t.Fatalf("AmneziaWGConfig() junk = (%d, %d, %d), want all zero", got.JunkCount, got.JunkMin, got.JunkMax)
+	}
+
+	err := dev.IpcSet("jc=1\njmin=0\njmax=0\n")
+	if err == nil || !strings.Contains(err.Error(), "junk min and max must be positive") {
+		t.Fatalf("IpcSet(enable junk with zero bounds) = %v, want positive bounds error", err)
+	}
+	got = dev.AmneziaWGConfig()
+	if got.JunkCount != 0 || got.JunkMin != 0 || got.JunkMax != 0 {
+		t.Fatalf("AmneziaWGConfig() after rejected IpcSet = (%d, %d, %d), want all zero", got.JunkCount, got.JunkMin, got.JunkMax)
 	}
 }
 
@@ -399,6 +625,7 @@ func TestDeviceTypedConfigMethodErrors(t *testing.T) {
 			JunkMin:          intPtr(30),
 			JunkMax:          intPtr(40),
 			InitHeader:       headerPtr(AmneziaWGHeaderRange{Start: 9000, End: 9001}),
+			TransportHeader:  headerPtr(AmneziaWGHeaderRange{Start: 9100, End: 9100}),
 			TransportPadding: intPtr(11),
 			InitiationPackets: [amneziaPacketCount]*string{
 				nil,
@@ -430,6 +657,9 @@ func TestDeviceTypedConfigMethodErrors(t *testing.T) {
 		}
 		if gotPatch.InitHeader == nil || *gotPatch.InitHeader != (AmneziaWGHeaderRange{Start: 9000, End: 9001}) {
 			t.Fatalf("PeerAmneziaWGConfigOverride() InitHeader = %+v, want 9000-9001", gotPatch.InitHeader)
+		}
+		if gotPatch.TransportHeader == nil || *gotPatch.TransportHeader != (AmneziaWGHeaderRange{Start: 9100, End: 9100}) {
+			t.Fatalf("PeerAmneziaWGConfigOverride() TransportHeader = %+v, want 9100", gotPatch.TransportHeader)
 		}
 		if gotPatch.TransportPadding == nil || *gotPatch.TransportPadding != 11 {
 			t.Fatalf("PeerAmneziaWGConfigOverride() TransportPadding = %+v, want 11", gotPatch.TransportPadding)

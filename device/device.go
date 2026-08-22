@@ -143,7 +143,8 @@ type Device struct {
 
 	ipackets [amneziaPacketCount]*obfChain
 
-	amneziaSnapshot atomic.Pointer[amneziaWGSnapshot]
+	amneziaSnapshot          atomic.Pointer[amneziaWGSnapshot]
+	amneziaReceiveClassifier atomic.Pointer[amneziaWGReceiveClassifier]
 }
 
 const defaultDeviceBatchSize = 256
@@ -345,12 +346,17 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	// remove peers with matching public keys
 
 	publicKey := sk.publicKey()
+	removedPeer := false
 	for key, peer := range device.peers.keyMap {
 		if peer.handshake.remoteStatic.Equals(publicKey) {
 			peer.handshake.mutex.RUnlock()
 			removePeerLocked(device, peer, key)
+			removedPeer = true
 			peer.handshake.mutex.RLock()
 		}
+	}
+	if removedPeer {
+		device.storeAmneziaWGReceiveClassifierLocked()
 	}
 
 	// update key material
@@ -494,6 +500,7 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger, spawner gonnec
 	device.headers.cookie = &magicHeader{start: MessageCookieReplyType, end: MessageCookieReplyType}
 	device.headers.transport = &magicHeader{start: MessageTransportType, end: MessageTransportType}
 	device.storeAmneziaWGSnapshot()
+	device.storeAmneziaWGReceiveClassifierLocked()
 
 	device.PopulatePools()
 
@@ -547,6 +554,7 @@ func (device *Device) RemovePeer(key NoisePublicKey) {
 	peer, ok := device.peers.keyMap[key]
 	if ok {
 		removePeerLocked(device, peer, key)
+		device.storeAmneziaWGReceiveClassifierLocked()
 	}
 }
 
@@ -559,6 +567,7 @@ func (device *Device) RemoveAllPeers() {
 	}
 
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
+	device.storeAmneziaWGReceiveClassifierLocked()
 }
 
 func (device *Device) Close() {
@@ -796,7 +805,8 @@ func (device *Device) currentTUN() *tunState {
 }
 
 // ReplaceTUN atomically swaps the active TUN attachment.
-// The old TUN is closed to unblock its reader before the new one takes over.
+// The new TUN becomes active before the old TUN is closed. This lets inbound
+// delivery retry against the new attachment if a write races the swap.
 func (device *Device) ReplaceTUN(tunDevice gtun.Tun) error {
 	tunState, err := newTunState(tunDevice)
 	if err != nil {

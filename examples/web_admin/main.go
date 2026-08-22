@@ -32,7 +32,10 @@ import (
 	"golang.org/x/crypto/curve25519"
 )
 
-const defaultMTU = 1420
+const (
+	defaultMTU     = 1420
+	redactedSecret = "<redacted>"
+)
 
 func main() {
 	app, err := newAdminApp()
@@ -221,6 +224,7 @@ func newAdminApp() (*adminApp, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", app.handleIndex)
 	mux.HandleFunc("/api/state", app.handleState)
+	mux.HandleFunc("/api/export", app.handleExport)
 	mux.HandleFunc("/api/device", app.handleDeviceUpdate)
 	mux.HandleFunc("/api/device/amnezia", app.handleAmneziaUpdate)
 	mux.HandleFunc("/api/peers/apply", app.handlePeerApply)
@@ -325,6 +329,15 @@ func (a *adminApp) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a.snapshot())
+}
+
+func (a *adminApp) handleExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	a.logPanelAction("state.export", "include_secrets=true")
+	writeJSON(w, http.StatusOK, a.secretSnapshot())
 }
 
 func (a *adminApp) logPanelAction(action, format string, args ...any) {
@@ -1025,11 +1038,19 @@ func (a *adminApp) detachBind() error {
 }
 
 func (a *adminApp) snapshot() appState {
+	return a.snapshotWithSecrets(false)
+}
+
+func (a *adminApp) secretSnapshot() appState {
+	return a.snapshotWithSecrets(true)
+}
+
+func (a *adminApp) snapshotWithSecrets(includeSecrets bool) appState {
 	cfg := a.dev.Config()
 
 	state := appState{
 		Device: deviceStateSummary{
-			PrivateKey: encodePrivateKey(cfg.PrivateKey),
+			PrivateKey: summarizePrivateKey(cfg.PrivateKey, includeSecrets),
 			ListenPort: cfg.ListenPort,
 			Fwmark:     cfg.Fwmark,
 			AmneziaWG:  summarizeAmneziaConfig(cfg.AmneziaWG),
@@ -1044,7 +1065,7 @@ func (a *adminApp) snapshot() appState {
 		}
 		summary := peerStateSummary{
 			PublicKey:                   hex.EncodeToString(peer.PublicKey[:]),
-			PresharedKey:                hex.EncodeToString(peer.PresharedKey[:]),
+			PresharedKey:                summarizePresharedKey(peer.PresharedKey, includeSecrets),
 			ProtocolVersion:             peer.ProtocolVersion,
 			Endpoint:                    peer.Endpoint,
 			LastHandshakeTime:           peer.LastHandshakeTime.UTC().Format(time.RFC3339Nano),
@@ -1212,6 +1233,27 @@ func parsePrefixes(src []string) ([]netip.Prefix, error) {
 func encodePrivateKey(key device.NoisePrivateKey) string {
 	if key.IsZero() {
 		return ""
+	}
+	return hex.EncodeToString(key[:])
+}
+
+func summarizePrivateKey(key device.NoisePrivateKey, includeSecret bool) string {
+	if key.IsZero() {
+		return ""
+	}
+	if !includeSecret {
+		return redactedSecret
+	}
+	return encodePrivateKey(key)
+}
+
+func summarizePresharedKey(key device.NoisePresharedKey, includeSecret bool) string {
+	var zero device.NoisePresharedKey
+	if key == zero {
+		return ""
+	}
+	if !includeSecret {
+		return redactedSecret
 	}
 	return hex.EncodeToString(key[:])
 }
@@ -1641,6 +1683,7 @@ pre {
 
     <section class="panel" style="grid-column: 1 / -1;">
       <h2>State</h2>
+      <button class="ghost" onclick="exportState()">Export credentials to state view</button>
       <pre id="state"></pre>
     </section>
   </div>
@@ -1678,6 +1721,16 @@ async function refresh() {
   const res = await fetch('/api/state');
   const data = await res.json();
   stateEl.textContent = JSON.stringify(data, null, 2);
+}
+
+async function exportState() {
+  try {
+    const data = await post('/api/export', {});
+    stateEl.textContent = JSON.stringify(data, null, 2);
+    showMessage('credential export loaded into state view', false);
+  } catch (err) {
+    showMessage(err.message, true);
+  }
 }
 
 function showMessage(text, isError) {

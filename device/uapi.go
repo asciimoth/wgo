@@ -251,66 +251,45 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 func handleAmneziaLine(key, value string, amnezia *ipcSetAmneziaWG) (bool, error) {
 	switch key {
 	case "jc":
-		jc, err := strconv.Atoi(value)
+		jc, err := parseNonNegativeAmneziaUAPIValue("jc", value, maxAmneziaWGJunkCount)
 		if err != nil {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse jc: %w", err)
-		}
-		if jc <= 0 {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "jc must be a positive value")
+			return true, err
 		}
 		amnezia.junkCount = &jc
 	case "jmin":
-		jmin, err := strconv.Atoi(value)
+		jmin, err := parseNonNegativeAmneziaUAPIValue("jmin", value, maxAmneziaWGJunkSize)
 		if err != nil {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse jmin: %w", err)
-		}
-		if jmin <= 0 {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "jmin must be a positive value")
+			return true, err
 		}
 		amnezia.junkMin = &jmin
 	case "jmax":
-		jmax, err := strconv.Atoi(value)
+		jmax, err := parseNonNegativeAmneziaUAPIValue("jmax", value, maxAmneziaWGJunkSize)
 		if err != nil {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse jmax: %w", err)
-		}
-		if jmax <= 0 {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "jmax must be a positive value")
+			return true, err
 		}
 		amnezia.junkMax = &jmax
 	case "s1":
-		padding, err := strconv.Atoi(value)
+		padding, err := parseNonNegativeAmneziaUAPIValue("s1", value, maxAmneziaWGHandshakePaddingSize)
 		if err != nil {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse s1: %w", err)
-		}
-		if padding < 0 {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "s1 must be non-negative")
+			return true, err
 		}
 		amnezia.initPadding = &padding
 	case "s2":
-		padding, err := strconv.Atoi(value)
+		padding, err := parseNonNegativeAmneziaUAPIValue("s2", value, MaxMessageSize-MessageResponseSize)
 		if err != nil {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse s2: %w", err)
-		}
-		if padding < 0 {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "s2 must be non-negative")
+			return true, err
 		}
 		amnezia.responsePadding = &padding
 	case "s3":
-		padding, err := strconv.Atoi(value)
+		padding, err := parseNonNegativeAmneziaUAPIValue("s3", value, MaxMessageSize-MessageCookieReplySize)
 		if err != nil {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse s3: %w", err)
-		}
-		if padding < 0 {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "s3 must be non-negative")
+			return true, err
 		}
 		amnezia.cookiePadding = &padding
 	case "s4":
-		padding, err := strconv.Atoi(value)
+		padding, err := parseNonNegativeAmneziaUAPIValue("s4", value, maxAmneziaWGTransportPaddingSize)
 		if err != nil {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse s4: %w", err)
-		}
-		if padding < 0 {
-			return true, ipcErrorf(ipc.IpcErrorInvalid, "s4 must be non-negative")
+			return true, err
 		}
 		amnezia.transportPadding = &padding
 	case "h1":
@@ -350,6 +329,20 @@ func handleAmneziaLine(key, value string, amnezia *ipcSetAmneziaWG) (bool, error
 	}
 
 	return true, nil
+}
+
+func parseNonNegativeAmneziaUAPIValue(name, value string, max int) (int, error) {
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse %s: %w", name, err)
+	}
+	if n < 0 {
+		return 0, ipcErrorf(ipc.IpcErrorInvalid, "%s must be non-negative", name)
+	}
+	if n > max {
+		return 0, ipcErrorf(ipc.IpcErrorInvalid, "%s must be <= %d", name, max)
+	}
+	return n, nil
 }
 
 func (device *Device) handleDeviceLine(key, value string, amnezia *ipcSetAmneziaWG) error {

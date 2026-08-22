@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,17 +22,27 @@ const (
 	amneziaPacketCount = 5
 	chars52            = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	digits10           = "0123456789"
+
+	maxAmneziaWGJunkCount            = 16
+	maxAmneziaWGJunkSize             = MaxMessageSize
+	maxAmneziaWGHandshakePaddingSize = MaxMessageSize - MessageHandshakeSize
+	maxAmneziaWGTransportPaddingSize = MaxTunOffsetHeadroom
+	maxAmneziaWGInitiationPacketSize = MaxMessageSize
 )
 
+// AmneziaWGHeaderRange is an inclusive range for an AmneziaWG message header.
 type AmneziaWGHeaderRange struct {
 	Start uint32
 	End   uint32
 }
 
+// DefaultAmneziaWGHeaderRange returns a single-value range for a WireGuard
+// message type.
 func DefaultAmneziaWGHeaderRange(messageType uint32) AmneziaWGHeaderRange {
 	return AmneziaWGHeaderRange{Start: messageType, End: messageType}
 }
 
+// ParseAmneziaWGHeaderRange parses "n" or "start-end" as an inclusive range.
 func ParseAmneziaWGHeaderRange(spec string) (AmneziaWGHeaderRange, error) {
 	header, err := newMagicHeader(spec)
 	if err != nil {
@@ -40,16 +51,19 @@ func ParseAmneziaWGHeaderRange(spec string) (AmneziaWGHeaderRange, error) {
 	return header.toConfig(), nil
 }
 
+// Validate reports whether value is inside the range.
 func (r AmneziaWGHeaderRange) Validate(value uint32) bool {
 	return r.Start <= value && value <= r.End
 }
 
+// Generate returns a cryptographically random value from the range.
 func (r AmneziaWGHeaderRange) Generate() uint32 {
 	high := int64(r.End - r.Start + 1)
 	n, _ := rand.Int(rand.Reader, big.NewInt(high))
 	return r.Start + uint32(n.Int64())
 }
 
+// Spec returns the UAPI string form for the range.
 func (r AmneziaWGHeaderRange) Spec() string {
 	if r.Start == r.End {
 		return fmt.Sprintf("%d", r.Start)
@@ -57,6 +71,11 @@ func (r AmneziaWGHeaderRange) Spec() string {
 	return fmt.Sprintf("%d-%d", r.Start, r.End)
 }
 
+// AmneziaWGConfig is a complete AmneziaWG obfuscation profile.
+//
+// Use DefaultAmneziaWGConfig to get the plain WireGuard-compatible profile
+// before changing fields. The zero value is not a valid complete profile,
+// because all header ranges default to 0 and therefore overlap.
 type AmneziaWGConfig struct {
 	JunkCount         int
 	JunkMin           int
@@ -72,6 +91,7 @@ type AmneziaWGConfig struct {
 	InitiationPackets [amneziaPacketCount]string
 }
 
+// DefaultAmneziaWGConfig returns a plain WireGuard-compatible profile.
 func DefaultAmneziaWGConfig() AmneziaWGConfig {
 	return AmneziaWGConfig{
 		InitHeader:      DefaultAmneziaWGHeaderRange(MessageInitiationType),
@@ -179,7 +199,11 @@ func newObfChain(spec string) (*obfChain, error) {
 func (c *obfChain) ObfuscatedLen() int {
 	total := 0
 	for _, part := range c.parts {
-		total += part.ObfuscatedLen()
+		length := part.ObfuscatedLen()
+		if length > maxAmneziaWGInitiationPacketSize-total {
+			return maxAmneziaWGInitiationPacketSize + 1
+		}
+		total += length
 	}
 	return total
 }
@@ -246,6 +270,9 @@ func newRandomBytesObf(value string) (obfPart, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateAmneziaWGGeneratedLength(length); err != nil {
+		return nil, err
+	}
 	return randomBytesObf{length: length}, nil
 }
 
@@ -260,6 +287,9 @@ type randomCharsetObf struct {
 func newRandomCharsetObf(value, charset string) (obfPart, error) {
 	length, err := strconv.Atoi(value)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateAmneziaWGGeneratedLength(length); err != nil {
 		return nil, err
 	}
 	return randomCharsetObf{length: length, charset: charset}, nil
@@ -428,6 +458,44 @@ type amneziaWGSnapshot struct {
 	ipackets [amneziaPacketCount]*obfChain
 }
 
+type amneziaWGReceiveClassifier struct {
+	profiles []amneziaWGSnapshot
+
+	// Fixed-size handshake packets are keyed by datagram size first, then by
+	// header offset. This avoids checking profiles that cannot match the size.
+	fixedBySize map[int]map[int]*amneziaWGReceiveHeaderIndex
+
+	// Transport packets have variable content size, so they are keyed by the
+	// only bounded receive-side value: the padding/header offset.
+	transportByPadding [maxAmneziaWGTransportPaddingSize + 1]amneziaWGReceiveHeaderIndex
+}
+
+// amneziaWGReceiveCandidate is a complete classification result for one
+// message header at one padding offset.
+type amneziaWGReceiveCandidate struct {
+	msgType uint32
+	padding int
+	order   int
+	amnezia amneziaWGSnapshot
+}
+
+// amneziaWGReceiveRangeCandidate stores a range candidate plus the largest end
+// value seen so far in its sorted bucket. The prefix maximum lets lookups stop
+// once no earlier range can contain the observed header.
+type amneziaWGReceiveRangeCandidate struct {
+	start     uint32
+	end       uint32
+	maxEnd    uint32
+	candidate amneziaWGReceiveCandidate
+}
+
+// amneziaWGReceiveHeaderIndex maps an observed header value to the profiles
+// that can accept it at one packet offset.
+type amneziaWGReceiveHeaderIndex struct {
+	exact  map[uint32][]amneziaWGReceiveCandidate
+	ranges []amneziaWGReceiveRangeCandidate
+}
+
 func (device *Device) storeAmneziaWGSnapshot() {
 	var snapshot amneziaWGSnapshot
 	snapshot.junk = device.junk
@@ -443,4 +511,276 @@ func (device *Device) amneziaWGSnapshot() amneziaWGSnapshot {
 		return amneziaWGSnapshot{}
 	}
 	return *snapshot
+}
+
+func (device *Device) storeAmneziaWGReceiveClassifier() {
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+	device.storeAmneziaWGReceiveClassifierLocked()
+}
+
+func (device *Device) storeAmneziaWGReceiveClassifierLocked() {
+	profiles := []amneziaWGSnapshot{device.amneziaWGSnapshot()}
+	for _, peer := range device.peers.keyMap {
+		snapshot := peer.amnezia.snapshot.Load()
+		if snapshot == nil || amneziaWGReceiveProfilesContain(profiles, *snapshot) {
+			continue
+		}
+		profiles = append(profiles, *snapshot)
+	}
+	device.amneziaReceiveClassifier.Store(newAmneziaWGReceiveClassifier(profiles))
+}
+
+// newAmneziaWGReceiveClassifier compiles profile snapshots into immutable
+// lookup tables that can be read without locks by the receive path.
+func newAmneziaWGReceiveClassifier(profiles []amneziaWGSnapshot) *amneziaWGReceiveClassifier {
+	classifier := &amneziaWGReceiveClassifier{
+		profiles:    profiles,
+		fixedBySize: make(map[int]map[int]*amneziaWGReceiveHeaderIndex),
+	}
+	for profileIndex, profile := range profiles {
+		baseOrder := profileIndex * 4
+		classifier.addFixedCandidate(profile.headers.init, MessageInitiationType, profile.paddings.init, MessageInitiationSize, baseOrder, profile)
+		classifier.addFixedCandidate(profile.headers.response, MessageResponseType, profile.paddings.response, MessageResponseSize, baseOrder+1, profile)
+		classifier.addFixedCandidate(profile.headers.cookie, MessageCookieReplyType, profile.paddings.cookie, MessageCookieReplySize, baseOrder+2, profile)
+		classifier.addTransportCandidate(profile.headers.transport, profile.paddings.transport, baseOrder+3, profile)
+	}
+	classifier.finalize()
+	return classifier
+}
+
+func (c *amneziaWGReceiveClassifier) addFixedCandidate(header *magicHeader, msgType uint32, padding, messageSize, order int, profile amneziaWGSnapshot) {
+	if header == nil {
+		return
+	}
+	size := padding + messageSize
+	byPadding := c.fixedBySize[size]
+	if byPadding == nil {
+		byPadding = make(map[int]*amneziaWGReceiveHeaderIndex)
+		c.fixedBySize[size] = byPadding
+	}
+	index := byPadding[padding]
+	if index == nil {
+		index = new(amneziaWGReceiveHeaderIndex)
+		byPadding[padding] = index
+	}
+	index.add(header, amneziaWGReceiveCandidate{
+		msgType: msgType,
+		padding: padding,
+		order:   order,
+		amnezia: profile,
+	})
+}
+
+func (c *amneziaWGReceiveClassifier) addTransportCandidate(header *magicHeader, padding, order int, profile amneziaWGSnapshot) {
+	if header == nil || padding < 0 || padding > maxAmneziaWGTransportPaddingSize {
+		return
+	}
+	c.transportByPadding[padding].add(header, amneziaWGReceiveCandidate{
+		msgType: MessageTransportType,
+		padding: padding,
+		order:   order,
+		amnezia: profile,
+	})
+	if padding > 0 {
+		// AmneziaWG S4 padding is not applied to keepalive transport packets.
+		// Index offset 0 too so receive can accept these unpadded packets.
+		c.transportByPadding[0].add(header, amneziaWGReceiveCandidate{
+			msgType: MessageTransportType,
+			padding: 0,
+			order:   order,
+			amnezia: profile,
+		})
+	}
+}
+
+func (c *amneziaWGReceiveClassifier) finalize() {
+	for _, byPadding := range c.fixedBySize {
+		for _, index := range byPadding {
+			index.finalize()
+		}
+	}
+	for i := range c.transportByPadding {
+		c.transportByPadding[i].finalize()
+	}
+}
+
+func (index *amneziaWGReceiveHeaderIndex) add(header *magicHeader, candidate amneziaWGReceiveCandidate) {
+	if header.start == header.end {
+		if index.exact == nil {
+			index.exact = make(map[uint32][]amneziaWGReceiveCandidate)
+		}
+		index.exact[header.start] = append(index.exact[header.start], candidate)
+		return
+	}
+	index.ranges = append(index.ranges, amneziaWGReceiveRangeCandidate{
+		start:     header.start,
+		end:       header.end,
+		candidate: candidate,
+	})
+}
+
+func (index *amneziaWGReceiveHeaderIndex) finalize() {
+	sort.Slice(index.ranges, func(i, j int) bool {
+		if index.ranges[i].start == index.ranges[j].start {
+			return index.ranges[i].end < index.ranges[j].end
+		}
+		return index.ranges[i].start < index.ranges[j].start
+	})
+	var maxEnd uint32
+	for i := range index.ranges {
+		if i == 0 || index.ranges[i].end > maxEnd {
+			maxEnd = index.ranges[i].end
+		}
+		index.ranges[i].maxEnd = maxEnd
+	}
+}
+
+func (index *amneziaWGReceiveHeaderIndex) empty() bool {
+	return len(index.exact) == 0 && len(index.ranges) == 0
+}
+
+func (index *amneziaWGReceiveHeaderIndex) lookup(header uint32, expectedType uint32) (amneziaWGReceiveCandidate, bool) {
+	var best amneziaWGReceiveCandidate
+	found := false
+	for _, candidate := range index.exact[header] {
+		if candidate.matches(expectedType) && (!found || candidate.order < best.order) {
+			best = candidate
+			found = true
+		}
+	}
+
+	limit := sort.Search(len(index.ranges), func(i int) bool {
+		return index.ranges[i].start > header
+	})
+	for i := limit - 1; i >= 0; i-- {
+		rangeCandidate := index.ranges[i]
+		if rangeCandidate.maxEnd < header {
+			break
+		}
+		if rangeCandidate.end < header || !rangeCandidate.candidate.matches(expectedType) {
+			continue
+		}
+		if !found || rangeCandidate.candidate.order < best.order {
+			best = rangeCandidate.candidate
+			found = true
+		}
+	}
+	return best, found
+}
+
+func (candidate amneziaWGReceiveCandidate) matches(expectedType uint32) bool {
+	return expectedType == MessageUnknownType || expectedType == candidate.msgType
+}
+
+func amneziaWGReceiveProfilesContain(profiles []amneziaWGSnapshot, candidate amneziaWGSnapshot) bool {
+	for _, profile := range profiles {
+		if amneziaWGReceiveProfileEqual(profile, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func amneziaWGReceiveProfileEqual(a, b amneziaWGSnapshot) bool {
+	return magicHeaderEqual(a.headers.init, b.headers.init) &&
+		magicHeaderEqual(a.headers.response, b.headers.response) &&
+		magicHeaderEqual(a.headers.cookie, b.headers.cookie) &&
+		magicHeaderEqual(a.headers.transport, b.headers.transport) &&
+		a.paddings == b.paddings
+}
+
+func magicHeaderEqual(a, b *magicHeader) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.start == b.start && a.end == b.end
+}
+
+type amneziaWGReceiveSignature struct {
+	name    string
+	size    int
+	padding int
+	header  *magicHeader
+}
+
+// validateAmneziaWGReceiveProfiles rejects active profile sets where one
+// datagram shape can select a receive candidate with a different strip offset
+// or message type. Identical per-message receive handling is allowed because it
+// cannot change MAC or decrypt input.
+func validateAmneziaWGReceiveProfiles(profiles []amneziaWGSnapshot) error {
+	unique := make([]amneziaWGSnapshot, 0, len(profiles))
+	for _, profile := range profiles {
+		if amneziaWGReceiveProfilesContain(unique, profile) {
+			continue
+		}
+		unique = append(unique, profile)
+	}
+	for i := 0; i < len(unique); i++ {
+		for j := i + 1; j < len(unique); j++ {
+			if err := validateAmneziaWGReceiveProfilePair(unique[i], unique[j]); err != nil {
+				return fmt.Errorf("amneziawg receive profile ambiguity: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// validateAmneziaWGReceiveProfilePair checks ambiguity after each profile has
+// already passed single-profile header validation.
+func validateAmneziaWGReceiveProfilePair(a, b amneziaWGSnapshot) error {
+	for _, left := range amneziaWGReceiveSignatures(a) {
+		for _, right := range amneziaWGReceiveSignatures(b) {
+			if left.isTransport() && right.isTransport() &&
+				a.paddings.transport == b.paddings.transport &&
+				magicHeaderEqual(a.headers.transport, b.headers.transport) {
+				continue
+			}
+			if left.size != right.size {
+				continue
+			}
+			if left.size == -1 {
+				if left.padding != right.padding && magicHeadersOverlap(left.header, right.header) {
+					return fmt.Errorf("%s packet overlaps %s packet", left.name, right.name)
+				}
+				continue
+			}
+			if left.padding != right.padding {
+				return fmt.Errorf("%s packet overlaps %s packet length with different padding", left.name, right.name)
+			}
+			if left.name != right.name && magicHeadersOverlap(left.header, right.header) {
+				return fmt.Errorf("%s packet overlaps %s packet at padding %d", left.name, right.name, left.padding)
+			}
+		}
+	}
+	return nil
+}
+
+func (sig amneziaWGReceiveSignature) isTransport() bool {
+	return sig.name == "transport" || sig.name == "transport keepalive"
+}
+
+func amneziaWGReceiveSignatures(profile amneziaWGSnapshot) []amneziaWGReceiveSignature {
+	signatures := []amneziaWGReceiveSignature{
+		{name: "init", size: profile.paddings.init + MessageInitiationSize, padding: profile.paddings.init, header: profile.headers.init},
+		{name: "response", size: profile.paddings.response + MessageResponseSize, padding: profile.paddings.response, header: profile.headers.response},
+		{name: "cookie", size: profile.paddings.cookie + MessageCookieReplySize, padding: profile.paddings.cookie, header: profile.headers.cookie},
+		{name: "transport", size: -1, padding: profile.paddings.transport, header: profile.headers.transport},
+	}
+	if profile.paddings.transport > 0 {
+		signatures = append(signatures, amneziaWGReceiveSignature{
+			name:    "transport keepalive",
+			size:    -1,
+			padding: 0,
+			header:  profile.headers.transport,
+		})
+	}
+	return signatures
+}
+
+func magicHeadersOverlap(a, b *magicHeader) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.start <= b.end && b.start <= a.end
 }
