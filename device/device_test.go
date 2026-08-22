@@ -952,6 +952,7 @@ type fakeTransitionBind struct {
 	id        string
 	size      int
 	openCount atomic.Int32
+	mark      atomic.Uint32
 }
 
 func (b *fakeTransitionBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
@@ -961,6 +962,7 @@ func (b *fakeTransitionBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPo
 
 func (b *fakeTransitionBind) Close() error { return nil }
 func (b *fakeTransitionBind) SetMark(mark uint32) error {
+	b.mark.Store(mark)
 	return nil
 }
 func (b *fakeTransitionBind) Send(bufs [][]byte, ep conn.Endpoint) error {

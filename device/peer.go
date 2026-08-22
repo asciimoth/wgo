@@ -30,6 +30,8 @@ type Peer struct {
 	endpoint struct {
 		sync.Mutex
 		val            conn.Endpoint
+		transport      TransportID
+		address        string
 		clearSrcOnTx   bool // signal to val.ClearSrc() prior to next packet transmission
 		disableRoaming bool
 	}
@@ -58,6 +60,8 @@ type Peer struct {
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
 	persistentKeepaliveInterval atomic.Uint32
+	activation                  PeerActivationMode
+	revision                    atomic.Uint64
 	amnezia                     struct {
 		override ipcSetAmneziaWG
 		snapshot atomic.Pointer[amneziaWGSnapshot]
@@ -106,9 +110,12 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	// reset endpoint
 	peer.endpoint.Lock()
 	peer.endpoint.val = nil
+	peer.endpoint.transport = DefaultTransportID
+	peer.endpoint.address = ""
 	peer.endpoint.disableRoaming = false
 	peer.endpoint.clearSrcOnTx = false
 	peer.endpoint.Unlock()
+	peer.activation = PeerActivationEager
 
 	// init timers
 	peer.timersInit()
@@ -129,16 +136,18 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	if peer.device.isClosed() {
 		return nil
 	}
-	if peer.device.net.bind == nil {
-		return fmt.Errorf("no bind attached")
-	}
-	bind := peer.device.net.bind
 
 	peer.endpoint.Lock()
 	endpoint := peer.endpoint.val
+	transportID := peer.endpoint.transport
 	if endpoint == nil {
 		peer.endpoint.Unlock()
 		return errors.New("no known endpoint for peer")
+	}
+	bind, err := peer.device.transportBindLocked(transportID)
+	if err != nil {
+		peer.endpoint.Unlock()
+		return err
 	}
 	if peer.endpoint.clearSrcOnTx {
 		endpoint.ClearSrc()
@@ -171,21 +180,37 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 }
 
 func (peer *Peer) rebindEndpoint(bind conn.Bind) error {
+	return peer.rebindEndpointForTransport(DefaultTransportID, bind)
+}
+
+func (peer *Peer) rebindEndpointForTransport(id TransportID, bind conn.Bind) error {
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
 
 	if peer.endpoint.val == nil {
 		return nil
 	}
+	if peer.endpoint.transport != id {
+		return nil
+	}
 	if bind == nil {
 		return nil
 	}
 
-	endpoint, err := bind.ParseEndpoint(peer.endpoint.val.DstToString())
+	address := peer.endpoint.address
+	if address == "" {
+		if id != DefaultTransportID {
+			peer.endpoint.val = nil
+			return nil
+		}
+		address = peer.endpoint.val.DstToString()
+	}
+	endpoint, err := bind.ParseEndpoint(address)
 	if err != nil {
 		return err
 	}
 	peer.endpoint.val = endpoint
+	peer.endpoint.address = address
 	peer.endpoint.clearSrcOnTx = false
 	return nil
 }
@@ -332,14 +357,18 @@ func (peer *Peer) Stop() {
 	peer.device.signalRuntimeStats()
 }
 
-func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
+func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint, transportID TransportID) {
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
 	if peer.endpoint.disableRoaming {
 		return
 	}
+	if peer.endpoint.val != nil && peer.endpoint.transport != transportID {
+		return
+	}
 	peer.endpoint.clearSrcOnTx = false
 	peer.endpoint.val = endpoint
+	peer.endpoint.transport = transportID
 }
 
 func (peer *Peer) markEndpointSrcForClearing() {

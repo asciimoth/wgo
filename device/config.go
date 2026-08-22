@@ -561,6 +561,9 @@ func (device *Device) ActivatePeer(publicKey NoisePublicKey) error {
 	if err != nil {
 		return err
 	}
+	if err := device.checkActivePeerLimitLocked(peer); err != nil {
+		return err
+	}
 	device.activatePeerLocked(peer)
 	return nil
 }
@@ -607,6 +610,9 @@ func (device *Device) applyPeerConfigLocked(cfg PeerConfig, opts ApplyConfigOpti
 		}
 	}
 	if opts.ActivatePeers {
+		if err := device.checkActivePeerLimitLocked(peer); err != nil {
+			return err
+		}
 		device.activatePeerLocked(peer)
 	}
 	return nil
@@ -626,6 +632,9 @@ func (device *Device) activatePeerLocked(peer *Peer) {
 func (device *Device) setListenPortLocked(port uint16) error {
 	device.net.Lock()
 	device.net.port = port
+	if st := device.defaultTransportLocked(); st != nil {
+		st.port = port
+	}
 	device.net.Unlock()
 	return device.BindUpdate()
 }
@@ -861,25 +870,34 @@ func (device *Device) setPeerPresharedKeyLocked(publicKey NoisePublicKey, presha
 }
 
 func (device *Device) setPeerEndpointLocked(publicKey NoisePublicKey, endpoint string) error {
+	return device.setPeerEndpointForTransportLocked(publicKey, DefaultTransportID, endpoint)
+}
+
+func (device *Device) setPeerEndpointForTransportLocked(publicKey NoisePublicKey, transportID TransportID, endpoint string) error {
 	peer, err := device.requirePeerLocked(publicKey)
 	if err != nil {
 		return err
 	}
 
 	device.net.RLock()
-	bind := device.net.bind
+	st := device.net.transports[transportID]
 	device.net.RUnlock()
-	if bind == nil {
-		return fmt.Errorf("failed to set endpoint %v: no bind attached", endpoint)
+	if st == nil || st.bind == nil {
+		if transportID == DefaultTransportID {
+			return fmt.Errorf("failed to set endpoint %v: no bind attached", endpoint)
+		}
+		return fmt.Errorf("%w: %q", ErrTransportNotFound, transportID)
 	}
 
-	parsed, err := bind.ParseEndpoint(endpoint)
+	parsed, err := st.bind.ParseEndpoint(endpoint)
 	if err != nil {
 		return fmt.Errorf("failed to set endpoint %v: %w", endpoint, err)
 	}
 
 	peer.endpoint.Lock()
 	peer.endpoint.val = parsed
+	peer.endpoint.transport = transportID
+	peer.endpoint.address = endpoint
 	peer.endpoint.Unlock()
 	return nil
 }
@@ -996,10 +1014,7 @@ func (device *Device) replacePeerAllowedIPsLocked(publicKey NoisePublicKey, allo
 		}
 	}
 
-	device.allowedips.RemoveByPeer(peer)
-	for _, prefix := range allowedIPs {
-		device.allowedips.Insert(prefix, peer)
-	}
+	device.allowedips.ReplaceForPeer(peer, allowedIPs)
 	return nil
 }
 
@@ -1038,7 +1053,7 @@ func (device *Device) lookupPeerLocked(publicKey NoisePublicKey) *Peer {
 func (device *Device) requirePeerLocked(publicKey NoisePublicKey) (*Peer, error) {
 	peer := device.lookupPeerLocked(publicKey)
 	if peer == nil {
-		return nil, fmt.Errorf("peer not found")
+		return nil, ErrPeerNotFound
 	}
 	return peer, nil
 }
@@ -1055,7 +1070,10 @@ func (device *Device) peerConfigLocked(peer *Peer) PeerConfig {
 
 	peer.endpoint.Lock()
 	if peer.endpoint.val != nil {
-		cfg.Endpoint = peer.endpoint.val.DstToString()
+		cfg.Endpoint = peer.endpoint.address
+		if cfg.Endpoint == "" {
+			cfg.Endpoint = peer.endpoint.val.DstToString()
+		}
 	}
 	peer.endpoint.Unlock()
 

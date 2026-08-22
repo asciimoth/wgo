@@ -35,9 +35,11 @@ type RuntimeStatsThresholds struct {
 type RuntimeStats struct {
 	Timestamp time.Time
 
-	PeerCount          int
-	ActivePeerCount    int
-	ConnectedPeerCount int
+	PeerCount            int
+	ActivePeerCount      int
+	ConnectedPeerCount   int
+	TransportCount       int
+	ActiveTransportCount int
 
 	RxBytes   uint64
 	TxBytes   uint64
@@ -53,6 +55,8 @@ func (stats RuntimeStats) Equal(other RuntimeStats) bool {
 	return stats.PeerCount == other.PeerCount &&
 		stats.ActivePeerCount == other.ActivePeerCount &&
 		stats.ConnectedPeerCount == other.ConnectedPeerCount &&
+		stats.TransportCount == other.TransportCount &&
+		stats.ActiveTransportCount == other.ActiveTransportCount &&
 		stats.RxBytes == other.RxBytes &&
 		stats.TxBytes == other.TxBytes &&
 		stats.RxPackets == other.RxPackets &&
@@ -134,6 +138,15 @@ func (device *Device) RuntimeStats() RuntimeStats {
 		}
 	}
 	device.peers.RUnlock()
+
+	device.net.RLock()
+	stats.TransportCount = len(device.net.transports)
+	for _, st := range device.net.transports {
+		if st.up {
+			stats.ActiveTransportCount++
+		}
+	}
+	device.net.RUnlock()
 
 	return stats
 }

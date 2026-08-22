@@ -52,6 +52,49 @@ func TestRuntimeStatsPeerCounts(t *testing.T) {
 	}
 }
 
+func TestRuntimeStatsTransportCounts(t *testing.T) {
+	dev := NewDevice(nil, &fakeTransitionBind{id: "default", size: 1}, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
+	t.Cleanup(dev.Close)
+
+	stats := dev.RuntimeStats()
+	if stats.TransportCount != 1 || stats.ActiveTransportCount != 0 {
+		t.Fatalf("RuntimeStats() before Up = %+v, want transport=1 active=0", stats)
+	}
+
+	if err := dev.Up(); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	stats = dev.RuntimeStats()
+	if stats.TransportCount != 1 || stats.ActiveTransportCount != 1 {
+		t.Fatalf("RuntimeStats() after Up = %+v, want transport=1 active=1", stats)
+	}
+
+	const transportID TransportID = "test/stats"
+	if err := dev.AddTransport(transportID, TransportConfig{Bind: &fakeTransitionBind{id: "stats", size: 1}}); err != nil {
+		t.Fatalf("AddTransport: %v", err)
+	}
+	stats = dev.RuntimeStats()
+	if stats.TransportCount != 2 || stats.ActiveTransportCount != 2 {
+		t.Fatalf("RuntimeStats() after AddTransport = %+v, want transport=2 active=2", stats)
+	}
+
+	if err := dev.RemoveTransport(transportID); err != nil {
+		t.Fatalf("RemoveTransport: %v", err)
+	}
+	stats = dev.RuntimeStats()
+	if stats.TransportCount != 1 || stats.ActiveTransportCount != 1 {
+		t.Fatalf("RuntimeStats() after RemoveTransport = %+v, want transport=1 active=1", stats)
+	}
+
+	if err := dev.Down(); err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+	stats = dev.RuntimeStats()
+	if stats.TransportCount != 1 || stats.ActiveTransportCount != 0 {
+		t.Fatalf("RuntimeStats() after Down = %+v, want transport=1 active=0", stats)
+	}
+}
+
 func TestRuntimeStatsSubscriptionTrafficThresholds(t *testing.T) {
 	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{})
 	t.Cleanup(dev.Close)

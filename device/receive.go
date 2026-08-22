@@ -22,19 +22,21 @@ import (
 )
 
 type QueueHandshakeElement struct {
-	msgType  uint32
-	amnezia  amneziaWGSnapshot
-	packet   []byte
-	endpoint conn.Endpoint
-	buffer   *[MessageBufferSize]byte
+	msgType     uint32
+	amnezia     amneziaWGSnapshot
+	packet      []byte
+	endpoint    conn.Endpoint
+	transportID TransportID
+	buffer      *[MessageBufferSize]byte
 }
 
 type QueueInboundElement struct {
-	buffer   *[MessageBufferSize]byte
-	packet   []byte
-	counter  uint64
-	keypair  *Keypair
-	endpoint conn.Endpoint
+	buffer      *[MessageBufferSize]byte
+	packet      []byte
+	counter     uint64
+	keypair     *Keypair
+	endpoint    conn.Endpoint
+	transportID TransportID
 }
 
 type QueueInboundElementsContainer struct {
@@ -171,6 +173,7 @@ func (elem *QueueInboundElement) clearPointers() {
 	elem.packet = nil
 	elem.keypair = nil
 	elem.endpoint = nil
+	elem.transportID = DefaultTransportID
 }
 
 /* Called when a new authenticated message has been received
@@ -196,12 +199,16 @@ func (peer *Peer) keepKeyFreshReceiving() {
  * IPv4 and IPv6 (separately)
  */
 func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.ReceiveFunc) {
+	device.routineReceiveIncoming(maxBatchSize, recv, DefaultTransportID, &device.net.stopping)
+}
+
+func (device *Device) routineReceiveIncoming(maxBatchSize int, recv conn.ReceiveFunc, transportID TransportID, stopping *sync.WaitGroup) {
 	recvName := recv.PrettyName()
 	defer func() {
 		device.logWorkerLifecyclef("Routine: receive incoming %s - stopped", recvName)
 		device.queue.decryption.wg.Done()
 		device.queue.handshake.wg.Done()
-		device.net.stopping.Done()
+		stopping.Done()
 	}()
 
 	device.logWorkerLifecyclef("Routine: receive incoming %s - started", recvName)
@@ -308,6 +315,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				elem.buffer = bufsArrs[i]
 				elem.keypair = keypair
 				elem.endpoint = endpoints[i]
+				elem.transportID = transportID
 				elem.counter = 0
 
 				elemsForPeer, ok := elemsByPeer[peer]
@@ -345,11 +353,12 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 			select {
 			case device.queue.handshake.c <- QueueHandshakeElement{
-				msgType:  msgType,
-				amnezia:  amnezia,
-				buffer:   bufsArrs[i],
-				packet:   packet,
-				endpoint: endpoints[i],
+				msgType:     msgType,
+				amnezia:     amnezia,
+				buffer:      bufsArrs[i],
+				packet:      packet,
+				endpoint:    endpoints[i],
+				transportID: transportID,
 			}:
 				bufsArrs[i] = device.GetMessageBuffer()
 				bufs[i] = bufsArrs[i][:]
@@ -522,6 +531,12 @@ func (device *Device) RoutineHandshake(id int) {
 				device.log.Debugf("Received invalid initiation message from %s", elem.endpoint.DstToString())
 				goto skip
 			}
+			if !peer.isRunning.Load() {
+				if err := device.activatePeerForTraffic(peer); err != nil {
+					device.log.Debugf("%v - Failed to activate peer for inbound initiation: %v", peer, err)
+					goto skip
+				}
+			}
 
 			// update timers
 
@@ -529,7 +544,7 @@ func (device *Device) RoutineHandshake(id int) {
 			peer.timersAnyAuthenticatedPacketReceived()
 
 			// update endpoint
-			peer.SetEndpointFromPacket(elem.endpoint)
+			peer.SetEndpointFromPacket(elem.endpoint, elem.transportID)
 
 			device.log.Debugf("%v - Received handshake initiation", peer)
 			peer.rxBytes.Add(uint64(len(elem.packet)))
@@ -558,9 +573,15 @@ func (device *Device) RoutineHandshake(id int) {
 				device.log.Debugf("Received invalid response message from %s", elem.endpoint.DstToString())
 				goto skip
 			}
+			if !peer.isRunning.Load() {
+				if err := device.activatePeerForTraffic(peer); err != nil {
+					device.log.Debugf("%v - Failed to activate peer for inbound response: %v", peer, err)
+					goto skip
+				}
+			}
 
 			// update endpoint
-			peer.SetEndpointFromPacket(elem.endpoint)
+			peer.SetEndpointFromPacket(elem.endpoint, elem.transportID)
 
 			device.log.Debugf("%v - Received handshake response", peer)
 			peer.rxBytes.Add(uint64(len(elem.packet)))
@@ -621,7 +642,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 
 			validTailPacket = i
 			if peer.ReceivedWithKeypair(elem.keypair) {
-				peer.SetEndpointFromPacket(elem.endpoint)
+				peer.SetEndpointFromPacket(elem.endpoint, elem.transportID)
 				peer.timersHandshakeComplete()
 				peer.SendStagedPackets()
 			}
@@ -679,7 +700,8 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		peer.rxBytes.Add(rxBytesLen)
 		peer.device.accountRuntimeStatsRx(rxBytesLen, rxPackets)
 		if validTailPacket >= 0 {
-			peer.SetEndpointFromPacket(elemsContainer.elems[validTailPacket].endpoint)
+			tail := elemsContainer.elems[validTailPacket]
+			peer.SetEndpointFromPacket(tail.endpoint, tail.transportID)
 			peer.keepKeyFreshReceiving()
 			peer.timersAnyAuthenticatedPacketTraversal()
 			peer.timersAnyAuthenticatedPacketReceived()

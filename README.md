@@ -12,6 +12,7 @@
 - support on-the-fly attach/detach/swap operations for `Bind` and `Tun` instances
 - added usage [examples](./examples)
 - added `Device` configuration methods matching UAPI get/set options
+- added multi-controller peer and transport APIs with a [guide](./docs/multi-controller-guide.md)
 - added leveled logging
 - implemented [amnesiawg-go](https://github.com/amnezia-vpn/amneziawg-go)-compatible obfuscation
     - added support for per-peer obfuscation options (with a [nuance](./ARCHITECTURE.md#amneziawg-extension))

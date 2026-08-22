@@ -48,6 +48,7 @@ type Device struct {
 		port          uint16 // listening port
 		fwmark        uint32 // mark value (0 = disabled)
 		brokenRoaming bool
+		transports    map[TransportID]*transportState
 	}
 
 	staticIdentity struct {
@@ -92,10 +93,11 @@ type Device struct {
 		limiter        ratelimiter.Ratelimiter
 	}
 
-	allowedips    AllowedIPs
-	indexTable    IndexTable
-	cookieChecker CookieChecker
-	batchSize     int
+	allowedips     AllowedIPs
+	indexTable     IndexTable
+	cookieChecker  CookieChecker
+	batchSize      int
+	maxActivePeers int
 
 	pool struct {
 		inboundElementsContainer  *WaitPool
@@ -167,6 +169,11 @@ type DeviceOptions struct {
 	// WorkerCount controls how many encryption, decryption, and handshake
 	// workers are started. Values less than 1 use runtime.GOMAXPROCS(0).
 	WorkerCount int
+
+	// MaxActivePeers bounds materialized peer sessions. Values less than 1 use
+	// MaxPeers. This implementation still stores configured peers as Peer
+	// objects, so the limit applies when on-demand peers are activated.
+	MaxActivePeers int
 }
 
 type tunState struct {
@@ -267,7 +274,14 @@ func (device *Device) upLocked() error {
 		device.log.Errf("Unable to update bind: %v", err)
 		return err
 	}
-	if device.net.bind == nil {
+	if err := device.openNonDefaultTransports(); err != nil {
+		device.log.Errf("Unable to update transports: %v", err)
+		return err
+	}
+	device.net.RLock()
+	hasTransport := device.net.bind != nil || len(device.net.transports) != 0
+	device.net.RUnlock()
+	if !hasTransport {
 		device.log.Debugf("Interface is up without an attached bind")
 		return nil
 	}
@@ -278,13 +292,25 @@ func (device *Device) upLocked() error {
 	defer device.ipcMutex.Unlock()
 
 	device.peers.RLock()
+	peers := make([]*Peer, 0, len(device.peers.keyMap))
 	for _, peer := range device.peers.keyMap {
-		peer.Start()
-		if peer.persistentKeepaliveInterval.Load() > 0 {
+		peers = append(peers, peer)
+	}
+	device.peers.RUnlock()
+
+	for _, peer := range peers {
+		keepalive := peer.persistentKeepaliveInterval.Load() > 0
+		if peer.activation != PeerActivationEager && !keepalive {
+			continue
+		}
+		if err := device.checkActivePeerLimitLocked(peer); err != nil {
+			return err
+		}
+		device.activatePeerLocked(peer)
+		if keepalive {
 			peer.SendKeepalive()
 		}
 	}
-	device.peers.RUnlock()
 	return nil
 }
 
@@ -295,12 +321,51 @@ func (device *Device) downLocked() error {
 	if err != nil {
 		device.log.Errf("Bind close failed: %v", err)
 	}
+	if transportErr := device.closeNonDefaultTransports(); err == nil {
+		err = transportErr
+	}
 
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
 		peer.Stop()
 	}
 	device.peers.RUnlock()
+	return err
+}
+
+func (device *Device) openNonDefaultTransports() error {
+	device.net.Lock()
+	defer device.net.Unlock()
+	for id, st := range device.net.transports {
+		if id == DefaultTransportID {
+			continue
+		}
+		recvFns, err := device.openTransportLocked(st)
+		if err != nil {
+			return fmt.Errorf("transport %q: %w", id, err)
+		}
+		device.startTransportReceiveRoutinesLocked(st, recvFns)
+	}
+	return nil
+}
+
+func (device *Device) closeNonDefaultTransports() error {
+	device.net.Lock()
+	var err error
+	closed := make([]*transportState, 0, len(device.net.transports))
+	for id, st := range device.net.transports {
+		if id == DefaultTransportID {
+			continue
+		}
+		if closeErr := device.closeTransportLocked(st); err == nil && closeErr != nil {
+			err = fmt.Errorf("transport %q: %w", id, closeErr)
+		}
+		closed = append(closed, st)
+	}
+	device.net.Unlock()
+	for _, st := range closed {
+		st.stopping.Wait()
+	}
 	return err
 }
 
@@ -475,7 +540,9 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger, spawner gonnec
 	device.log = loggerOrNop(logger)
 	device.spawner = spawner
 	device.net.bind = bind
+	device.initTransports(bind)
 	device.batchSize = effectiveDeviceBatchSize(tunDevice, bind, options)
+	device.maxActivePeers = options.MaxActivePeers
 	if tunDevice != nil {
 		device.tun.device.Store(tunState)
 		mtu, err := tunDevice.MTU()
@@ -544,6 +611,14 @@ func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 	defer device.peers.RUnlock()
 
 	return device.peers.keyMap[pk]
+}
+
+func (device *Device) LookupActivePeer(pk NoisePublicKey) *Peer {
+	peer := device.LookupPeer(pk)
+	if peer == nil || !peer.isRunning.Load() {
+		return nil
+	}
+	return peer
 }
 
 func (device *Device) RemovePeer(key NoisePublicKey) {
@@ -632,19 +707,54 @@ func (device *Device) SendKeepalivesToPeersWithCurrentKeypair() {
 	device.peers.RUnlock()
 }
 
+func (device *Device) activatePeerForTraffic(peer *Peer) error {
+	if !device.isUp() {
+		return nil
+	}
+	if peer.isRunning.Load() {
+		return nil
+	}
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
+	if peer.isRunning.Load() {
+		return nil
+	}
+	if err := device.checkActivePeerLimitLocked(peer); err != nil {
+		return err
+	}
+	device.activatePeerLocked(peer)
+	return nil
+}
+
+func (device *Device) checkActivePeerLimitLocked(peer *Peer) error {
+	limit := MaxPeers
+	if device.maxActivePeers > 0 {
+		limit = device.maxActivePeers
+	}
+	if limit <= 0 || peer.isRunning.Load() {
+		return nil
+	}
+	active := 0
+	device.peers.RLock()
+	for _, existing := range device.peers.keyMap {
+		if existing.isRunning.Load() {
+			active++
+		}
+	}
+	device.peers.RUnlock()
+	if active >= limit {
+		return ErrActivePeerLimit
+	}
+	return nil
+}
+
 // closeBindLocked closes the device's net.bind.
 // The caller must hold the net mutex.
-func closeBindLocked(device *Device) error {
-	var err error
-	netc := &device.net
-	if netc.netlinkCancel != nil {
-		_ = netc.netlinkCancel.Cancel()
-	}
-	if netc.bind != nil {
-		err = gonnect.ClosedNetworkErrToNil(netc.bind.Close())
-	}
-	netc.stopping.Wait()
-	return err
+func closeBindLocked(device *Device) (*transportState, error) {
+	st := device.defaultTransportLocked()
+	err := device.closeTransportLocked(st)
+	device.syncDefaultTransportAliasesLocked(st)
+	return st, err
 }
 
 func (device *Device) Bind() conn.Bind {
@@ -664,8 +774,12 @@ func (device *Device) BindSetMark(mark uint32) error {
 
 	// update fwmark on existing bind
 	device.net.fwmark = mark
-	if device.isUp() && device.net.bind != nil {
-		if err := setBindMark(device.net.bind, mark); err != nil {
+	st := device.defaultTransportLocked()
+	if st != nil {
+		st.fwmark = mark
+	}
+	if device.isUp() && st != nil && st.bind != nil {
+		if err := setBindMark(st.bind, mark); err != nil {
 			return err
 		}
 	}
@@ -682,48 +796,44 @@ func (device *Device) BindSetMark(mark uint32) error {
 
 func (device *Device) BindUpdate() error {
 	device.net.Lock()
-	defer device.net.Unlock()
 
 	// close existing sockets
-	if err := closeBindLocked(device); err != nil {
+	st := device.defaultTransportLocked()
+	if err := device.closeTransportLocked(st); err != nil {
+		device.syncDefaultTransportAliasesLocked(st)
+		device.net.Unlock()
+		if st != nil {
+			st.stopping.Wait()
+		}
 		return err
 	}
+	device.syncDefaultTransportAliasesLocked(st)
+	device.net.Unlock()
+	if st != nil {
+		st.stopping.Wait()
+	}
+
+	device.net.Lock()
+	defer device.net.Unlock()
 
 	// open new sockets
 	if !device.isUp() {
+		device.syncDefaultTransportAliasesLocked(st)
 		return nil
 	}
-	if device.net.bind == nil {
-		device.net.port = 0
+	if st == nil || st.bind == nil {
+		device.syncDefaultTransportAliasesLocked(st)
 		device.log.Debugf("Bind update skipped: no bind attached")
 		return nil
 	}
 
-	// bind to new port
-	var err error
-	var recvFns []conn.ReceiveFunc
-	netc := &device.net
-
-	recvFns, netc.port, err = netc.bind.Open(netc.port)
+	recvFns, err := device.openTransportLocked(st)
 	if err != nil {
-		netc.port = 0
+		device.syncDefaultTransportAliasesLocked(st)
 		return err
 	}
-
-	netc.netlinkCancel, err = device.startRouteListener(netc.bind)
-	if err != nil {
-		_ = netc.bind.Close()
-		netc.port = 0
-		return err
-	}
-
-	// set fwmark
-	if netc.fwmark != 0 {
-		err = setBindMark(netc.bind, netc.fwmark)
-		if err != nil {
-			return err
-		}
-	}
+	device.syncDefaultTransportAliasesLocked(st)
+	device.startTransportReceiveRoutinesLocked(st, recvFns)
 
 	// clear cached source addresses
 	device.peers.RLock()
@@ -731,16 +841,6 @@ func (device *Device) BindUpdate() error {
 		peer.markEndpointSrcForClearing()
 	}
 	device.peers.RUnlock()
-
-	// start receiving routines
-	device.net.stopping.Add(len(recvFns))
-	device.queue.decryption.wg.Add(len(recvFns)) // each RoutineReceiveIncoming goroutine writes to device.queue.decryption
-	device.queue.handshake.wg.Add(len(recvFns))  // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
-	batchSize := netc.bind.BatchSize()
-	for _, fn := range recvFns {
-		recvName := fmt.Sprintf("%T", fn)
-		device.spawnWorker(func() { device.RoutineReceiveIncoming(batchSize, fn) }, "wgo: receive incoming "+recvName)
-	}
 
 	device.log.Debugf("UDP bind has been updated")
 	return nil
@@ -757,8 +857,11 @@ func setBindMark(bind conn.Bind, mark uint32) (err error) {
 
 func (device *Device) BindClose() error {
 	device.net.Lock()
-	err := closeBindLocked(device)
+	st, err := closeBindLocked(device)
 	device.net.Unlock()
+	if st != nil {
+		st.stopping.Wait()
+	}
 	return err
 }
 
@@ -775,10 +878,26 @@ func (device *Device) rebindPeerEndpointsLocked(bind conn.Bind) error {
 }
 
 func (device *Device) swapBindLocked(bind conn.Bind) {
-	device.net.bind = bind
+	st := device.defaultTransportLocked()
 	if bind == nil {
-		device.net.port = 0
+		delete(device.net.transports, DefaultTransportID)
+		device.syncDefaultTransportAliasesLocked(nil)
+		return
 	}
+	if st == nil {
+		st = &transportState{
+			id:         DefaultTransportID,
+			port:       device.net.port,
+			fwmark:     device.net.fwmark,
+			generation: 1,
+		}
+		device.net.transports[DefaultTransportID] = st
+	} else if st.generation == 0 {
+		st.generation = 1
+	}
+	st.bind = bind
+	st.fwmark = device.net.fwmark
+	device.syncDefaultTransportAliasesLocked(st)
 }
 
 func (device *Device) startTUN(tun *tunState) {
@@ -917,10 +1036,13 @@ func (device *Device) ReplaceBind(bind conn.Bind) error {
 		}
 	}
 
+	device.net.Lock()
 	device.swapBindLocked(bind)
 	if err := device.rebindPeerEndpointsLocked(bind); err != nil {
+		device.net.Unlock()
 		return err
 	}
+	device.net.Unlock()
 
 	if wasUp {
 		if err := device.upLocked(); err != nil {
@@ -950,15 +1072,20 @@ func (device *Device) AttachBind(bind conn.Bind) error {
 		return fmt.Errorf("device already has a bind attached")
 	}
 
+	device.net.Lock()
 	device.swapBindLocked(bind)
 	if err := device.rebindPeerEndpointsLocked(bind); err != nil {
 		device.swapBindLocked(nil)
+		device.net.Unlock()
 		return err
 	}
+	device.net.Unlock()
 
 	if device.isUp() {
 		if err := device.upLocked(); err != nil {
+			device.net.Lock()
 			device.swapBindLocked(nil)
+			device.net.Unlock()
 			return err
 		}
 	}
@@ -982,7 +1109,9 @@ func (device *Device) DetachBind() error {
 		}
 	}
 
+	device.net.Lock()
 	device.swapBindLocked(nil)
+	device.net.Unlock()
 	device.log.Debugf("Bind detached")
 	return nil
 }

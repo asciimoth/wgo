@@ -421,8 +421,14 @@ func (peer *ipcSetPeer) handlePostConfig() error {
 		peer.endpoint.disableRoaming = peer.device.net.brokenRoaming && peer.endpoint.val != nil
 	}
 	if peer.device.isUp() {
-		peer.Start()
-		if peer.pkaOn {
+		keepalive := peer.persistentKeepaliveInterval.Load() > 0
+		if peer.activation == PeerActivationEager || keepalive {
+			if err := peer.device.checkActivePeerLimitLocked(peer.Peer); err != nil {
+				return err
+			}
+			peer.device.activatePeerLocked(peer.Peer)
+		}
+		if peer.pkaOn && peer.isRunning.Load() {
 			peer.SendKeepalive()
 		}
 		peer.SendStagedPackets()

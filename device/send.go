@@ -238,9 +238,9 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 		packet = buf
 	}
 	device.net.RLock()
-	bind := device.net.bind
+	bind, bindErr := device.transportBindLocked(initiatingElem.transportID)
 	device.net.RUnlock()
-	if bind == nil {
+	if bindErr != nil {
 		return nil
 	}
 	// TODO: allocation could be avoided
@@ -358,15 +358,20 @@ func (device *Device) RoutineReadFromTUN(tun *tunState) {
 		}
 
 		for peer, elemsForPeer := range elemsByPeer {
-			if peer.isRunning.Load() {
-				peer.StagePackets(elemsForPeer)
-				peer.SendStagedPackets()
-			} else {
+			if !peer.isRunning.Load() {
+				if err := device.activatePeerForTraffic(peer); err != nil {
+					device.log.Debugf("%v - Failed to activate peer for outbound traffic: %v", peer, err)
+				}
+			}
+			if !peer.isRunning.Load() {
 				for _, elem := range elemsForPeer.elems {
 					device.PutMessageBuffer(elem.buffer)
 					device.PutOutboundElement(elem)
 				}
 				device.PutOutboundElementsContainer(elemsForPeer)
+			} else {
+				peer.StagePackets(elemsForPeer)
+				peer.SendStagedPackets()
 			}
 			delete(elemsByPeer, peer)
 		}
