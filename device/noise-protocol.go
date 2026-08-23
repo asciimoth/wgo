@@ -341,14 +341,31 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	return &msg, nil
 }
 
+type consumeInitiationResult uint8
+
+const (
+	consumeInitiationInvalid consumeInitiationResult = iota
+	consumeInitiationProfileMismatch
+	consumeInitiationOK
+)
+
 func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+	peer, _ := device.consumeMessageInitiation(msg, nil)
+	return peer
+}
+
+func (device *Device) ConsumeMessageInitiationWithProfile(msg *MessageInitiation, expected amneziaWGSnapshot) (*Peer, consumeInitiationResult) {
+	return device.consumeMessageInitiation(msg, &expected)
+}
+
+func (device *Device) consumeMessageInitiation(msg *MessageInitiation, expected *amneziaWGSnapshot) (*Peer, consumeInitiationResult) {
 	var (
 		hash     [blake2s.Size]byte
 		chainKey [blake2s.Size]byte
 	)
 
 	if msg.Type != MessageInitiationType {
-		return nil
+		return nil, consumeInitiationInvalid
 	}
 
 	device.staticIdentity.RLock()
@@ -363,13 +380,13 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	var key [chacha20poly1305.KeySize]byte
 	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
 	if err != nil {
-		return nil
+		return nil, consumeInitiationInvalid
 	}
 	KDF2(&chainKey, &key, chainKey[:], ss[:])
 	aead, _ := chacha20poly1305.New(key[:])
 	_, err = aead.Open(peerPK[:0], ZeroNonce[:], msg.Static[:], hash[:])
 	if err != nil {
-		return nil
+		return nil, consumeInitiationInvalid
 	}
 	mixHash(&hash, &hash, msg.Static[:])
 
@@ -377,7 +394,11 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 
 	peer := device.LookupPeer(peerPK)
 	if peer == nil || !peer.isRunning.Load() {
-		return nil
+		return nil, consumeInitiationInvalid
+	}
+
+	if expected != nil && !amneziaWGReceiveProfileEqual(peer.amneziaWGSnapshot(), *expected) {
+		return peer, consumeInitiationProfileMismatch
 	}
 
 	handshake := &peer.handshake
@@ -390,7 +411,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 
 	if isZero(handshake.precomputedStaticStatic[:]) {
 		handshake.mutex.RUnlock()
-		return nil
+		return nil, consumeInitiationInvalid
 	}
 	KDF2(
 		&chainKey,
@@ -402,7 +423,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	_, err = aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
 	if err != nil {
 		handshake.mutex.RUnlock()
-		return nil
+		return nil, consumeInitiationInvalid
 	}
 	mixHash(&hash, &hash, msg.Timestamp[:])
 
@@ -413,11 +434,11 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	handshake.mutex.RUnlock()
 	if replay {
 		device.log.Debugf("%v - ConsumeMessageInitiation: handshake replay @ %v", peer, timestamp)
-		return nil
+		return nil, consumeInitiationInvalid
 	}
 	if flood {
 		device.log.Debugf("%v - ConsumeMessageInitiation: handshake flood", peer)
-		return nil
+		return nil, consumeInitiationInvalid
 	}
 
 	// update handshake state
@@ -442,7 +463,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	setZero(hash[:])
 	setZero(chainKey[:])
 
-	return peer
+	return peer, consumeInitiationOK
 }
 
 func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error) {

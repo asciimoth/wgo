@@ -231,16 +231,19 @@ The inbound path starts with UDP datagrams read from `batchudp.ReceiveFunc` inst
 Flow:
 
 1. Read one or more datagrams from the bind
-2. Classify each packet by WireGuard message type
-3. Route handshake packets to the handshake queue
-4. Route transport packets by receiver index via `IndexTable`
-5. Decrypt transport packets in parallel
-6. Validate counters and replay windows
-7. Deliver plaintext IP packets to the peer’s sequential inbound consumer
-8. Snapshot the currently attached TUN for delivery
-9. If that TUN requires a larger write offset than the internal transport layout, shift plaintext right before TUN delivery
-10. Write plaintext packets back to `tun.Tun` using that attachment's `writeOffset`
-11. If a TUN swap raced the write and the old attachment was already closed, rebuild the write buffers once against the new current attachment and retry
+2. Decode WireGuard or AmneziaWG packet candidates without changing the shared receive buffer
+3. For response, cookie, and transport packets, look up the receiver index and require the indexed peer's effective receive profile to match the decoded candidate
+4. For initiations, check MACs and cookie policy per candidate, then authenticate the Noise static key and require the authenticated peer's effective receive profile to match before committing handshake state
+5. Materialize the accepted candidate by stripping any AmneziaWG prefix, restoring a protected header, and trimming fixed-message random trailers
+6. Route handshake packets to the handshake queue
+7. Route transport packets by receiver index via `IndexTable`
+8. Decrypt transport packets in parallel
+9. Validate counters and replay windows
+10. Deliver plaintext IP packets to the peer’s sequential inbound consumer
+11. Snapshot the currently attached TUN for delivery
+12. If that TUN requires a larger write offset than the internal transport layout, shift plaintext right before TUN delivery
+13. Write plaintext packets back to `tun.Tun` using that attachment's `writeOffset`
+14. If a TUN swap raced the write and the old attachment was already closed, rebuild the write buffers once against the new current attachment and retry
 
 ## Bind Transition Notes
 
@@ -334,11 +337,14 @@ The primary configuration surface for embedders is the typed `Device` API. Commo
 - `Device.SetPeerPresharedKey(NoisePublicKey, NoisePresharedKey)`
 - `Device.SetPeerEndpoint(NoisePublicKey, string)`
 - `Device.SetPeerPersistentKeepaliveInterval(NoisePublicKey, uint16)`
+- `Device.SetPeerPersistentKeepaliveRange(NoisePublicKey, AmneziaWGRange)`
 - `Device.SetPeerProtocolVersion(NoisePublicKey, int)`
 - `Device.ReplacePeerAllowedIPs(NoisePublicKey, []netip.Prefix)`
 - `Device.AddPeerAllowedIP(NoisePublicKey, netip.Prefix)`
 - `Device.RemovePeerAllowedIP(NoisePublicKey, netip.Prefix)`
 - `Device.AmneziaWGConfig()`
+- `Device.SetAmneziaWGVersion(AmneziaWGVersion)`
+- `Device.SetPeerAmneziaWGVersion(NoisePublicKey, AmneziaWGVersion)`
 - `Device.Config()`
 - `Device.PeerConfig(NoisePublicKey)`
 
@@ -370,7 +376,7 @@ In practice, the examples in this repository prefer the direct `Device` methods 
 
 ## AmneziaWG Extension
 
-This repository now implements the AmneziaWG 2.0 obfuscation extension  using the current [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) behavior as the compatibility target where that differs from public docs.
+This repository implements AmneziaWG obfuscation, including the earlier v2 fields and AWG 3.1 controls. The compatibility target is [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) where that differs from public docs.
 
 The configuration model is now hierarchical:
 
@@ -378,6 +384,7 @@ The configuration model is now hierarchical:
 - `S1..S4` fixed prefix lengths
 - `I1..I5` pre-handshake decoy packet specs
 - `Jc`, `Jmin`, `Jmax` pre-handshake junk packet settings
+- AWG 3.1 header protection key, content padding range, timing ranges, random trailers flag, cookie disable flag, and ranged persistent keepalive
 
 These values still exist on `device.Device` as the default profile for the node, but peers may now carry their own effective AmneziaWG profile too.
 
@@ -387,17 +394,22 @@ The runtime behavior is:
 - a peer may override that default with its own AmneziaWG config through typed setters or peer-scoped UAPI keys
 - outbound initiation, response, and transport packets use the peer's effective AmneziaWG snapshot
 - peers without overrides continue to use the device-global defaults
+- `AmneziaWGVersionAuto` infers the required mode from configured fields; there is no AWG on-wire version negotiation
 
-Receive-side classification is more constrained because the peer is not always known before packet parsing. The implementation handles this by testing the device-global snapshot first and then any peer-specific snapshots already compiled into live peers. That preserves mixed-profile interoperability while keeping the inner WireGuard processing unchanged after padding is stripped.
+Receive-side classification is more constrained because the peer is not always known before packet parsing. The implementation handles this by testing immutable compiled receive profiles from the device default and peer-specific snapshots. Header-protected AWG 3.1 packets require bounded pre-auth candidate work because the protected packet carries no key ID. `DeviceOptions.MaxAmneziaWGReceiveProfiles` limits the number of distinct receive profiles; `Device.AmneziaWGReceiveCounters()` exposes classifier counters.
 
-This also means mixed per-peer profiles are only safe when their receive-side signatures are unambiguous. Matching currently stops at the first snapshot whose `(configured padding, configured header range, expected size)` fits the packet. Validation prevents header overlap within one effective profile, but it does not reject overlaps or other ambiguous combinations across different peers. If two peers can both plausibly match the same incoming wire packet, classification may select the wrong profile and the subsequent handshake or transport decode will fail. Track this as a follow-up in [REVIEW_FOLLOWUPS.md](REVIEW_FOLLOWUPS.md).
+The receive counters are diagnostics only. They count classifier candidates, protected-header decode failures, authenticated profile mismatches, unknown packets, and profile-limit rejections. They do not expose header-protection key material.
+
+This also means mixed per-peer profiles are only safe when their receive-side signatures are unambiguous. Validation rejects overlapping effective receive profiles and rejects header-protection keys unless all `S1..S4` paddings provide the 12-byte ChaCha nonce. Random trailers make fixed handshake messages variable-size receive signatures, so they are included in the overlap checks. Profiles that differ only by send-only timing can share one receive classifier entry. Peers that differ in receive-visible header protection settings become distinct candidates.
 
 The implementation touches four main areas:
 
-- config and state: [device/amnezia.go](device/amnezia.go), [device/config.go](device/config.go), and [device/uapi.go](device/uapi.go) define the typed config model, peer override patches, UAPI keys, CPS parsing for `I1..I5`, and header-overlap validation
-- send path: [device/noise-protocol.go](device/noise-protocol.go) and [device/send.go](device/send.go) generate randomized header values, prepend fixed-size random prefixes, emit `I1..I5` and `J*` packets before each initiation, and preserve the keepalive `S4` quirk from `amneziawg-go`, all from the effective per-peer snapshot. Receive-side handling for unpadded keepalives when `S4 > 0` is tracked in [REVIEW_FOLLOWUPS.md](REVIEW_FOLLOWUPS.md).
-- receive path: [device/receive.go](device/receive.go) classifies packets by `(configured padding, configured header range, expected size)` before handing the stripped inner message to normal WireGuard processing, checking both the device-default and peer-specific snapshots; mixed per-peer profiles therefore need distinct receive-side signatures
+- config and state: [device/amnezia.go](device/amnezia.go), [device/config.go](device/config.go), and [device/uapi.go](device/uapi.go) define the typed config model, peer override patches, AWG 3.1 ranges, official UAPI keys, CPS parsing for `I1..I5`, and header-overlap validation
+- send path: [device/noise-protocol.go](device/noise-protocol.go) and [device/send.go](device/send.go) generate randomized header values, prepend fixed-size random prefixes, emit `I1..I5` and `J*` packets before each initiation, apply AWG 3.1 header protection, and add configured content padding before transport encryption
+- receive path: [device/receive.go](device/receive.go) classifies packets by `(configured padding, configured header range, expected size, header protection key)` before handing the stripped inner message to normal WireGuard processing, checking both the device-default and peer-specific snapshots; protected headers are restored only on a decoded copy until the candidate is bound to the indexed or authenticated peer
 - cookie handling: [device/cookie.go](device/cookie.go) now accepts the configured cookie header value so `H3` applies to cookie replies too
+
+AWG 3.1 header protection uses the first 12 bytes of each `S*` prefix as a ChaCha20 nonce. This applies to fixed handshake messages and to transport, including keepalive transport messages. The older AWG v2 unpadded-keepalive receive fallback is only compiled for profiles without header protection.
 
 Vanilla WireGuard support is preserved by the default configuration and by peers that do not override it:
 
@@ -410,6 +422,99 @@ Vanilla WireGuard support is preserved by the default configuration and by peers
 - `Jc=Jmin=Jmax=0`
 
 With those defaults, packet layout and handshake behavior remain standard WireGuard.
+
+UAPI remains compatibility-only. It accepts the official AWG 3.1 lowercase keys such as `header_protection_key`, `content_padding_addition`, timing ranges, `random_trailers`, `disable_cookies`, and ranged `persistent_keepalive_interval=a-b`. Older tools can still use fixed persistent keepalive integers; fixed values are emitted as integers. A ranged persistent keepalive value is emitted as `persistent_keepalive_interval=a-b`; older WireGuard-only tools can reject that value or display it incorrectly because upstream WireGuard UAPI only defines a fixed integer. Explicit `AmneziaWGDisabled`, `AmneziaWGV1_5`, and `AmneziaWGV2` profiles reject non-fixed persistent keepalive ranges because ranged keepalive is an AWG 3.1 control.
+
+### AWG 2.0 to 3.1 Migration
+
+AWG has no on-wire version negotiation. Both endpoints must use compatible settings before traffic can pass. A v3.1-capable binary can still send v2-shaped packets when all v3.1-only fields are unset, but setting `HeaderProtectionKey`, `ContentPadding`, timing ranges, `RandomTrailers`, `DisableCookies`, or a ranged persistent keepalive makes the effective profile require AWG 3.1 behavior.
+
+For a conservative migration:
+
+1. Upgrade both endpoints to versions that support AWG 3.1.
+2. Keep the existing AWG 2.0 `Jc/Jmin/Jmax`, `S1..S4`, `H1..H4`, and `I1..I5` values unchanged.
+3. Set `Version: AmneziaWGV3_1` only after both endpoints run the new code.
+4. Add v3.1 fields one group at a time, starting with timing ranges or content padding because they do not affect receive header decoding.
+5. Add `HeaderProtectionKey` last. When it is set, configure every `S1..S4` padding to at least 12 bytes because the first 12 bytes are the ChaCha nonce.
+
+Example v2 profile promoted to v3.1 with header protection and content padding:
+
+```go
+cfg := device.DefaultAmneziaWGConfig()
+
+// Existing AWG 2.0 values.
+cfg.JunkCount = 2
+cfg.JunkMin = 8
+cfg.JunkMax = 64
+cfg.InitHeader = device.AmneziaWGHeaderRange{Start: 1001, End: 1001}
+cfg.ResponseHeader = device.AmneziaWGHeaderRange{Start: 1002, End: 1002}
+cfg.CookieHeader = device.AmneziaWGHeaderRange{Start: 1003, End: 1003}
+cfg.TransportHeader = device.AmneziaWGHeaderRange{Start: 1004, End: 1004}
+cfg.InitPadding = 12
+cfg.ResponsePadding = 12
+cfg.CookiePadding = 12
+cfg.TransportPadding = 12
+
+// New AWG 3.1 values.
+cfg.Version = device.AmneziaWGV3_1
+cfg.HeaderProtectionKey = headerKey
+cfg.ContentPadding = device.AmneziaWGRange{Min: 16, Max: 64, Set: true}
+
+if err := dev.SetAmneziaWGConfig(cfg); err != nil {
+	return err
+}
+```
+
+### Typed AWG 3.1 Example
+
+Embedders should prefer typed API calls over UAPI when they control the process. This keeps range parsing, validation, and peer-scoped overrides in Go types.
+
+```go
+headerKey, err := device.ParseAmneziaWGHeaderProtectionKeyHex(
+	"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+)
+if err != nil {
+	return err
+}
+
+cfg := device.DefaultAmneziaWGConfig()
+cfg.Version = device.AmneziaWGV3_1
+cfg.InitPadding = 12
+cfg.ResponsePadding = 12
+cfg.CookiePadding = 12
+cfg.TransportPadding = 12
+cfg.HeaderProtectionKey = headerKey
+cfg.ContentPadding = device.AmneziaWGRange{Min: 8, Max: 48, Set: true}
+cfg.KeepaliveTimeout = device.AmneziaWGRange{Min: 8, Max: 12, Set: true}
+
+if err := dev.SetAmneziaWGConfig(cfg); err != nil {
+	return err
+}
+
+if err := dev.SetPeerPersistentKeepaliveRange(peerKey, device.AmneziaWGRange{
+	Min: 25,
+	Max: 35,
+	Set: true,
+}); err != nil {
+	return err
+}
+```
+
+Use `SetPeerAmneziaWGConfig` or `SetPeerAmneziaWGConfigPatch` when one peer needs a different AWG profile. Use `SetPeerPersistentKeepaliveRange` for ranged persistent keepalive because the older `SetPeerPersistentKeepaliveInterval` method always configures a fixed interval.
+
+### Receive Profile Limits
+
+Header-protected AWG 3.1 packets do not carry a clear profile identifier before header decoding. The receiver must try candidate receive profiles before it knows which peer sent an initiation. Keep the number of distinct receive-visible profiles small.
+
+Recommended embedder rules:
+
+- Use one device-wide AWG profile when possible.
+- Prefer per-peer differences that are send-only, such as timing ranges, because they deduplicate to one receive profile.
+- Avoid many different `HeaderProtectionKey`, `S1..S4`, or `H1..H4` combinations on one device.
+- Set `DeviceOptions.MaxAmneziaWGReceiveProfiles` to a bound that matches the deployment.
+- Monitor `Device.AmneziaWGReceiveCounters()` for `CandidatesTried`, `HeaderDecryptFailures`, `ProfileMismatches`, `UnknownPackets`, and `ProfileLimitRejections`.
+
+Normal typed API and UAPI setters reject configurations that exceed the receive-profile limit. The classifier also has a defensive limit check for already inconsistent internal state; in that case, extra profiles are not added and packets for those profiles can fail classification until the configuration is simplified or the limit is raised.
 
 ## Netstack Mode
 

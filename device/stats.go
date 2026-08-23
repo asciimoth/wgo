@@ -133,7 +133,7 @@ func (device *Device) RuntimeStats() RuntimeStats {
 		if stats.LastHandshakeTime.IsZero() || handshakeTime.After(stats.LastHandshakeTime) {
 			stats.LastHandshakeTime = handshakeTime
 		}
-		if running && now.Sub(handshakeTime) <= RejectAfterTime {
+		if running && now.Sub(handshakeTime) <= peer.rejectAfterTimeMax() {
 			stats.ConnectedPeerCount++
 		}
 	}

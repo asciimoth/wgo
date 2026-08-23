@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	conn "github.com/asciimoth/batchudp"
 	"github.com/asciimoth/wgo/ipc"
 )
 
@@ -112,40 +113,26 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			sendf("i%d=%s", i+1, spec)
 		}
 	}
+	sendAmneziaWGV3UAPI(sendf, keyf, cfg.AmneziaWG, false)
 
 	for _, peer := range cfg.Peers {
 		keyf("public_key", (*[32]byte)(&peer.PublicKey))
 		if peer.AmneziaWG != nil {
-			if peer.AmneziaWG.JunkCount != 0 {
-				sendf("jc=%d", peer.AmneziaWG.JunkCount)
-			}
-			if peer.AmneziaWG.JunkMin != 0 {
-				sendf("jmin=%d", peer.AmneziaWG.JunkMin)
-			}
-			if peer.AmneziaWG.JunkMax != 0 {
-				sendf("jmax=%d", peer.AmneziaWG.JunkMax)
-			}
-			if peer.AmneziaWG.InitPadding != 0 {
-				sendf("s1=%d", peer.AmneziaWG.InitPadding)
-			}
-			if peer.AmneziaWG.ResponsePadding != 0 {
-				sendf("s2=%d", peer.AmneziaWG.ResponsePadding)
-			}
-			if peer.AmneziaWG.CookiePadding != 0 {
-				sendf("s3=%d", peer.AmneziaWG.CookiePadding)
-			}
-			if peer.AmneziaWG.TransportPadding != 0 {
-				sendf("s4=%d", peer.AmneziaWG.TransportPadding)
-			}
+			sendf("jc=%d", peer.AmneziaWG.JunkCount)
+			sendf("jmin=%d", peer.AmneziaWG.JunkMin)
+			sendf("jmax=%d", peer.AmneziaWG.JunkMax)
+			sendf("s1=%d", peer.AmneziaWG.InitPadding)
+			sendf("s2=%d", peer.AmneziaWG.ResponsePadding)
+			sendf("s3=%d", peer.AmneziaWG.CookiePadding)
+			sendf("s4=%d", peer.AmneziaWG.TransportPadding)
 			sendf("h1=%s", peer.AmneziaWG.InitHeader.Spec())
 			sendf("h2=%s", peer.AmneziaWG.ResponseHeader.Spec())
 			sendf("h3=%s", peer.AmneziaWG.CookieHeader.Spec())
 			sendf("h4=%s", peer.AmneziaWG.TransportHeader.Spec())
 			for i, spec := range peer.AmneziaWG.InitiationPackets {
-				if spec != "" {
-					sendf("i%d=%s", i+1, spec)
-				}
+				sendf("i%d=%s", i+1, spec)
 			}
+			sendAmneziaWGV3UAPI(sendf, keyf, *peer.AmneziaWG, true)
 		}
 		keyf("preshared_key", (*[32]byte)(&peer.PresharedKey))
 		sendf("protocol_version=%d", peer.ProtocolVersion)
@@ -161,7 +148,11 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 		sendf("last_handshake_time_nsec=%d", nano)
 		sendf("tx_bytes=%d", peer.TxBytes)
 		sendf("rx_bytes=%d", peer.RxBytes)
-		sendf("persistent_keepalive_interval=%d", peer.PersistentKeepaliveInterval)
+		if peer.PersistentKeepaliveRange != nil {
+			sendf("persistent_keepalive_interval=%s", peer.PersistentKeepaliveRange.String())
+		} else {
+			sendf("persistent_keepalive_interval=%d", peer.PersistentKeepaliveInterval)
+		}
 
 		for _, prefix := range peer.AllowedIPs {
 			sendf("allowed_ip=%s", prefix.String())
@@ -188,20 +179,49 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 		}
 	}()
 
-	peer := new(ipcSetPeer)
+	peer := &ipcSetPeer{device: device}
 	amnezia := new(ipcSetAmneziaWG)
 	deviceConfig := true
+	var committedPeers []ipcPeerUAPIRollback
+	var committedDeviceAmnezia *AmneziaWGConfig
+	commitDeviceAmnezia := func() error {
+		if !amnezia.hasValues() {
+			return nil
+		}
+		previous := device.amneziaWGConfigLocked()
+		if err := amnezia.mergeWithDevice(device); err != nil {
+			return err
+		}
+		committedDeviceAmnezia = &previous
+		amnezia = new(ipcSetAmneziaWG)
+		return nil
+	}
 
 	scanner := bufio.NewScanner(r)
+	defer func() {
+		if err == nil {
+			return
+		}
+		for i := len(committedPeers) - 1; i >= 0; i-- {
+			device.rollbackPeerUAPI(committedPeers[i])
+		}
+		if committedDeviceAmnezia != nil {
+			_ = device.setAmneziaWGConfigLocked(*committedDeviceAmnezia)
+		}
+	}()
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
 			// Blank line means terminate operation.
-			if err := amnezia.mergeWithDevice(device); err != nil {
+			if err := commitDeviceAmnezia(); err != nil {
 				return ipcErrorf(ipc.IpcErrorInvalid, "failed to apply amneziawg config: %w", err)
 			}
-			if err := peer.handlePostConfig(); err != nil {
+			rollback, err := peer.handlePostConfig()
+			if err != nil {
 				return ipcErrorf(ipc.IpcErrorInvalid, "failed to apply peer config: %w", err)
+			}
+			if rollback != nil {
+				committedPeers = append(committedPeers, *rollback)
 			}
 			return nil
 		}
@@ -214,11 +234,18 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 			if deviceConfig {
 				deviceConfig = false
 			}
-			if err := peer.handlePostConfig(); err != nil {
+			if err := commitDeviceAmnezia(); err != nil {
+				return ipcErrorf(ipc.IpcErrorInvalid, "failed to apply amneziawg config: %w", err)
+			}
+			rollback, err := peer.handlePostConfig()
+			if err != nil {
 				return ipcErrorf(ipc.IpcErrorInvalid, "failed to apply peer config: %w", err)
 			}
+			if rollback != nil {
+				committedPeers = append(committedPeers, *rollback)
+			}
 			// Load/create the peer we are now configuring.
-			err := device.handlePublicKeyLine(peer, value)
+			err = device.handlePublicKeyLine(peer, value)
 			if err != nil {
 				return err
 			}
@@ -235,11 +262,15 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 			return err
 		}
 	}
-	if err := amnezia.mergeWithDevice(device); err != nil {
+	if err := commitDeviceAmnezia(); err != nil {
 		return ipcErrorf(ipc.IpcErrorInvalid, "failed to apply amneziawg config: %w", err)
 	}
-	if err := peer.handlePostConfig(); err != nil {
+	rollback, err := peer.handlePostConfig()
+	if err != nil {
 		return ipcErrorf(ipc.IpcErrorInvalid, "failed to apply peer config: %w", err)
+	}
+	if rollback != nil {
+		committedPeers = append(committedPeers, *rollback)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -250,6 +281,13 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 
 func handleAmneziaLine(key, value string, amnezia *ipcSetAmneziaWG) (bool, error) {
 	switch key {
+	case "awg_version", "amneziawg_version":
+		version64, err := strconv.ParseUint(value, 10, 8)
+		if err != nil {
+			return true, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse %s: %w", key, err)
+		}
+		version := AmneziaWGVersion(version64)
+		amnezia.version = &version
 	case "jc":
 		jc, err := parseNonNegativeAmneziaUAPIValue("jc", value, maxAmneziaWGJunkCount)
 		if err != nil {
@@ -324,11 +362,98 @@ func handleAmneziaLine(key, value string, amnezia *ipcSetAmneziaWG) (bool, error
 		index := int(key[1] - '1')
 		amnezia.initiationPackets[index] = chain
 		amnezia.packetSet[index] = true
+	case "header_protection_key":
+		headerKey, err := ParseAmneziaWGHeaderProtectionKeyHex(value)
+		if err != nil {
+			return true, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse header_protection_key: %w", err)
+		}
+		amnezia.headerProtectionKey = &headerKey
+	case "content_padding_addition":
+		rng, err := parseAmneziaRangeUAPIValue("content_padding_addition", value, uint32(MaxMessageSize))
+		if err != nil {
+			return true, err
+		}
+		amnezia.contentPadding = &rng
+	case "rekey_after_time":
+		rng, err := parseAmneziaRangeUAPIValue("rekey_after_time", value, maxAmneziaWGTimerRangeSeconds)
+		if err != nil {
+			return true, err
+		}
+		amnezia.rekeyAfterTime = &rng
+	case "rekey_timeout":
+		rng, err := parseAmneziaRangeUAPIValue("rekey_timeout", value, maxAmneziaWGTimerRangeSeconds)
+		if err != nil {
+			return true, err
+		}
+		amnezia.rekeyTimeout = &rng
+	case "reject_after_time":
+		rng, err := parseAmneziaRangeUAPIValue("reject_after_time", value, maxAmneziaWGTimerRangeSeconds)
+		if err != nil {
+			return true, err
+		}
+		amnezia.rejectAfterTime = &rng
+	case "keepalive_timeout":
+		rng, err := parseAmneziaRangeUAPIValue("keepalive_timeout", value, maxAmneziaWGTimerRangeSeconds)
+		if err != nil {
+			return true, err
+		}
+		amnezia.keepaliveTimeout = &rng
+	case "max_handshake_attempts":
+		rng, err := parseAmneziaRangeUAPIValue("max_handshake_attempts", value, maxAmneziaWGHandshakeAttempts)
+		if err != nil {
+			return true, err
+		}
+		amnezia.maxHandshakeAttempts = &rng
+	case "random_trailers":
+		v, err := parseAmneziaBoolUAPIValue("random_trailers", value)
+		if err != nil {
+			return true, err
+		}
+		amnezia.randomTrailers = &v
+	case "disable_cookies":
+		v, err := parseAmneziaBoolUAPIValue("disable_cookies", value)
+		if err != nil {
+			return true, err
+		}
+		amnezia.disableCookies = &v
 	default:
 		return false, nil
 	}
 
 	return true, nil
+}
+
+func sendAmneziaWGV3UAPI(sendf func(string, ...any), keyf func(string, *[32]byte), cfg AmneziaWGConfig, full bool) {
+	if full || cfg.Version != AmneziaWGVersionAuto {
+		sendf("awg_version=%d", cfg.Version)
+	}
+	if full || !cfg.HeaderProtectionKey.IsZero() {
+		keyf("header_protection_key", (*[32]byte)(&cfg.HeaderProtectionKey))
+	}
+	if full || cfg.ContentPadding.Set {
+		sendf("content_padding_addition=%s", cfg.ContentPadding.String())
+	}
+	if full || cfg.RekeyAfterTime.Set {
+		sendf("rekey_after_time=%s", cfg.RekeyAfterTime.String())
+	}
+	if full || cfg.RekeyTimeout.Set {
+		sendf("rekey_timeout=%s", cfg.RekeyTimeout.String())
+	}
+	if full || cfg.RejectAfterTime.Set {
+		sendf("reject_after_time=%s", cfg.RejectAfterTime.String())
+	}
+	if full || cfg.KeepaliveTimeout.Set {
+		sendf("keepalive_timeout=%s", cfg.KeepaliveTimeout.String())
+	}
+	if full || cfg.MaxHandshakeAttempts.Set {
+		sendf("max_handshake_attempts=%s", cfg.MaxHandshakeAttempts.String())
+	}
+	if full || cfg.RandomTrailers {
+		sendf("random_trailers=%t", cfg.RandomTrailers)
+	}
+	if full || cfg.DisableCookies {
+		sendf("disable_cookies=%t", cfg.DisableCookies)
+	}
 }
 
 func parseNonNegativeAmneziaUAPIValue(name, value string, max int) (int, error) {
@@ -343,6 +468,31 @@ func parseNonNegativeAmneziaUAPIValue(name, value string, max int) (int, error) 
 		return 0, ipcErrorf(ipc.IpcErrorInvalid, "%s must be <= %d", name, max)
 	}
 	return n, nil
+}
+
+func parseAmneziaRangeUAPIValue(name, value string, max uint32) (AmneziaWGRange, error) {
+	if value == "off" {
+		return AmneziaWGRange{}, nil
+	}
+	rng, err := ParseAmneziaWGRange(value)
+	if err != nil {
+		return AmneziaWGRange{}, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse %s: %w", name, err)
+	}
+	if err := rng.Validate(name, max); err != nil {
+		return AmneziaWGRange{}, ipcErrorf(ipc.IpcErrorInvalid, "%w", err)
+	}
+	return rng, nil
+}
+
+func parseAmneziaBoolUAPIValue(name, value string) (bool, error) {
+	switch value {
+	case "true", "1":
+		return true, nil
+	case "false", "0":
+		return false, nil
+	default:
+		return false, ipcErrorf(ipc.IpcErrorInvalid, "failed to parse %s: expected true or false", name)
+	}
 }
 
 func (device *Device) handleDeviceLine(key, value string, amnezia *ipcSetAmneziaWG) error {
@@ -401,30 +551,216 @@ func (device *Device) handleDeviceLine(key, value string, amnezia *ipcSetAmnezia
 
 // An ipcSetPeer is the current state of an IPC set operation on a peer.
 type ipcSetPeer struct {
-	*Peer                   // Peer is the current peer being operated on
-	dummy   bool            // dummy reports whether this peer is a temporary, placeholder peer
-	created bool            // new reports whether this is a newly created peer
-	pkaOn   bool            // pkaOn reports whether the peer had the persistent keepalive turn on
-	amnezia ipcSetAmneziaWG // pending peer-local amnezia settings for the current operation
+	device     *Device
+	*Peer      // Peer is the current peer being operated on
+	publicKey  NoisePublicKey
+	hasPeer    bool
+	dummy      bool            // dummy reports whether this peer is a temporary, placeholder peer
+	created    bool            // new reports whether this is a newly created peer
+	pkaOn      bool            // pkaOn reports whether the peer had the persistent keepalive turn on
+	amnezia    ipcSetAmneziaWG // pending peer-local amnezia settings for the current operation
+	pka        *AmneziaWGRange // pending persistent keepalive range for the current operation
+	pkaIsRange bool
+	remove     bool // remove reports whether this peer should be deleted at commit time
+	// stagedEndpoint is applied after parsing so a later parse or validation
+	// error in the same UAPI operation does not partially change the peer.
+	stagedEndpoint        *string
+	stagedPresharedKey    *NoisePresharedKey
+	stagedProtocolVersion *int
+	allowedIPOps          []ipcSetAllowedIPOp
 }
 
-func (peer *ipcSetPeer) handlePostConfig() error {
-	if peer.Peer == nil || peer.dummy {
-		return nil
+type ipcSetAllowedIPOp struct {
+	replace bool
+	add     bool
+	prefix  netip.Prefix
+}
+
+type ipcPeerUAPIRollback struct {
+	peer              *Peer
+	existed           bool
+	presharedKey      NoisePresharedKey
+	keepalive         AmneziaWGRange
+	keepalivePacked   uint64
+	keepaliveIsRange  bool
+	endpoint          conn.Endpoint
+	endpointAddress   string
+	endpointTransport TransportID
+	allowedIPs        []netip.Prefix
+	amnezia           ipcSetAmneziaWG
+}
+
+func (device *Device) capturePeerUAPIRollback(peer *Peer, existed bool) ipcPeerUAPIRollback {
+	rollback := ipcPeerUAPIRollback{
+		peer:             peer,
+		existed:          existed,
+		keepalivePacked:  peer.persistentKeepaliveRange.Load(),
+		keepaliveIsRange: peer.persistentKeepaliveIsRange.Load(),
+		amnezia:          peer.amnezia.override,
+	}
+	rollback.keepalive = unpackAmneziaWGRange(rollback.keepalivePacked)
+
+	peer.handshake.mutex.RLock()
+	rollback.presharedKey = peer.handshake.presharedKey
+	peer.handshake.mutex.RUnlock()
+
+	peer.endpoint.Lock()
+	rollback.endpoint = peer.endpoint.val
+	rollback.endpointAddress = peer.endpoint.address
+	rollback.endpointTransport = peer.endpoint.transport
+	peer.endpoint.Unlock()
+
+	device.allowedips.EntriesForPeer(peer, func(prefix netip.Prefix) bool {
+		rollback.allowedIPs = append(rollback.allowedIPs, prefix)
+		return true
+	})
+	return rollback
+}
+
+func (device *Device) rollbackPeerUAPI(rollback ipcPeerUAPIRollback) {
+	if !rollback.existed {
+		device.RemovePeer(rollback.peer.handshake.remoteStatic)
+		return
+	}
+
+	peer := rollback.peer
+	device.peers.Lock()
+	if _, ok := device.peers.keyMap[peer.handshake.remoteStatic]; !ok {
+		device.peers.keyMap[peer.handshake.remoteStatic] = peer
+		device.signalRuntimeStats()
+	}
+	device.peers.Unlock()
+
+	peer.handshake.mutex.Lock()
+	peer.handshake.presharedKey = rollback.presharedKey
+	peer.handshake.mutex.Unlock()
+
+	peer.persistentKeepaliveRange.Store(rollback.keepalivePacked)
+	peer.persistentKeepaliveIsRange.Store(rollback.keepaliveIsRange)
+	if rollback.keepalive.Set && rollback.keepalive.Min == rollback.keepalive.Max && rollback.keepalive.Max <= uint32(^uint16(0)) {
+		peer.persistentKeepaliveInterval.Store(rollback.keepalive.Min)
+	} else {
+		peer.persistentKeepaliveInterval.Store(0)
+	}
+
+	peer.endpoint.Lock()
+	peer.endpoint.val = rollback.endpoint
+	peer.endpoint.address = rollback.endpointAddress
+	peer.endpoint.transport = rollback.endpointTransport
+	peer.endpoint.Unlock()
+
+	device.allowedips.ReplaceForPeer(peer, rollback.allowedIPs)
+	peer.amnezia.override = rollback.amnezia
+	_ = device.refreshPeerAmneziaWGSnapshotLocked(peer)
+	device.storeAmneziaWGReceiveClassifier()
+}
+
+func (device *Device) parseDefaultPeerEndpointLocked(endpoint string) (conn.Endpoint, error) {
+	device.net.RLock()
+	st := device.net.transports[DefaultTransportID]
+	device.net.RUnlock()
+	if st == nil || st.bind == nil {
+		return nil, fmt.Errorf("failed to set endpoint %v: no bind attached", endpoint)
+	}
+	parsed, err := st.bind.ParseEndpoint(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set endpoint %v: %w", endpoint, err)
+	}
+	return parsed, nil
+}
+
+func (peer *ipcSetPeer) handlePostConfig() (*ipcPeerUAPIRollback, error) {
+	if !peer.hasPeer {
+		return nil, nil
+	}
+	if peer.remove {
+		if peer.Peer != nil && peer.Peer.device != nil {
+			rollback := peer.device.capturePeerUAPIRollback(peer.Peer, true)
+			peer.device.log.Debugf("%v - UAPI: Removing", peer.Peer)
+			peer.device.RemovePeer(peer.publicKey)
+			return &rollback, nil
+		}
+		return nil, nil
+	}
+	if peer.dummy {
+		return nil, nil
+	}
+
+	var parsedEndpoint conn.Endpoint
+	if peer.stagedEndpoint != nil {
+		parsed, err := peer.device.parseDefaultPeerEndpointLocked(*peer.stagedEndpoint)
+		if err != nil {
+			return nil, err
+		}
+		parsedEndpoint = parsed
+	}
+
+	if peer.Peer == nil {
+		var err error
+		peer.Peer, err = peer.device.NewPeer(peer.publicKey)
+		if err != nil {
+			return nil, err
+		}
+		peer.created = true
+		peer.device.log.Debugf("%v - UAPI: Created", peer.Peer)
+	}
+	rollback := peer.device.capturePeerUAPIRollback(peer.Peer, !peer.created)
+	committed := false
+	defer func() {
+		if !committed {
+			peer.device.rollbackPeerUAPI(rollback)
+		}
+	}()
+
+	if peer.stagedPresharedKey != nil {
+		if err := peer.device.setPeerPresharedKeyLocked(peer.publicKey, *peer.stagedPresharedKey); err != nil {
+			return nil, err
+		}
+	}
+	for _, op := range peer.allowedIPOps {
+		switch {
+		case op.replace:
+			if err := peer.device.replacePeerAllowedIPsLocked(peer.publicKey, nil); err != nil {
+				return nil, err
+			}
+		case op.add:
+			if err := peer.device.addPeerAllowedIPLocked(peer.publicKey, op.prefix); err != nil {
+				return nil, err
+			}
+		default:
+			if err := peer.device.removePeerAllowedIPLocked(peer.publicKey, op.prefix); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if peer.stagedProtocolVersion != nil {
+		if err := peer.device.setPeerProtocolVersionLocked(peer.publicKey, *peer.stagedProtocolVersion); err != nil {
+			return nil, err
+		}
 	}
 	if peer.amnezia.hasValues() {
 		if err := peer.device.setPeerAmneziaWGConfigPatchLocked(peer.Peer, peer.amnezia); err != nil {
-			return err
+			return nil, err
 		}
+	}
+	if peer.pka != nil {
+		oldOn := peer.persistentKeepaliveRange.Load() != 0
+		if _, err := peer.device.setPeerPersistentKeepaliveLocked(peer.handshake.remoteStatic, *peer.pka, peer.pkaIsRange, false); err != nil {
+			return nil, err
+		}
+		peer.pkaOn = !oldOn && peer.pka.Set
+	}
+	if peer.stagedEndpoint != nil {
+		applyPeerEndpoint(peer.Peer, parsedEndpoint, DefaultTransportID, *peer.stagedEndpoint)
 	}
 	if peer.created {
 		peer.endpoint.disableRoaming = peer.device.net.brokenRoaming && peer.endpoint.val != nil
 	}
 	if peer.device.isUp() {
-		keepalive := peer.persistentKeepaliveInterval.Load() > 0
+		keepalive := peer.persistentKeepaliveRange.Load() != 0
 		if peer.activation == PeerActivationEager || keepalive {
 			if err := peer.device.checkActivePeerLimitLocked(peer.Peer); err != nil {
-				return err
+				return nil, err
 			}
 			peer.device.activatePeerLocked(peer.Peer)
 		}
@@ -433,12 +769,20 @@ func (peer *ipcSetPeer) handlePostConfig() error {
 		}
 		peer.SendStagedPackets()
 	}
-	return nil
+	committed = true
+	return &rollback, nil
 }
 
 func (device *Device) handlePublicKeyLine(peer *ipcSetPeer, value string) error {
+	*peer = ipcSetPeer{device: device}
+	peer.hasPeer = true
 	peer.pkaOn = false
 	peer.amnezia = ipcSetAmneziaWG{}
+	peer.pka = nil
+	peer.stagedEndpoint = nil
+	peer.stagedPresharedKey = nil
+	peer.stagedProtocolVersion = nil
+	peer.allowedIPOps = nil
 
 	// Load/create the peer we are configuring.
 	var publicKey NoisePublicKey
@@ -446,6 +790,7 @@ func (device *Device) handlePublicKeyLine(peer *ipcSetPeer, value string) error 
 	if err != nil {
 		return ipcErrorf(ipc.IpcErrorInvalid, "failed to get peer by public key: %w", err)
 	}
+	peer.publicKey = publicKey
 
 	// Ignore peer with the same public key as this device.
 	device.staticIdentity.RLock()
@@ -456,15 +801,6 @@ func (device *Device) handlePublicKeyLine(peer *ipcSetPeer, value string) error 
 		peer.Peer = &Peer{}
 	} else {
 		peer.Peer = device.LookupPeer(publicKey)
-	}
-
-	peer.created = peer.Peer == nil
-	if peer.created {
-		peer.Peer, err = device.NewPeer(publicKey)
-		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to create new peer: %w", err)
-		}
-		device.log.Debugf("%v - UAPI: Created", peer.Peer)
 	}
 	return nil
 }
@@ -480,9 +816,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		if value != "true" {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set update only, invalid value: %v", value)
 		}
-		if peer.created && !peer.dummy {
-			device.RemovePeer(peer.handshake.remoteStatic)
-			peer.Peer = &Peer{}
+		if peer.Peer == nil && !peer.dummy {
 			peer.dummy = true
 		}
 
@@ -491,11 +825,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		if value != "true" {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set remove, invalid value: %v", value)
 		}
-		if !peer.dummy {
-			device.log.Debugf("%v - UAPI: Removing", peer.Peer)
-			device.RemovePeer(peer.handshake.remoteStatic)
-		}
-		peer.Peer = &Peer{}
+		peer.remove = true
 		peer.dummy = true
 
 	case "preshared_key":
@@ -508,35 +838,30 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		if peer.dummy {
 			return nil
 		}
-		if err := device.setPeerPresharedKeyLocked(peer.handshake.remoteStatic, presharedKey); err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set preshared key: %w", err)
-		}
+		peer.stagedPresharedKey = &presharedKey
 
 	case "endpoint":
 		device.log.Debugf("%v - UAPI: Updating endpoint", peer.Peer)
 		if peer.dummy {
 			return nil
 		}
-		if err := device.setPeerEndpointLocked(peer.handshake.remoteStatic, value); err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "%w", err)
-		}
+		peer.stagedEndpoint = &value
 
 	case "persistent_keepalive_interval":
 		device.log.Debugf("%v - UAPI: Updating persistent keepalive interval", peer.Peer)
 
-		secs, err := strconv.ParseUint(value, 10, 16)
+		keepalive, err := parseAmneziaRangeUAPIValue("persistent_keepalive_interval", value, uint32(^uint16(0)))
 		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set persistent keepalive interval: %w", err)
+			return err
+		}
+		if keepalive.Min == 0 && keepalive.Max == 0 {
+			keepalive = AmneziaWGRange{}
 		}
 
-		if peer.dummy {
-			return nil
+		if !peer.dummy {
+			peer.pka = &keepalive
+			peer.pkaIsRange = keepalive.Set && strings.Contains(value, "-")
 		}
-		old, err := device.setPeerPersistentKeepaliveIntervalLocked(peer.handshake.remoteStatic, uint16(secs), false)
-		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set persistent keepalive interval: %w", err)
-		}
-		peer.pkaOn = old == 0 && secs != 0
 
 	case "replace_allowed_ips":
 		device.log.Debugf("%v - UAPI: Removing all allowedips", peer.Peer)
@@ -546,9 +871,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		if peer.dummy {
 			return nil
 		}
-		if err := device.replacePeerAllowedIPsLocked(peer.handshake.remoteStatic, nil); err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to replace allowedips: %w", err)
-		}
+		peer.allowedIPOps = append(peer.allowedIPOps, ipcSetAllowedIPOp{replace: true})
 
 	case "allowed_ip":
 		add := true
@@ -566,15 +889,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		if peer.dummy {
 			return nil
 		}
-		if add {
-			if err := device.addPeerAllowedIPLocked(peer.handshake.remoteStatic, prefix); err != nil {
-				return ipcErrorf(ipc.IpcErrorInvalid, "failed to set allowed ip: %w", err)
-			}
-		} else {
-			if err := device.removePeerAllowedIPLocked(peer.handshake.remoteStatic, prefix); err != nil {
-				return ipcErrorf(ipc.IpcErrorInvalid, "failed to set allowed ip: %w", err)
-			}
-		}
+		peer.allowedIPOps = append(peer.allowedIPOps, ipcSetAllowedIPOp{add: add, prefix: prefix})
 
 	case "protocol_version":
 		version, err := strconv.Atoi(value)
@@ -587,9 +902,7 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 			}
 			return nil
 		}
-		if err := device.setPeerProtocolVersionLocked(peer.handshake.remoteStatic, version); err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "%w", err)
-		}
+		peer.stagedProtocolVersion = &version
 
 	default:
 		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI peer key: %v", key)

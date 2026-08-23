@@ -6,6 +6,7 @@
 package device
 
 import (
+	"encoding/hex"
 	"errors"
 	"net/netip"
 	"slices"
@@ -366,6 +367,13 @@ func TestValidateAmneziaWGConfigRejectsUnsafeNumericValues(t *testing.T) {
 			},
 			wantErr: "generated length must be <=",
 		},
+		{
+			name: "reject after time overflows runtime timers",
+			mutate: func(cfg *AmneziaWGConfig) {
+				cfg.RejectAfterTime = AmneziaWGRange{Min: maxAmneziaWGRejectAfterTimeMax + 1, Max: maxAmneziaWGRejectAfterTimeMax + 1, Set: true}
+			},
+			wantErr: "reject after time maximum must be <=",
+		},
 	}
 
 	for _, tt := range tests {
@@ -411,6 +419,13 @@ func TestValidateAmneziaWGConfigPatchRejectsUnsafeNumericValues(t *testing.T) {
 			},
 			wantErr: "generated length must be non-negative",
 		},
+		{
+			name: "reject after time overflows runtime timers",
+			patch: AmneziaWGConfigPatch{
+				RejectAfterTime: &AmneziaWGRange{Min: maxAmneziaWGRejectAfterTimeMax + 1, Max: maxAmneziaWGRejectAfterTimeMax + 1, Set: true},
+			},
+			wantErr: "reject after time maximum must be <=",
+		},
 	}
 
 	for _, tt := range tests {
@@ -420,6 +435,589 @@ func TestValidateAmneziaWGConfigPatchRejectsUnsafeNumericValues(t *testing.T) {
 				t.Fatalf("ValidateAmneziaWGConfigPatch() = %v, want %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestAmneziaWG31TypedConfigAndValidation(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	var key AmneziaWGHeaderProtectionKey
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	cfg := DefaultAmneziaWGConfig()
+	cfg.Version = AmneziaWGV3_1
+	cfg.InitPadding = 12
+	cfg.ResponsePadding = 12
+	cfg.CookiePadding = 12
+	cfg.TransportPadding = 12
+	cfg.HeaderProtectionKey = key
+	cfg.ContentPadding = AmneziaWGRange{Min: 2, Max: 8, Set: true}
+	cfg.RekeyAfterTime = AmneziaWGRange{Min: 90, Max: 120, Set: true}
+	cfg.RandomTrailers = true
+	cfg.DisableCookies = true
+
+	if err := dev.SetAmneziaWGConfig(cfg); err != nil {
+		t.Fatalf("SetAmneziaWGConfig(v3.1): %v", err)
+	}
+	if got := dev.AmneziaWGConfig(); got != cfg {
+		t.Fatalf("AmneziaWGConfig() = %+v, want %+v", got, cfg)
+	}
+
+	cfg.InitPadding = 11
+	if err := ValidateAmneziaWGConfig(cfg); err == nil || !strings.Contains(err.Error(), "header protection") {
+		t.Fatalf("ValidateAmneziaWGConfig(short S1) = %v, want header protection error", err)
+	}
+
+	cfg = DefaultAmneziaWGConfig()
+	cfg.Version = AmneziaWGV2
+	cfg.ContentPadding = AmneziaWGRange{Min: 1, Max: 1, Set: true}
+	if err := ValidateAmneziaWGConfig(cfg); err == nil || !strings.Contains(err.Error(), "3.1 fields") {
+		t.Fatalf("ValidateAmneziaWGConfig(v2 with v3 field) = %v, want v3 field error", err)
+	}
+}
+
+func TestAmneziaWGExplicitV2RejectsRangedPersistentKeepalive(t *testing.T) {
+	peerKey := mustPrivateKey(t, 109).PublicKey()
+	awg := DefaultAmneziaWGConfig()
+	awg.Version = AmneziaWGV2
+	keepalive := AmneziaWGRange{Min: 5, Max: 9, Set: true}
+
+	err := ValidateConfig(DeviceConfig{
+		AmneziaWG: awg,
+		Peers: []PeerConfig{{
+			PublicKey:                peerKey,
+			ProtocolVersion:          1,
+			PersistentKeepaliveRange: &keepalive,
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "persistent keepalive range") {
+		t.Fatalf("ValidateConfig(v2 with ranged pka) = %v, want persistent keepalive range error", err)
+	}
+
+	keepalive = AmneziaWGRange{Min: 7, Max: 7, Set: true}
+	err = ValidateConfig(DeviceConfig{
+		AmneziaWG: awg,
+		Peers: []PeerConfig{{
+			PublicKey:                peerKey,
+			ProtocolVersion:          1,
+			PersistentKeepaliveRange: &keepalive,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ValidateConfig(v2 with fixed pka range): %v", err)
+	}
+}
+
+func TestAmneziaWG31UAPIRoundTrip(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	keyHex := strings.Repeat("11", 32)
+	conf := strings.Join([]string{
+		"s1=12",
+		"s2=12",
+		"s3=12",
+		"s4=12",
+		"header_protection_key=" + keyHex,
+		"content_padding_addition=3-7",
+		"rekey_after_time=90-120",
+		"random_trailers=true",
+		"disable_cookies=true",
+		"",
+	}, "\n")
+	if err := dev.IpcSet(conf); err != nil {
+		t.Fatalf("IpcSet(v3.1): %v", err)
+	}
+
+	got, err := dev.IpcGet()
+	if err != nil {
+		t.Fatalf("IpcGet: %v", err)
+	}
+	for _, want := range []string{
+		"header_protection_key=" + keyHex,
+		"content_padding_addition=3-7",
+		"rekey_after_time=90-120",
+		"random_trailers=true",
+		"disable_cookies=true",
+	} {
+		if !strings.Contains(got, want+"\n") {
+			t.Fatalf("IpcGet() missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+func TestAmneziaWGPeerUAPIEmitsExplicitClears(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	var key AmneziaWGHeaderProtectionKey
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	base := DefaultAmneziaWGConfig()
+	base.Version = AmneziaWGV3_1
+	base.InitPadding = 12
+	base.ResponsePadding = 12
+	base.CookiePadding = 12
+	base.TransportPadding = 12
+	base.HeaderProtectionKey = key
+	base.ContentPadding = AmneziaWGRange{Min: 3, Max: 7, Set: true}
+	base.RekeyAfterTime = AmneziaWGRange{Min: 90, Max: 120, Set: true}
+	base.RandomTrailers = true
+	base.DisableCookies = true
+	if err := dev.SetAmneziaWGConfig(base); err != nil {
+		t.Fatalf("SetAmneziaWGConfig: %v", err)
+	}
+
+	peerKey := mustPrivateKey(t, 130).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	zeroKey := AmneziaWGHeaderProtectionKey{}
+	unsetRange := AmneziaWGRange{}
+	disabled := false
+	patch := AmneziaWGConfigPatch{
+		HeaderProtectionKey: &zeroKey,
+		ContentPadding:      &unsetRange,
+		RekeyAfterTime:      &unsetRange,
+		RandomTrailers:      &disabled,
+		DisableCookies:      &disabled,
+	}
+	if err := dev.SetPeerAmneziaWGConfigPatch(peerKey, patch); err != nil {
+		t.Fatalf("SetPeerAmneziaWGConfigPatch: %v", err)
+	}
+
+	got, err := dev.IpcGet()
+	if err != nil {
+		t.Fatalf("IpcGet: %v", err)
+	}
+	for _, want := range []string{
+		"header_protection_key=" + strings.Repeat("00", 32),
+		"content_padding_addition=off",
+		"rekey_after_time=off",
+		"random_trailers=false",
+		"disable_cookies=false",
+	} {
+		if !strings.Contains(got, want+"\n") {
+			t.Fatalf("IpcGet() missing peer clear %q in:\n%s", want, got)
+		}
+	}
+
+	replayed := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(replayed.Close)
+	var replay strings.Builder
+	for _, line := range strings.Split(got, "\n") {
+		switch {
+		case strings.HasPrefix(line, "last_handshake_time_"),
+			strings.HasPrefix(line, "tx_bytes="),
+			strings.HasPrefix(line, "rx_bytes="):
+			continue
+		case line == "":
+			continue
+		default:
+			replay.WriteString(line)
+			replay.WriteByte('\n')
+		}
+	}
+	if err := replayed.IpcSet(replay.String()); err != nil {
+		t.Fatalf("replay IpcSet: %v", err)
+	}
+	cfg, ok := replayed.PeerConfig(peerKey)
+	if !ok || cfg.AmneziaWG == nil {
+		t.Fatalf("replayed PeerConfig missing AWG override")
+	}
+	if !cfg.AmneziaWG.HeaderProtectionKey.IsZero() || cfg.AmneziaWG.ContentPadding.Set ||
+		cfg.AmneziaWG.RekeyAfterTime.Set || cfg.AmneziaWG.RandomTrailers || cfg.AmneziaWG.DisableCookies {
+		t.Fatalf("replayed peer AWG clears not preserved: %+v", *cfg.AmneziaWG)
+	}
+}
+
+func TestPeerPersistentKeepaliveRangeAPIAndUAPI(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	peerKey := mustPrivateKey(t, 111).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	rng := AmneziaWGRange{Min: 5, Max: 9, Set: true}
+	if err := dev.SetPeerPersistentKeepaliveRange(peerKey, rng); err != nil {
+		t.Fatalf("SetPeerPersistentKeepaliveRange: %v", err)
+	}
+	got, ok := dev.PeerPersistentKeepaliveRange(peerKey)
+	if !ok || got != rng {
+		t.Fatalf("PeerPersistentKeepaliveRange() = %+v, %v; want %+v, true", got, ok, rng)
+	}
+	peerCfg, ok := dev.PeerConfig(peerKey)
+	if !ok || peerCfg.PersistentKeepaliveRange == nil || *peerCfg.PersistentKeepaliveRange != rng {
+		t.Fatalf("PeerConfig().PersistentKeepaliveRange = %+v, %v; want %+v", peerCfg.PersistentKeepaliveRange, ok, rng)
+	}
+
+	publicKeyHex := hex.EncodeToString(peerKey[:])
+	if err := dev.IpcSet("public_key=" + publicKeyHex + "\npersistent_keepalive_interval=7-11\n"); err != nil {
+		t.Fatalf("IpcSet(ranged pka): %v", err)
+	}
+	got, ok = dev.PeerPersistentKeepaliveRange(peerKey)
+	if want := (AmneziaWGRange{Min: 7, Max: 11, Set: true}); !ok || got != want {
+		t.Fatalf("PeerPersistentKeepaliveRange() after UAPI = %+v, %v; want %+v, true", got, ok, want)
+	}
+	gotUAPI, err := dev.IpcGet()
+	if err != nil {
+		t.Fatalf("IpcGet: %v", err)
+	}
+	if !strings.Contains(gotUAPI, "persistent_keepalive_interval=7-11\n") {
+		t.Fatalf("IpcGet() missing ranged persistent keepalive in:\n%s", gotUAPI)
+	}
+}
+
+func TestSetPeerPersistentKeepaliveRangeRejectsExplicitV2(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	peerKey := mustPrivateKey(t, 113).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	awg := DefaultAmneziaWGConfig()
+	awg.Version = AmneziaWGV2
+	if err := dev.SetPeerAmneziaWGConfig(peerKey, awg); err != nil {
+		t.Fatalf("SetPeerAmneziaWGConfig(v2): %v", err)
+	}
+
+	err := dev.SetPeerPersistentKeepaliveRange(peerKey, AmneziaWGRange{Min: 5, Max: 9, Set: true})
+	if err == nil || !strings.Contains(err.Error(), "persistent keepalive range") {
+		t.Fatalf("SetPeerPersistentKeepaliveRange(v2) = %v, want persistent keepalive range error", err)
+	}
+
+	if err := dev.SetPeerPersistentKeepaliveRange(peerKey, AmneziaWGRange{Min: 7, Max: 7, Set: true}); err != nil {
+		t.Fatalf("SetPeerPersistentKeepaliveRange(v2 fixed): %v", err)
+	}
+}
+
+func TestPeerPersistentKeepaliveFixedRangePreserved(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	peerKey := mustPrivateKey(t, 116).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+
+	rng := AmneziaWGRange{Min: 5, Max: 5, Set: true}
+	if err := dev.SetPeerPersistentKeepaliveRange(peerKey, rng); err != nil {
+		t.Fatalf("SetPeerPersistentKeepaliveRange: %v", err)
+	}
+	peerCfg, ok := dev.PeerConfig(peerKey)
+	if !ok {
+		t.Fatal("PeerConfig() reported missing peer")
+	}
+	if peerCfg.PersistentKeepaliveRange == nil || *peerCfg.PersistentKeepaliveRange != rng {
+		t.Fatalf("PeerConfig().PersistentKeepaliveRange = %+v, want %+v", peerCfg.PersistentKeepaliveRange, rng)
+	}
+	if peerCfg.PersistentKeepaliveInterval != 5 {
+		t.Fatalf("PeerConfig().PersistentKeepaliveInterval = %d, want 5", peerCfg.PersistentKeepaliveInterval)
+	}
+
+	if err := dev.SetPeerPersistentKeepaliveInterval(peerKey, 5); err != nil {
+		t.Fatalf("SetPeerPersistentKeepaliveInterval: %v", err)
+	}
+	peerCfg, ok = dev.PeerConfig(peerKey)
+	if !ok {
+		t.Fatal("PeerConfig() reported missing peer after interval set")
+	}
+	if peerCfg.PersistentKeepaliveRange != nil {
+		t.Fatalf("PeerConfig().PersistentKeepaliveRange = %+v, want nil after interval set", peerCfg.PersistentKeepaliveRange)
+	}
+	if peerCfg.PersistentKeepaliveInterval != 5 {
+		t.Fatalf("PeerConfig().PersistentKeepaliveInterval after interval set = %d, want 5", peerCfg.PersistentKeepaliveInterval)
+	}
+}
+
+func TestPeerPersistentKeepaliveFixedUAPIRangePreserved(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	peerKey := mustPrivateKey(t, 117).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+
+	if err := dev.IpcSet("public_key=" + hex.EncodeToString(peerKey[:]) + "\npersistent_keepalive_interval=6-6\n"); err != nil {
+		t.Fatalf("IpcSet(fixed ranged pka): %v", err)
+	}
+	peerCfg, ok := dev.PeerConfig(peerKey)
+	if !ok {
+		t.Fatal("PeerConfig() reported missing peer")
+	}
+	if want := (AmneziaWGRange{Min: 6, Max: 6, Set: true}); peerCfg.PersistentKeepaliveRange == nil || *peerCfg.PersistentKeepaliveRange != want {
+		t.Fatalf("PeerConfig().PersistentKeepaliveRange = %+v, want %+v", peerCfg.PersistentKeepaliveRange, want)
+	}
+
+	if err := dev.IpcSet("public_key=" + hex.EncodeToString(peerKey[:]) + "\npersistent_keepalive_interval=6\n"); err != nil {
+		t.Fatalf("IpcSet(fixed pka): %v", err)
+	}
+	peerCfg, ok = dev.PeerConfig(peerKey)
+	if !ok {
+		t.Fatal("PeerConfig() reported missing peer after fixed pka")
+	}
+	if peerCfg.PersistentKeepaliveRange != nil {
+		t.Fatalf("PeerConfig().PersistentKeepaliveRange = %+v, want nil after fixed pka", peerCfg.PersistentKeepaliveRange)
+	}
+	if peerCfg.PersistentKeepaliveInterval != 6 {
+		t.Fatalf("PeerConfig().PersistentKeepaliveInterval = %d, want 6", peerCfg.PersistentKeepaliveInterval)
+	}
+}
+
+func TestPeerSpecPreservesPersistentKeepaliveRange(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	peerKey := mustPrivateKey(t, 112).PublicKey()
+	rng := AmneziaWGRange{Min: 12, Max: 18, Set: true}
+	spec := PeerSpec{
+		PublicKey:                peerKey,
+		ProtocolVersion:          1,
+		PersistentKeepaliveRange: &rng,
+		Activation:               PeerActivationOnDemand,
+	}
+	if err := dev.UpsertPeer(spec); err != nil {
+		t.Fatalf("UpsertPeer: %v", err)
+	}
+	got, ok := dev.PeerSpec(peerKey)
+	if !ok || got.PersistentKeepaliveRange == nil || *got.PersistentKeepaliveRange != rng {
+		t.Fatalf("PeerSpec().PersistentKeepaliveRange = %+v, %v; want %+v", got.PersistentKeepaliveRange, ok, rng)
+	}
+}
+
+func TestAmneziaWGUAPIStagesPersistentKeepaliveRange(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	peerKey := mustPrivateKey(t, 113).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	if err := dev.SetPeerPersistentKeepaliveInterval(peerKey, 3); err != nil {
+		t.Fatalf("SetPeerPersistentKeepaliveInterval: %v", err)
+	}
+
+	conf := "public_key=" + hex.EncodeToString(peerKey[:]) + "\n" +
+		"persistent_keepalive_interval=7-11\n" +
+		"s4=-1\n"
+	if err := dev.IpcSet(conf); err == nil {
+		t.Fatal("IpcSet(invalid after pka) succeeded")
+	}
+
+	got, ok := dev.PeerPersistentKeepaliveRange(peerKey)
+	if !ok || got != (AmneziaWGRange{Min: 3, Max: 3, Set: true}) {
+		t.Fatalf("PeerPersistentKeepaliveRange() after rejected UAPI = %+v, %v; want fixed 3", got, ok)
+	}
+}
+
+func TestAmneziaWGUAPIRollsBackDeviceDefaultBeforeLaterPeerFailure(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	peerKey := mustPrivateKey(t, 120).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	oldCfg := dev.AmneziaWGConfig()
+	oldCfg.TransportPadding = 4
+	if err := dev.SetAmneziaWGConfig(oldCfg); err != nil {
+		t.Fatalf("SetAmneziaWGConfig: %v", err)
+	}
+
+	conf := "s4=12\n" +
+		"public_key=" + hex.EncodeToString(peerKey[:]) + "\n" +
+		"s4=-1\n"
+	if err := dev.IpcSet(conf); err == nil {
+		t.Fatal("IpcSet(invalid peer after device AWG change) succeeded")
+	}
+
+	got := dev.AmneziaWGConfig()
+	if got.TransportPadding != oldCfg.TransportPadding {
+		t.Fatalf("AmneziaWGConfig().TransportPadding after rejected UAPI = %d, want %d", got.TransportPadding, oldCfg.TransportPadding)
+	}
+}
+
+func TestUAPIStagesPeerPresharedKey(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	peerKey := mustPrivateKey(t, 116).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	var oldKey NoisePresharedKey
+	var newKey NoisePresharedKey
+	for i := range oldKey {
+		oldKey[i] = byte(1 + i)
+		newKey[i] = byte(101 + i)
+	}
+	if err := dev.SetPeerPresharedKey(peerKey, oldKey); err != nil {
+		t.Fatalf("SetPeerPresharedKey: %v", err)
+	}
+
+	conf := "public_key=" + hex.EncodeToString(peerKey[:]) + "\n" +
+		"preshared_key=" + hex.EncodeToString(newKey[:]) + "\n" +
+		"s4=-1\n"
+	if err := dev.IpcSet(conf); err == nil {
+		t.Fatal("IpcSet(invalid after preshared key) succeeded")
+	}
+
+	peerCfg, ok := dev.PeerConfig(peerKey)
+	if !ok {
+		t.Fatal("PeerConfig() reported missing peer")
+	}
+	if peerCfg.PresharedKey != oldKey {
+		t.Fatal("PeerConfig().PresharedKey changed after rejected UAPI")
+	}
+}
+
+func TestUAPIStagesPeerAllowedIPReplacement(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	peerKey := mustPrivateKey(t, 117).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	oldPrefix := netip.MustParsePrefix("10.0.0.1/32")
+	if err := dev.AddPeerAllowedIP(peerKey, oldPrefix); err != nil {
+		t.Fatalf("AddPeerAllowedIP: %v", err)
+	}
+
+	conf := "public_key=" + hex.EncodeToString(peerKey[:]) + "\n" +
+		"replace_allowed_ips=true\n" +
+		"allowed_ip=192.0.2.1/32\n" +
+		"s4=-1\n"
+	if err := dev.IpcSet(conf); err == nil {
+		t.Fatal("IpcSet(invalid after allowed IP replacement) succeeded")
+	}
+
+	peerCfg, ok := dev.PeerConfig(peerKey)
+	if !ok {
+		t.Fatal("PeerConfig() reported missing peer")
+	}
+	if !slices.Equal(peerCfg.AllowedIPs, []netip.Prefix{oldPrefix}) {
+		t.Fatalf("PeerConfig().AllowedIPs after rejected UAPI = %v, want %v", peerCfg.AllowedIPs, []netip.Prefix{oldPrefix})
+	}
+}
+
+func TestUAPIRollsBackCommittedPeerRemovalBeforeLaterFailure(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+
+	peerKey := mustPrivateKey(t, 118).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	oldPrefix := netip.MustParsePrefix("10.0.0.2/32")
+	if err := dev.AddPeerAllowedIP(peerKey, oldPrefix); err != nil {
+		t.Fatalf("AddPeerAllowedIP: %v", err)
+	}
+
+	conf := "public_key=" + hex.EncodeToString(peerKey[:]) + "\n" +
+		"remove=true\n" +
+		"public_key=" + hex.EncodeToString(peerKey[:]) + "\n" +
+		"allowed_ip=192.0.2.2/32\n" +
+		"s4=-1\n"
+	if err := dev.IpcSet(conf); err == nil {
+		t.Fatal("IpcSet(invalid after remove/recreate) succeeded")
+	}
+
+	peerCfg, ok := dev.PeerConfig(peerKey)
+	if !ok {
+		t.Fatal("PeerConfig() reported missing peer after rejected remove/recreate")
+	}
+	if !slices.Equal(peerCfg.AllowedIPs, []netip.Prefix{oldPrefix}) {
+		t.Fatalf("PeerConfig().AllowedIPs after rejected remove/recreate = %v, want %v", peerCfg.AllowedIPs, []netip.Prefix{oldPrefix})
+	}
+}
+
+func TestAmneziaWGUAPIStagesEndpointWithPersistentKeepaliveRange(t *testing.T) {
+	tunDev := newChannelTUN()
+	bind := &fakeTransitionBind{id: "bind0", size: 1}
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+	waitForDeviceUp(t, dev)
+
+	peerKey := mustPrivateKey(t, 114).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	if err := dev.SetPeerEndpoint(peerKey, "127.0.0.1:51820"); err != nil {
+		t.Fatalf("SetPeerEndpoint: %v", err)
+	}
+	if err := dev.SetPeerPersistentKeepaliveInterval(peerKey, 3); err != nil {
+		t.Fatalf("SetPeerPersistentKeepaliveInterval: %v", err)
+	}
+
+	conf := "public_key=" + hex.EncodeToString(peerKey[:]) + "\n" +
+		"endpoint=127.0.0.1:51821\n" +
+		"persistent_keepalive_interval=7-11\n" +
+		"s4=-1\n"
+	if err := dev.IpcSet(conf); err == nil {
+		t.Fatal("IpcSet(invalid after endpoint and pka) succeeded")
+	}
+
+	peerCfg, ok := dev.PeerConfig(peerKey)
+	if !ok {
+		t.Fatal("PeerConfig() reported missing peer")
+	}
+	if peerCfg.Endpoint != "127.0.0.1:51820" {
+		t.Fatalf("PeerConfig().Endpoint after rejected UAPI = %q, want old endpoint", peerCfg.Endpoint)
+	}
+	got, ok := dev.PeerPersistentKeepaliveRange(peerKey)
+	if !ok || got != (AmneziaWGRange{Min: 3, Max: 3, Set: true}) {
+		t.Fatalf("PeerPersistentKeepaliveRange() after rejected UAPI = %+v, %v; want fixed 3", got, ok)
+	}
+}
+
+func TestAmneziaWGUAPIDoesNotApplyKeepaliveWhenStagedEndpointFails(t *testing.T) {
+	tunDev := newChannelTUN()
+	bind := &rejectingEndpointBind{
+		fakeTransitionBind: fakeTransitionBind{id: "bind0", size: 1},
+		err:                errors.New("parser rejected endpoint"),
+	}
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, ""), nil, DeviceOptions{WorkerCount: 1})
+	t.Cleanup(dev.Close)
+	waitForDeviceUp(t, dev)
+
+	peerKey := mustPrivateKey(t, 115).PublicKey()
+	if _, err := dev.NewPeer(peerKey); err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	peer := dev.LookupPeer(peerKey)
+	peer.endpoint.Lock()
+	peer.endpoint.val = fakeBindEndpoint{bindID: "bind0", dst: "127.0.0.1:51820"}
+	peer.endpoint.address = "127.0.0.1:51820"
+	peer.endpoint.Unlock()
+	if err := dev.SetPeerPersistentKeepaliveInterval(peerKey, 3); err != nil {
+		t.Fatalf("SetPeerPersistentKeepaliveInterval: %v", err)
+	}
+
+	conf := "public_key=" + hex.EncodeToString(peerKey[:]) + "\n" +
+		"endpoint=127.0.0.1:51821\n" +
+		"persistent_keepalive_interval=7-11\n"
+	err := dev.IpcSet(conf)
+	if err == nil || !strings.Contains(err.Error(), "parser rejected endpoint") {
+		t.Fatalf("IpcSet(rejecting endpoint) = %v, want parser error", err)
+	}
+
+	peerCfg, ok := dev.PeerConfig(peerKey)
+	if !ok {
+		t.Fatal("PeerConfig() reported missing peer")
+	}
+	if peerCfg.Endpoint != "127.0.0.1:51820" {
+		t.Fatalf("PeerConfig().Endpoint after rejected endpoint = %q, want old endpoint", peerCfg.Endpoint)
+	}
+	got, ok := dev.PeerPersistentKeepaliveRange(peerKey)
+	if !ok || got != (AmneziaWGRange{Min: 3, Max: 3, Set: true}) {
+		t.Fatalf("PeerPersistentKeepaliveRange() after rejected endpoint = %+v, %v; want fixed 3", got, ok)
 	}
 }
 
@@ -1086,6 +1684,15 @@ func (p *validationEndpointParser) ParseEndpoint(s string) (conn.Endpoint, error
 		return nil, p.err
 	}
 	return fakeBindEndpoint{bindID: "validation", dst: s}, nil
+}
+
+type rejectingEndpointBind struct {
+	fakeTransitionBind
+	err error
+}
+
+func (b *rejectingEndpointBind) ParseEndpoint(string) (conn.Endpoint, error) {
+	return nil, b.err
 }
 
 func sortPrefixes(prefixes []netip.Prefix) {

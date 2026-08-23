@@ -31,6 +31,7 @@ type PeerSpec struct {
 	ProtocolVersion             int
 	Endpoint                    *PeerEndpoint
 	PersistentKeepaliveInterval uint16
+	PersistentKeepaliveRange    *AmneziaWGRange
 	AllowedIPs                  []netip.Prefix
 	AmneziaWG                   *AmneziaWGConfig
 	Activation                  PeerActivationMode
@@ -57,6 +58,10 @@ func clonePeerSpec(spec PeerSpec) PeerSpec {
 		amnezia := *spec.AmneziaWG
 		out.AmneziaWG = &amnezia
 	}
+	if spec.PersistentKeepaliveRange != nil {
+		keepalive := *spec.PersistentKeepaliveRange
+		out.PersistentKeepaliveRange = &keepalive
+	}
 	return out
 }
 
@@ -80,6 +85,11 @@ func (device *Device) validatePeerSpec(spec PeerSpec) error {
 	if spec.AmneziaWG != nil {
 		if err := ValidateAmneziaWGConfig(*spec.AmneziaWG); err != nil {
 			return fmt.Errorf("amneziawg: %w", err)
+		}
+	}
+	if spec.PersistentKeepaliveRange != nil {
+		if err := spec.PersistentKeepaliveRange.Validate("persistent keepalive interval", uint32(^uint16(0))); err != nil {
+			return err
 		}
 	}
 	if spec.Endpoint == nil {
@@ -135,7 +145,9 @@ func (device *Device) UpsertPeer(spec PeerSpec) error {
 	if !created {
 		oldSpec = device.peerSpecLocked(peer, oldCfg)
 	}
-	activate := device.isUp() && (spec.Activation == PeerActivationEager || spec.PersistentKeepaliveInterval > 0)
+	activate := device.isUp() && (spec.Activation == PeerActivationEager ||
+		spec.PersistentKeepaliveInterval > 0 ||
+		(spec.PersistentKeepaliveRange != nil && spec.PersistentKeepaliveRange.Set))
 	if activate {
 		if err := device.checkActivePeerLimitLocked(peer); err != nil {
 			if created {
@@ -180,6 +192,15 @@ func peerSpecExpiresSession(old PeerConfig, spec PeerSpec) bool {
 	if old.ProtocolVersion != spec.ProtocolVersion {
 		return true
 	}
+	if (old.PersistentKeepaliveRange == nil) != (spec.PersistentKeepaliveRange == nil) {
+		return true
+	}
+	if old.PersistentKeepaliveRange != nil && *old.PersistentKeepaliveRange != *spec.PersistentKeepaliveRange {
+		return true
+	}
+	if old.PersistentKeepaliveRange == nil && old.PersistentKeepaliveInterval != spec.PersistentKeepaliveInterval {
+		return true
+	}
 	oldAmnezia := old.AmneziaWG
 	newAmnezia := spec.AmneziaWG
 	if (oldAmnezia == nil) != (newAmnezia == nil) {
@@ -201,7 +222,11 @@ func (device *Device) applyPeerSpecLocked(peer *Peer, spec PeerSpec) error {
 	if err := device.replacePeerAllowedIPsLocked(spec.PublicKey, spec.AllowedIPs); err != nil {
 		return fmt.Errorf("allowed IPs: %w", err)
 	}
-	if _, err := device.setPeerPersistentKeepaliveIntervalLocked(spec.PublicKey, spec.PersistentKeepaliveInterval, false); err != nil {
+	if spec.PersistentKeepaliveRange != nil {
+		if _, err := device.setPeerPersistentKeepaliveRangeLocked(spec.PublicKey, *spec.PersistentKeepaliveRange, false); err != nil {
+			return fmt.Errorf("persistent keepalive interval: %w", err)
+		}
+	} else if _, err := device.setPeerPersistentKeepaliveIntervalLocked(spec.PublicKey, spec.PersistentKeepaliveInterval, false); err != nil {
 		return fmt.Errorf("persistent keepalive interval: %w", err)
 	}
 	if err := device.setPeerAmneziaWGConfigLocked(spec.PublicKey, spec.AmneziaWG); err != nil {
@@ -268,7 +293,7 @@ func (device *Device) PeerSnapshot(publicKey NoisePublicKey) (PeerSnapshot, bool
 	}
 	if !cfg.LastHandshakeTime.IsZero() {
 		snapshot.LastHandshakeTime = cfg.LastHandshakeTime
-		snapshot.Connected = snapshot.Active && now.Sub(cfg.LastHandshakeTime) <= RejectAfterTime
+		snapshot.Connected = snapshot.Active && now.Sub(cfg.LastHandshakeTime) <= peer.rejectAfterTimeMax()
 	}
 	return snapshot, true
 }
@@ -279,6 +304,7 @@ func (device *Device) peerSpecLocked(peer *Peer, cfg PeerConfig) PeerSpec {
 		PresharedKey:                cfg.PresharedKey,
 		ProtocolVersion:             cfg.ProtocolVersion,
 		PersistentKeepaliveInterval: cfg.PersistentKeepaliveInterval,
+		PersistentKeepaliveRange:    cfg.PersistentKeepaliveRange,
 		AllowedIPs:                  slices.Clone(cfg.AllowedIPs),
 		AmneziaWG:                   cfg.AmneziaWG,
 		Activation:                  peer.activation,
@@ -294,6 +320,10 @@ func (device *Device) peerSpecLocked(peer *Peer, cfg PeerConfig) PeerSpec {
 	if spec.AmneziaWG != nil {
 		amnezia := *spec.AmneziaWG
 		spec.AmneziaWG = &amnezia
+	}
+	if spec.PersistentKeepaliveRange != nil {
+		keepalive := *spec.PersistentKeepaliveRange
+		spec.PersistentKeepaliveRange = &keepalive
 	}
 	slices.SortFunc(spec.AllowedIPs, func(a, b netip.Prefix) int {
 		return strings.Compare(a.String(), b.String())

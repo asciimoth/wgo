@@ -6,7 +6,13 @@ RUN apt-get update \
 	&& apt-get install -y --no-install-recommends git \
 	&& rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-go.git /src/upstream
+ARG AMNEZIAWG_GO_COMMIT=1b86b2ae0e493e7ea93f8c1a0f0cb6735b1551f1
+
+RUN git init /src/upstream \
+	&& cd /src/upstream \
+	&& git remote add origin https://github.com/amnezia-vpn/amneziawg-go.git \
+	&& git fetch --depth 1 origin "${AMNEZIAWG_GO_COMMIT}" \
+	&& git checkout FETCH_HEAD
 
 WORKDIR /src/upstream
 

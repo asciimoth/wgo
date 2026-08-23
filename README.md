@@ -14,8 +14,8 @@
 - added `Device` configuration methods matching UAPI get/set options
 - added multi-controller peer and transport APIs with a [guide](./docs/multi-controller-guide.md)
 - added leveled logging
-- implemented [amnesiawg-go](https://github.com/amnezia-vpn/amneziawg-go)-compatible obfuscation
-    - added support for per-peer obfuscation options (with a [nuance](./ARCHITECTURE.md#amneziawg-extension))
+- implemented [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go)-compatible obfuscation, including typed AWG 3.1 configuration fields
+    - added support for per-peer obfuscation options, migration notes, and receive-profile guidance in [ARCHITECTURE.md](./ARCHITECTURE.md#amneziawg-extension)
 - added more end-to-end and [compatibility](./tests/compat) tests with other WireGuard implementations
 - added [performance tests](./tests/perf) with a [comparison](./performance-log.md) against other WireGuard implementations
 - [WASM builds supported](https://asciimoth.github.io/wg-web-demo/)

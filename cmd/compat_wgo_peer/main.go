@@ -25,12 +25,13 @@ import (
 )
 
 type config struct {
-	iface      string
-	tunLocal   string
-	peerRoute  string
-	listenPort int
-	mtu        int
-	logLevel   string
+	iface        string
+	tunLocal     string
+	peerRoute    string
+	listenPort   int
+	mtu          int
+	logLevel     string
+	forceCookies bool
 }
 
 func main() {
@@ -64,7 +65,9 @@ func run() error {
 		_ = tunDev.Close()
 		return err
 	}
-	dev := device.NewDevice(tunDev, bind, device.NewLogger(logger, "compat/wgo: "), nil, device.DeviceOptions{})
+	dev := device.NewDevice(tunDev, bind, device.NewLogger(logger, "compat/wgo: "), nil, device.DeviceOptions{
+		ForceHandshakeCookies: cfg.forceCookies,
+	})
 
 	if err := dev.SetListenPort(uint16(cfg.listenPort)); err != nil {
 		dev.Close()
@@ -130,6 +133,7 @@ func parseFlags() config {
 	flag.IntVar(&cfg.listenPort, "listen-port", 51820, "udp listen port")
 	flag.IntVar(&cfg.mtu, "mtu", 1420, "interface MTU")
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "log level: silent,error,warn,info,debug")
+	flag.BoolVar(&cfg.forceCookies, "force-handshake-cookies", false, "force cookie replies for every initiation without a valid mac2")
 	flag.Parse()
 	return cfg
 }

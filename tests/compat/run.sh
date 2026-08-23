@@ -8,13 +8,21 @@ TMP_DIR="${ROOT_DIR}/.tmp/compat/${RUN_ID}"
 MTU="${MTU:-1420}"
 WG_PORT_A="${WG_PORT_A:-51820}"
 WG_PORT_B="${WG_PORT_B:-51821}"
+AMNEZIA_V31_HEADER_KEY="000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+AMNEZIA_V31_ALT_HEADER_KEY="1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
 
 VANILLA_DIR="${TMP_DIR}/vanilla"
 AMNEZIA_DIR="${TMP_DIR}/amnezia"
+AMNEZIA_COOKIE_DIR="${TMP_DIR}/amnezia-cookie"
+AMNEZIA_V31_MULTI_DIR="${TMP_DIR}/amnezia-v31-multi"
 MULTI_DIR="${TMP_DIR}/multi-peer"
+PING_COUNT_FOR_PADDING=5
+CONTENT_PADDING_PROBE_BYTES=64
 
 VANILLA_NETWORK="${RUN_ID}-vanilla-net"
 AMNEZIA_NETWORK="${RUN_ID}-amnezia-net"
+AMNEZIA_COOKIE_NETWORK="${RUN_ID}-amnezia-cookie-net"
+AMNEZIA_V31_MULTI_NETWORK="${RUN_ID}-amnezia-v31-multi-net"
 MULTI_NETWORK="${RUN_ID}-multi-net"
 
 KERNEL_IMAGE="wgo-compat-kernel:${RUN_ID}"
@@ -25,6 +33,11 @@ KERNEL_CONT="${RUN_ID}-kernel"
 VANILLA_WGO_CONT="${RUN_ID}-wgo"
 AMNEZIA_CONT="${RUN_ID}-amnezia"
 AMNEZIA_WGO_CONT="${RUN_ID}-amnezia-wgo"
+AMNEZIA_COOKIE_CONT="${RUN_ID}-amnezia-cookie"
+AMNEZIA_COOKIE_WGO_CONT="${RUN_ID}-amnezia-cookie-wgo"
+AMNEZIA_V31_MULTI_A_CONT="${RUN_ID}-amnezia-v31-multi-a"
+AMNEZIA_V31_MULTI_B_CONT="${RUN_ID}-amnezia-v31-multi-b"
+AMNEZIA_V31_MULTI_WGO_CONT="${RUN_ID}-amnezia-v31-multi-wgo"
 MULTI_KERNEL_CONT="${RUN_ID}-multi-kernel"
 MULTI_AMNEZIA_A_CONT="${RUN_ID}-multi-amnezia-a"
 MULTI_AMNEZIA_B_CONT="${RUN_ID}-multi-amnezia-b"
@@ -40,6 +53,18 @@ AMNEZIA_WGO_TUN_IP="10.89.0.2/32"
 AMNEZIA_PEER_TUN_HOST="10.89.0.1"
 AMNEZIA_WGO_TUN_HOST="10.89.0.2"
 
+AMNEZIA_COOKIE_PEER_TUN_IP="10.91.0.1/32"
+AMNEZIA_COOKIE_WGO_TUN_IP="10.91.0.2/32"
+AMNEZIA_COOKIE_PEER_TUN_HOST="10.91.0.1"
+AMNEZIA_COOKIE_WGO_TUN_HOST="10.91.0.2"
+
+AMNEZIA_V31_MULTI_WGO_TUN_IP="10.92.0.1/32"
+AMNEZIA_V31_MULTI_A_TUN_IP="10.92.0.2/32"
+AMNEZIA_V31_MULTI_B_TUN_IP="10.92.0.3/32"
+AMNEZIA_V31_MULTI_WGO_TUN_HOST="10.92.0.1"
+AMNEZIA_V31_MULTI_A_TUN_HOST="10.92.0.2"
+AMNEZIA_V31_MULTI_B_TUN_HOST="10.92.0.3"
+
 MULTI_WGO_TUN_IP="10.90.0.1/32"
 MULTI_KERNEL_TUN_IP="10.90.0.2/32"
 MULTI_AMNEZIA_A_TUN_IP="10.90.0.3/32"
@@ -49,7 +74,7 @@ MULTI_KERNEL_TUN_HOST="10.90.0.2"
 MULTI_AMNEZIA_A_TUN_HOST="10.90.0.3"
 MULTI_AMNEZIA_B_TUN_HOST="10.90.0.4"
 
-mkdir -p "${VANILLA_DIR}" "${AMNEZIA_DIR}" "${MULTI_DIR}"
+mkdir -p "${VANILLA_DIR}" "${AMNEZIA_DIR}" "${AMNEZIA_COOKIE_DIR}" "${AMNEZIA_V31_MULTI_DIR}" "${MULTI_DIR}"
 
 log() {
 	printf '==> %s\n' "$*" >&2
@@ -83,14 +108,21 @@ cleanup() {
 	capture_state "${KERNEL_CONT}" "${VANILLA_DIR}" "kernel" || true
 	capture_state "${AMNEZIA_WGO_CONT}" "${AMNEZIA_DIR}" "wgo" || true
 	capture_state "${AMNEZIA_CONT}" "${AMNEZIA_DIR}" "amnezia" || true
+	capture_state "${AMNEZIA_COOKIE_WGO_CONT}" "${AMNEZIA_COOKIE_DIR}" "wgo" || true
+	capture_state "${AMNEZIA_COOKIE_CONT}" "${AMNEZIA_COOKIE_DIR}" "amnezia" || true
+	capture_state "${AMNEZIA_V31_MULTI_WGO_CONT}" "${AMNEZIA_V31_MULTI_DIR}" "wgo" || true
+	capture_state "${AMNEZIA_V31_MULTI_A_CONT}" "${AMNEZIA_V31_MULTI_DIR}" "amnezia-a" || true
+	capture_state "${AMNEZIA_V31_MULTI_B_CONT}" "${AMNEZIA_V31_MULTI_DIR}" "amnezia-b" || true
 	capture_state "${MULTI_WGO_CONT}" "${MULTI_DIR}" "wgo" || true
 	capture_state "${MULTI_KERNEL_CONT}" "${MULTI_DIR}" "kernel" || true
 	capture_state "${MULTI_AMNEZIA_A_CONT}" "${MULTI_DIR}" "amnezia-a" || true
 	capture_state "${MULTI_AMNEZIA_B_CONT}" "${MULTI_DIR}" "amnezia-b" || true
 
 	docker rm -f "${VANILLA_WGO_CONT}" "${KERNEL_CONT}" "${AMNEZIA_WGO_CONT}" "${AMNEZIA_CONT}" \
+		"${AMNEZIA_COOKIE_WGO_CONT}" "${AMNEZIA_COOKIE_CONT}" \
+		"${AMNEZIA_V31_MULTI_WGO_CONT}" "${AMNEZIA_V31_MULTI_A_CONT}" "${AMNEZIA_V31_MULTI_B_CONT}" \
 		"${MULTI_WGO_CONT}" "${MULTI_KERNEL_CONT}" "${MULTI_AMNEZIA_A_CONT}" "${MULTI_AMNEZIA_B_CONT}" >/dev/null 2>&1 || true
-	docker network rm "${VANILLA_NETWORK}" "${AMNEZIA_NETWORK}" "${MULTI_NETWORK}" >/dev/null 2>&1 || true
+	docker network rm "${VANILLA_NETWORK}" "${AMNEZIA_NETWORK}" "${AMNEZIA_COOKIE_NETWORK}" "${AMNEZIA_V31_MULTI_NETWORK}" "${MULTI_NETWORK}" >/dev/null 2>&1 || true
 	docker image rm -f "${WGO_IMAGE}" "${KERNEL_IMAGE}" "${AMNEZIA_IMAGE}" >/dev/null 2>&1 || true
 	set -e
 }
@@ -159,6 +191,58 @@ uapi_set() {
 	fi
 }
 
+uapi_get() {
+	local cont="$1"
+	local log_file="$2"
+	local reply
+	reply="$(
+		printf 'get=1\n\n' \
+			| docker exec -i "${cont}" sh -ceu '
+				socket=/var/run/wireguard/wg0.sock
+				if [ ! -S "${socket}" ] && [ -S /var/run/amneziawg/wg0.sock ]; then
+					socket=/var/run/amneziawg/wg0.sock
+				fi
+				exec socat - UNIX-CONNECT:"${socket}"
+			'
+	)"
+	printf '%s\n%s\n\n' "GET" "${reply}" >>"${log_file}"
+	if ! grep -q '^errno=0$' <<<"${reply}"; then
+		echo "uapi get failed in ${cont}" >&2
+		echo "${reply}" >&2
+		exit 1
+	fi
+	printf '%s\n' "${reply}"
+}
+
+peer_counter() {
+	local cont="$1"
+	local log_file="$2"
+	local peer_pub_hex="$3"
+	local counter="$4"
+
+	uapi_get "${cont}" "${log_file}" \
+		| awk -v pub="${peer_pub_hex}" -v counter="${counter}" '
+			$0 == "public_key=" pub {
+				in_peer = 1
+				next
+			}
+			/^public_key=/ {
+				in_peer = 0
+			}
+			in_peer && index($0, counter "=") == 1 {
+				split($0, parts, "=")
+				print parts[2]
+				found = 1
+				exit
+			}
+			END {
+				if (!found) {
+					exit 1
+				}
+			}
+		'
+}
+
 expect_ping_success() {
 	local cont="$1"
 	local addr="$2"
@@ -186,6 +270,78 @@ expect_ping_failure() {
 		fi
 		sleep 1
 	done
+}
+
+transport_rx_delta_for_ping() {
+	local sender_cont="$1"
+	local receiver_cont="$2"
+	local receiver_log_file="$3"
+	local receiver_peer_pub_hex="$4"
+	local target_tun_host="$5"
+	local before after
+
+	before="$(peer_counter "${receiver_cont}" "${receiver_log_file}" "${receiver_peer_pub_hex}" rx_bytes)"
+	docker_shell "${sender_cont}" "ping -c ${PING_COUNT_FOR_PADDING} -W 1 -i 0.2 -s 1 ${target_tun_host}" >/dev/null
+	after="$(peer_counter "${receiver_cont}" "${receiver_log_file}" "${receiver_peer_pub_hex}" rx_bytes)"
+	printf '%s\n' "$((after - before))"
+}
+
+expect_content_padding_rx_growth() {
+	local sender_cont="$1"
+	local receiver_cont="$2"
+	local sender_log_file="$3"
+	local receiver_log_file="$4"
+	local receiver_peer_pub_hex="$5"
+	local target_tun_host="$6"
+	local label="$7"
+	local base_delta padded_delta min_growth
+
+	uapi_set "${sender_cont}" "$(cat <<'EOF'
+set=1
+content_padding_addition=0
+random_trailers=false
+EOF
+)" "${sender_log_file}"
+	uapi_set "${receiver_cont}" "$(cat <<'EOF'
+set=1
+content_padding_addition=0
+random_trailers=false
+EOF
+)" "${receiver_log_file}"
+	expect_ping_success "${sender_cont}" "${target_tun_host}"
+	base_delta="$(transport_rx_delta_for_ping "${sender_cont}" "${receiver_cont}" "${receiver_log_file}" "${receiver_peer_pub_hex}" "${target_tun_host}")"
+
+	uapi_set "${sender_cont}" "$(cat <<EOF
+set=1
+content_padding_addition=${CONTENT_PADDING_PROBE_BYTES}
+random_trailers=false
+EOF
+)" "${sender_log_file}"
+	uapi_set "${receiver_cont}" "$(cat <<'EOF'
+set=1
+content_padding_addition=0
+random_trailers=false
+EOF
+)" "${receiver_log_file}"
+	expect_ping_success "${sender_cont}" "${target_tun_host}"
+	padded_delta="$(transport_rx_delta_for_ping "${sender_cont}" "${receiver_cont}" "${receiver_log_file}" "${receiver_peer_pub_hex}" "${target_tun_host}")"
+
+	# Normal WireGuard content padding can absorb up to one padding block of
+	# the requested AWG addition, so assert growth outside that slack.
+	min_growth=$((PING_COUNT_FOR_PADDING * (CONTENT_PADDING_PROBE_BYTES - 16)))
+	if ((padded_delta - base_delta < min_growth)); then
+		echo "${label}: padded rx delta ${padded_delta} did not grow by at least ${min_growth} over baseline ${base_delta}" >&2
+		return 1
+	fi
+}
+
+send_awg_malformed() {
+	local cont="$1"
+	local target="$2"
+	local case_name="$3"
+	local header="$4"
+
+	docker_shell "${cont}" "awg-malformed-sender -target '${target}' -case '${case_name}' -key '${AMNEZIA_V31_HEADER_KEY}' -header '${header}' -count 2"
 }
 
 configure_kernel_interface() {
@@ -279,6 +435,143 @@ i5=<b 0x99>
 EOF
 }
 
+amnezia_v31_device_config_payload() {
+	cat <<'EOF'
+jc=2
+jmin=11
+jmax=23
+s1=12
+s2=12
+s3=12
+s4=12
+h1=6111-6113
+h2=6222-6224
+h3=6333-6333
+h4=6444-6446
+i1=<b 0xaa55><rc 3><rd 2><t>
+i2=<r 5>
+i3=<rd 4>
+i4=<rc 6>
+i5=<b 0x01020304>
+header_protection_key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+content_padding_addition=4-16
+rekey_after_time=90-120
+rekey_timeout=5-8
+reject_after_time=180-220
+keepalive_timeout=10-15
+max_handshake_attempts=3-5
+random_trailers=true
+disable_cookies=true
+EOF
+}
+
+amnezia_v31_random_trailers_device_config_payload() {
+	cat <<'EOF'
+jc=2
+jmin=11
+jmax=23
+s1=12
+s2=12
+s3=12
+s4=12
+h1=6111-6113
+h2=6222-6224
+h3=6333-6333
+h4=6444-6446
+i1=<b 0xaa55><rc 3><rd 2><t>
+i2=<r 5>
+i3=<rd 4>
+i4=<rc 6>
+i5=<b 0x01020304>
+header_protection_key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+content_padding_addition=0
+random_trailers=true
+EOF
+}
+
+amnezia_v31_content_padding_device_config_payload() {
+	cat <<EOF
+jc=2
+jmin=11
+jmax=23
+s1=12
+s2=12
+s3=12
+s4=12
+h1=6111-6113
+h2=6222-6224
+h3=6333-6333
+h4=6444-6446
+i1=<b 0xaa55><rc 3><rd 2><t>
+i2=<r 5>
+i3=<rd 4>
+i4=<rc 6>
+i5=<b 0x01020304>
+header_protection_key=${AMNEZIA_V31_HEADER_KEY}
+content_padding_addition=${CONTENT_PADDING_PROBE_BYTES}
+random_trailers=false
+EOF
+}
+
+amnezia_v31_cookie_device_config_payload() {
+	cat <<'EOF'
+jc=2
+jmin=11
+jmax=23
+s1=12
+s2=12
+s3=12
+s4=12
+h1=6111-6113
+h2=6222-6224
+h3=6333-6333
+h4=6444-6446
+i1=<b 0xaa55><rc 3><rd 2><t>
+i2=<r 5>
+i3=<rd 4>
+i4=<rc 6>
+i5=<b 0x01020304>
+header_protection_key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+content_padding_addition=4-16
+rekey_after_time=90-120
+rekey_timeout=5-8
+reject_after_time=180-220
+keepalive_timeout=10-15
+max_handshake_attempts=3-5
+random_trailers=true
+EOF
+}
+
+amnezia_v31_alt_device_config_payload() {
+	cat <<EOF
+jc=1
+jmin=1
+jmax=8
+s1=13
+s2=14
+s3=15
+s4=16
+h1=7111-7115
+h2=7222-7226
+h3=7333-7335
+h4=7444-7448
+i1=<rd 1><b 0x7a>
+i2=<b 0x1122><rc 2>
+i3=<r 3><t>
+i4=<b 0x334455>
+i5=<rd 2>
+header_protection_key=${AMNEZIA_V31_ALT_HEADER_KEY}
+content_padding_addition=0-32
+rekey_after_time=80
+rekey_timeout=4-6
+reject_after_time=160-190
+keepalive_timeout=8-12
+max_handshake_attempts=2-4
+random_trailers=false
+disable_cookies=false
+EOF
+}
+
 configure_wgo_peer() {
 	local cont="$1"
 	local log_file="$2"
@@ -289,6 +582,7 @@ configure_wgo_peer() {
 	local peer_port="$7"
 	local peer_tun_host="$8"
 	local extra_device_lines="${9:-}"
+	local extra_peer_lines="${10:-}"
 
 	uapi_set "${cont}" "$(cat <<EOF
 set=1
@@ -300,6 +594,7 @@ protocol_version=1
 replace_allowed_ips=true
 allowed_ip=${peer_tun_host}/32
 endpoint=${peer_outer_ip}:${peer_port}
+${extra_peer_lines}
 EOF
 )" "${log_file}"
 }
@@ -452,6 +747,8 @@ run_amnezia_suite() {
 	local amnezia_outer_ip wgo_outer_ip
 	local amnezia_priv_b64 amnezia_pub_b64 wgo_priv_b64 wgo_pub_b64 psk_b64
 	local amnezia_priv_hex amnezia_pub_hex wgo_priv_hex psk_hex amnezia_device_lines
+	local amnezia_v31_device_lines amnezia_v31_peer_lines
+	local amnezia_v31_content_padding_device_lines amnezia_v31_random_trailers_device_lines
 
 	log "starting amneziawg compatibility suite"
 	run docker network create "${AMNEZIA_NETWORK}"
@@ -506,6 +803,100 @@ run_amnezia_suite() {
 	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
 	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
 
+	log "amnezia v3.1 random-trailers case: both implementations complete protected handshakes with content padding disabled"
+	amnezia_v31_random_trailers_device_lines="$(amnezia_v31_random_trailers_device_config_payload)"
+	configure_wgo_peer "${AMNEZIA_CONT}" "${AMNEZIA_DIR}/amnezia-uapi.log" "${amnezia_priv_hex}" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${AMNEZIA_WGO_TUN_HOST}" "${amnezia_v31_random_trailers_device_lines}"$'\n'
+	configure_wgo_peer "${AMNEZIA_WGO_CONT}" "${AMNEZIA_DIR}/wgo-uapi.log" "${wgo_priv_hex}" "${WG_PORT_A}" "${amnezia_pub_hex}" "${amnezia_outer_ip}" "${WG_PORT_A}" "${AMNEZIA_PEER_TUN_HOST}" "${amnezia_v31_random_trailers_device_lines}"$'\n'
+
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+
+	log "amnezia v3.1 content-padding case: fixed padding increases received transport bytes in both directions"
+	amnezia_v31_content_padding_device_lines="$(amnezia_v31_content_padding_device_config_payload)"
+	configure_wgo_peer "${AMNEZIA_CONT}" "${AMNEZIA_DIR}/amnezia-uapi.log" "${amnezia_priv_hex}" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${AMNEZIA_WGO_TUN_HOST}" "${amnezia_v31_content_padding_device_lines}"$'\n'
+	configure_wgo_peer "${AMNEZIA_WGO_CONT}" "${AMNEZIA_DIR}/wgo-uapi.log" "${wgo_priv_hex}" "${WG_PORT_A}" "${amnezia_pub_hex}" "${amnezia_outer_ip}" "${WG_PORT_A}" "${AMNEZIA_PEER_TUN_HOST}" "${amnezia_v31_content_padding_device_lines}"$'\n'
+
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+	expect_content_padding_rx_growth "${AMNEZIA_WGO_CONT}" "${AMNEZIA_CONT}" "${AMNEZIA_DIR}/wgo-uapi.log" "${AMNEZIA_DIR}/amnezia-uapi.log" "$(b64_to_hex "${wgo_pub_b64}")" "${AMNEZIA_PEER_TUN_HOST}" "wgo to official content padding"
+	expect_content_padding_rx_growth "${AMNEZIA_CONT}" "${AMNEZIA_WGO_CONT}" "${AMNEZIA_DIR}/amnezia-uapi.log" "${AMNEZIA_DIR}/wgo-uapi.log" "${amnezia_pub_hex}" "${AMNEZIA_WGO_TUN_HOST}" "official to wgo content padding"
+
+	log "amnezia v3.1 case: configuring protected headers, random trailers, content padding, and timing ranges"
+	amnezia_v31_device_lines="$(amnezia_v31_device_config_payload)"
+	amnezia_v31_peer_lines="persistent_keepalive_interval=2-3"
+	configure_wgo_peer "${AMNEZIA_CONT}" "${AMNEZIA_DIR}/amnezia-uapi.log" "${amnezia_priv_hex}" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${AMNEZIA_WGO_TUN_HOST}" "${amnezia_v31_device_lines}"$'\n' "${amnezia_v31_peer_lines}"
+	configure_wgo_peer "${AMNEZIA_WGO_CONT}" "${AMNEZIA_DIR}/wgo-uapi.log" "${wgo_priv_hex}" "${WG_PORT_A}" "${amnezia_pub_hex}" "${amnezia_outer_ip}" "${WG_PORT_A}" "${AMNEZIA_PEER_TUN_HOST}" "${amnezia_v31_device_lines}"$'\n' "${amnezia_v31_peer_lines}"
+
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+	docker_shell "${AMNEZIA_CONT}" "ping -c 3 -W 1 -i 0.2 ${AMNEZIA_WGO_TUN_HOST}"
+	docker_shell "${AMNEZIA_WGO_CONT}" "ping -c 3 -W 1 -i 0.2 ${AMNEZIA_PEER_TUN_HOST}"
+
+	log "amnezia v3.1 malformed case: truncated protected S prefix"
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${amnezia_outer_ip}:${WG_PORT_A}" "truncated-s-prefix" 6111
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${wgo_outer_ip}:${WG_PORT_A}" "truncated-s-prefix" 6111
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+
+	log "amnezia v3.1 malformed case: exact nonce without protected core"
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${amnezia_outer_ip}:${WG_PORT_A}" "exact-s-nonce" 6111
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${wgo_outer_ip}:${WG_PORT_A}" "exact-s-nonce" 6111
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+
+	log "amnezia v3.1 malformed case: protected initiation with bad authenticated contents"
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${amnezia_outer_ip}:${WG_PORT_A}" "corrupt-initiation" 6111
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${wgo_outer_ip}:${WG_PORT_A}" "corrupt-initiation" 6111
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+
+	log "amnezia v3.1 malformed case: protected response with wrong receiver index"
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${amnezia_outer_ip}:${WG_PORT_A}" "wrong-response-index" 6222
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${wgo_outer_ip}:${WG_PORT_A}" "wrong-response-index" 6222
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+
+	log "amnezia v3.1 malformed case: protected cookie with wrong receiver index"
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${amnezia_outer_ip}:${WG_PORT_A}" "wrong-cookie-index" 6333
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${wgo_outer_ip}:${WG_PORT_A}" "wrong-cookie-index" 6333
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+
+	log "amnezia v3.1 malformed case: protected transport with wrong receiver index"
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${amnezia_outer_ip}:${WG_PORT_A}" "wrong-receiver-index" 6444
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${wgo_outer_ip}:${WG_PORT_A}" "wrong-receiver-index" 6444
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+
+	log "amnezia v3.1 malformed case: maximum UDP protected transport with wrong receiver index"
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${amnezia_outer_ip}:${WG_PORT_A}" "maximum-udp-transport" 6444
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${wgo_outer_ip}:${WG_PORT_A}" "maximum-udp-transport" 6444
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+
+	log "amnezia v3.1 malformed case: maximum UDP fixed-message trailer"
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${amnezia_outer_ip}:${WG_PORT_A}" "oversized-fixed-trailer" 6111
+	send_awg_malformed "${AMNEZIA_WGO_CONT}" "${wgo_outer_ip}:${WG_PORT_A}" "oversized-fixed-trailer" 6111
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+
+	log "amnezia v3.1 case: rejecting traffic after one side gets a wrong header key"
+	uapi_set "${AMNEZIA_WGO_CONT}" "$(cat <<'EOF'
+set=1
+header_protection_key=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+EOF
+)" "${AMNEZIA_DIR}/wgo-uapi.log"
+	expect_ping_failure "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+
+	log "amnezia v3.1 case: restoring the shared header key"
+	uapi_set "${AMNEZIA_WGO_CONT}" "$(cat <<'EOF'
+set=1
+header_protection_key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+EOF
+)" "${AMNEZIA_DIR}/wgo-uapi.log"
+	expect_ping_success "${AMNEZIA_WGO_CONT}" "${AMNEZIA_PEER_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
+
 	log "amnezia psk case: rotating both peers while preserving non-default amnezia params"
 	remove_peer "${AMNEZIA_CONT}" "${AMNEZIA_DIR}/amnezia-uapi.log" "$(b64_to_hex "${wgo_pub_b64}")"
 	configure_peer_preshared_key "${AMNEZIA_CONT}" "${AMNEZIA_DIR}/amnezia-uapi.log" "$(b64_to_hex "${wgo_pub_b64}")" "${psk_hex}" "${wgo_outer_ip}" "${WG_PORT_A}" "${AMNEZIA_WGO_TUN_HOST}"
@@ -538,6 +929,190 @@ EOF
 	expect_ping_success "${AMNEZIA_CONT}" "${AMNEZIA_WGO_TUN_HOST}"
 }
 
+run_amnezia_cookie_suite() {
+	local amnezia_outer_ip wgo_outer_ip
+	local amnezia_priv_b64 amnezia_pub_b64 wgo_priv_b64 wgo_pub_b64
+	local amnezia_priv_hex amnezia_pub_hex wgo_priv_hex amnezia_device_lines
+
+	log "starting amneziawg protected-cookie compatibility suite"
+	run docker network create "${AMNEZIA_COOKIE_NETWORK}"
+
+	run docker run -d \
+		--name "${AMNEZIA_COOKIE_CONT}" \
+		--hostname amnezia-cookie-peer \
+		--network "${AMNEZIA_COOKIE_NETWORK}" \
+		--network-alias amnezia-cookie-peer \
+		--privileged \
+		"${AMNEZIA_IMAGE}" \
+		wg0
+
+	run docker run -d \
+		--name "${AMNEZIA_COOKIE_WGO_CONT}" \
+		--hostname wgo-cookie-peer \
+		--network "${AMNEZIA_COOKIE_NETWORK}" \
+		--network-alias wgo-cookie-peer \
+		--privileged \
+		"${WGO_IMAGE}" \
+		-iface wg0 \
+		-tun-local "${AMNEZIA_COOKIE_WGO_TUN_IP}" \
+		-peer-route "${AMNEZIA_COOKIE_PEER_TUN_IP}" \
+		-listen-port "${WG_PORT_A}" \
+		-mtu "${MTU}" \
+		-log-level debug \
+		-force-handshake-cookies
+
+	wait_for_cmd "${AMNEZIA_COOKIE_CONT}" "test -S /var/run/amneziawg/wg0.sock"
+	wait_for_cmd "${AMNEZIA_COOKIE_CONT}" "ip link show dev wg0"
+	wait_for_cmd "${AMNEZIA_COOKIE_WGO_CONT}" "test -S /var/run/wireguard/wg0.sock"
+	wait_for_cmd "${AMNEZIA_COOKIE_WGO_CONT}" "ip link show dev wg0"
+
+	amnezia_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${AMNEZIA_COOKIE_CONT}")"
+	wgo_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${AMNEZIA_COOKIE_WGO_CONT}")"
+
+	read -r amnezia_priv_b64 amnezia_pub_b64 <<<"$(new_key_pair "${AMNEZIA_COOKIE_CONT}")"
+	read -r wgo_priv_b64 wgo_pub_b64 <<<"$(new_key_pair "${AMNEZIA_COOKIE_CONT}")"
+
+	amnezia_priv_hex="$(b64_to_hex "${amnezia_priv_b64}")"
+	amnezia_pub_hex="$(b64_to_hex "${amnezia_pub_b64}")"
+	wgo_priv_hex="$(b64_to_hex "${wgo_priv_b64}")"
+	amnezia_device_lines="$(amnezia_v31_cookie_device_config_payload)"
+
+	configure_userspace_interface "${AMNEZIA_COOKIE_CONT}" "${AMNEZIA_COOKIE_PEER_TUN_IP}" "${AMNEZIA_COOKIE_WGO_TUN_HOST}"
+
+	log "amnezia v3.1 protected-cookie case: official peer completes handshake through wgo cookie reply"
+	configure_wgo_peer "${AMNEZIA_COOKIE_CONT}" "${AMNEZIA_COOKIE_DIR}/amnezia-uapi.log" "${amnezia_priv_hex}" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${AMNEZIA_COOKIE_WGO_TUN_HOST}" "${amnezia_device_lines}"$'\n'
+	configure_wgo_peer "${AMNEZIA_COOKIE_WGO_CONT}" "${AMNEZIA_COOKIE_DIR}/wgo-uapi.log" "${wgo_priv_hex}" "${WG_PORT_A}" "${amnezia_pub_hex}" "${amnezia_outer_ip}" "${WG_PORT_A}" "${AMNEZIA_COOKIE_PEER_TUN_HOST}" "${amnezia_device_lines}"$'\n'
+
+	expect_ping_success "${AMNEZIA_COOKIE_CONT}" "${AMNEZIA_COOKIE_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_COOKIE_WGO_CONT}" "${AMNEZIA_COOKIE_PEER_TUN_HOST}"
+}
+
+run_amnezia_v31_multi_peer_suite() {
+	local amnezia_a_outer_ip amnezia_b_outer_ip wgo_outer_ip
+	local amnezia_a_priv_b64 amnezia_a_pub_b64
+	local amnezia_b_priv_b64 amnezia_b_pub_b64
+	local wgo_priv_b64 wgo_pub_b64
+	local amnezia_a_pub_hex amnezia_b_pub_hex wgo_priv_hex
+	local device_default_lines peer_override_lines
+	local ranged_keepalive_lines
+
+	log "starting amneziawg v3.1 device-default and peer-override suite"
+	run docker network create "${AMNEZIA_V31_MULTI_NETWORK}"
+
+	run docker run -d \
+		--name "${AMNEZIA_V31_MULTI_A_CONT}" \
+		--hostname amnezia-v31-multi-a-peer \
+		--network "${AMNEZIA_V31_MULTI_NETWORK}" \
+		--network-alias amnezia-v31-multi-a-peer \
+		--privileged \
+		"${AMNEZIA_IMAGE}" \
+		wg0
+
+	run docker run -d \
+		--name "${AMNEZIA_V31_MULTI_B_CONT}" \
+		--hostname amnezia-v31-multi-b-peer \
+		--network "${AMNEZIA_V31_MULTI_NETWORK}" \
+		--network-alias amnezia-v31-multi-b-peer \
+		--privileged \
+		"${AMNEZIA_IMAGE}" \
+		wg0
+
+	run docker run -d \
+		--name "${AMNEZIA_V31_MULTI_WGO_CONT}" \
+		--hostname wgo-v31-multi-peer \
+		--network "${AMNEZIA_V31_MULTI_NETWORK}" \
+		--network-alias wgo-v31-multi-peer \
+		--privileged \
+		"${WGO_IMAGE}" \
+		-iface wg0 \
+		-tun-local "${AMNEZIA_V31_MULTI_WGO_TUN_IP}" \
+		-peer-route "${AMNEZIA_V31_MULTI_A_TUN_IP}" \
+		-listen-port "${WG_PORT_A}" \
+		-mtu "${MTU}" \
+		-log-level debug
+
+	wait_for_cmd "${AMNEZIA_V31_MULTI_A_CONT}" "test -S /var/run/amneziawg/wg0.sock"
+	wait_for_cmd "${AMNEZIA_V31_MULTI_A_CONT}" "ip link show dev wg0"
+	wait_for_cmd "${AMNEZIA_V31_MULTI_B_CONT}" "test -S /var/run/amneziawg/wg0.sock"
+	wait_for_cmd "${AMNEZIA_V31_MULTI_B_CONT}" "ip link show dev wg0"
+	wait_for_cmd "${AMNEZIA_V31_MULTI_WGO_CONT}" "test -S /var/run/wireguard/wg0.sock"
+	wait_for_cmd "${AMNEZIA_V31_MULTI_WGO_CONT}" "ip link show dev wg0"
+
+	amnezia_a_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${AMNEZIA_V31_MULTI_A_CONT}")"
+	amnezia_b_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${AMNEZIA_V31_MULTI_B_CONT}")"
+	wgo_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${AMNEZIA_V31_MULTI_WGO_CONT}")"
+
+	read -r amnezia_a_priv_b64 amnezia_a_pub_b64 <<<"$(new_key_pair "${AMNEZIA_V31_MULTI_A_CONT}")"
+	read -r amnezia_b_priv_b64 amnezia_b_pub_b64 <<<"$(new_key_pair "${AMNEZIA_V31_MULTI_A_CONT}")"
+	read -r wgo_priv_b64 wgo_pub_b64 <<<"$(new_key_pair "${AMNEZIA_V31_MULTI_A_CONT}")"
+
+	amnezia_a_pub_hex="$(b64_to_hex "${amnezia_a_pub_b64}")"
+	amnezia_b_pub_hex="$(b64_to_hex "${amnezia_b_pub_b64}")"
+	wgo_priv_hex="$(b64_to_hex "${wgo_priv_b64}")"
+	device_default_lines="$(amnezia_v31_device_config_payload)"
+	peer_override_lines="$(amnezia_v31_alt_device_config_payload)"
+	ranged_keepalive_lines="persistent_keepalive_interval=2-3"
+
+	configure_userspace_interface "${AMNEZIA_V31_MULTI_A_CONT}" "${AMNEZIA_V31_MULTI_A_TUN_IP}" "${AMNEZIA_V31_MULTI_WGO_TUN_HOST}"
+	configure_userspace_interface "${AMNEZIA_V31_MULTI_B_CONT}" "${AMNEZIA_V31_MULTI_B_TUN_IP}" "${AMNEZIA_V31_MULTI_WGO_TUN_HOST}"
+	docker_shell "${AMNEZIA_V31_MULTI_WGO_CONT}" "ip route replace ${AMNEZIA_V31_MULTI_B_TUN_HOST}/32 dev wg0"
+
+	log "amnezia v3.1 multi-peer case: configuring upstream peers with different protected profiles"
+	configure_wgo_peer "${AMNEZIA_V31_MULTI_A_CONT}" "${AMNEZIA_V31_MULTI_DIR}/amnezia-a-uapi.log" "$(b64_to_hex "${amnezia_a_priv_b64}")" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${AMNEZIA_V31_MULTI_WGO_TUN_HOST}" "${device_default_lines}"$'\n' "${ranged_keepalive_lines}"
+	configure_wgo_peer "${AMNEZIA_V31_MULTI_B_CONT}" "${AMNEZIA_V31_MULTI_DIR}/amnezia-b-uapi.log" "$(b64_to_hex "${amnezia_b_priv_b64}")" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${AMNEZIA_V31_MULTI_WGO_TUN_HOST}" "${peer_override_lines}"$'\n'
+
+	log "amnezia v3.1 multi-peer case: using a device default profile plus one peer override in wgo"
+	uapi_set "${AMNEZIA_V31_MULTI_WGO_CONT}" "$(cat <<EOF
+set=1
+private_key=${wgo_priv_hex}
+listen_port=${WG_PORT_A}
+$(printf '%s\n' "${device_default_lines}")
+replace_peers=true
+public_key=${amnezia_a_pub_hex}
+protocol_version=1
+${ranged_keepalive_lines}
+replace_allowed_ips=true
+allowed_ip=${AMNEZIA_V31_MULTI_A_TUN_HOST}/32
+endpoint=${amnezia_a_outer_ip}:${WG_PORT_A}
+public_key=${amnezia_b_pub_hex}
+protocol_version=1
+$(printf '%s\n' "${peer_override_lines}")
+replace_allowed_ips=true
+allowed_ip=${AMNEZIA_V31_MULTI_B_TUN_HOST}/32
+endpoint=${amnezia_b_outer_ip}:${WG_PORT_A}
+EOF
+)" "${AMNEZIA_V31_MULTI_DIR}/wgo-uapi.log"
+
+	expect_ping_success "${AMNEZIA_V31_MULTI_WGO_CONT}" "${AMNEZIA_V31_MULTI_A_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_V31_MULTI_WGO_CONT}" "${AMNEZIA_V31_MULTI_B_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_V31_MULTI_A_CONT}" "${AMNEZIA_V31_MULTI_WGO_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_V31_MULTI_B_CONT}" "${AMNEZIA_V31_MULTI_WGO_TUN_HOST}"
+
+	log "amnezia v3.1 multi-peer case: wrong override key does not break the default-profile peer"
+	uapi_set "${AMNEZIA_V31_MULTI_WGO_CONT}" "$(cat <<EOF
+set=1
+public_key=${amnezia_b_pub_hex}
+$(printf '%s\n' "${peer_override_lines}")
+header_protection_key=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+EOF
+)" "${AMNEZIA_V31_MULTI_DIR}/wgo-uapi.log"
+
+	expect_ping_failure "${AMNEZIA_V31_MULTI_WGO_CONT}" "${AMNEZIA_V31_MULTI_B_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_V31_MULTI_WGO_CONT}" "${AMNEZIA_V31_MULTI_A_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_V31_MULTI_A_CONT}" "${AMNEZIA_V31_MULTI_WGO_TUN_HOST}"
+
+	log "amnezia v3.1 multi-peer case: restoring the peer override"
+	uapi_set "${AMNEZIA_V31_MULTI_WGO_CONT}" "$(cat <<EOF
+set=1
+public_key=${amnezia_b_pub_hex}
+$(printf '%s\n' "${peer_override_lines}")
+EOF
+)" "${AMNEZIA_V31_MULTI_DIR}/wgo-uapi.log"
+
+	expect_ping_success "${AMNEZIA_V31_MULTI_WGO_CONT}" "${AMNEZIA_V31_MULTI_B_TUN_HOST}"
+	expect_ping_success "${AMNEZIA_V31_MULTI_B_CONT}" "${AMNEZIA_V31_MULTI_WGO_TUN_HOST}"
+}
+
 run_multi_peer_suite() {
 	local kernel_outer_ip amnezia_a_outer_ip amnezia_b_outer_ip wgo_outer_ip
 	local kernel_priv_b64 kernel_pub_b64
@@ -545,7 +1120,8 @@ run_multi_peer_suite() {
 	local amnezia_b_priv_b64 amnezia_b_pub_b64
 	local wgo_priv_b64 wgo_pub_b64
 	local wgo_priv_hex kernel_pub_hex amnezia_a_pub_hex amnezia_b_pub_hex
-	local amnezia_a_device_lines amnezia_b_device_lines
+	local amnezia_a_device_lines amnezia_b_device_lines amnezia_b_peer_lines
+	local amnezia_a_v31_device_lines amnezia_a_v31_peer_lines
 
 	log "starting multi-peer per-peer compatibility suite"
 	run docker network create "${MULTI_NETWORK}"
@@ -614,7 +1190,10 @@ run_multi_peer_suite() {
 	amnezia_a_pub_hex="$(b64_to_hex "${amnezia_a_pub_b64}")"
 	amnezia_b_pub_hex="$(b64_to_hex "${amnezia_b_pub_b64}")"
 	amnezia_a_device_lines="$(amnezia_device_config_payload_a)"
-	amnezia_b_device_lines="$(amnezia_device_config_payload_b)"
+	amnezia_b_device_lines="$(amnezia_v31_device_config_payload)"
+	amnezia_b_peer_lines="persistent_keepalive_interval=2-3"
+	amnezia_a_v31_device_lines="$(amnezia_v31_alt_device_config_payload)"
+	amnezia_a_v31_peer_lines="persistent_keepalive_interval=0"
 
 	configure_kernel_interface "${MULTI_KERNEL_CONT}" "${MULTI_KERNEL_TUN_IP}" "${MULTI_WGO_TUN_HOST}"
 	configure_userspace_interface "${MULTI_AMNEZIA_A_CONT}" "${MULTI_AMNEZIA_A_TUN_IP}" "${MULTI_WGO_TUN_HOST}"
@@ -625,9 +1204,9 @@ run_multi_peer_suite() {
 	log "multi-peer case: configuring remote peers"
 	configure_kernel_peer "${MULTI_KERNEL_CONT}" "${kernel_priv_b64}" "${WG_PORT_A}" "${wgo_pub_b64}" "${wgo_outer_ip}" "${WG_PORT_A}" "${MULTI_WGO_TUN_HOST}"
 	configure_wgo_peer "${MULTI_AMNEZIA_A_CONT}" "${MULTI_DIR}/amnezia-a-uapi.log" "$(b64_to_hex "${amnezia_a_priv_b64}")" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${MULTI_WGO_TUN_HOST}" "${amnezia_a_device_lines}"$'\n'
-	configure_wgo_peer "${MULTI_AMNEZIA_B_CONT}" "${MULTI_DIR}/amnezia-b-uapi.log" "$(b64_to_hex "${amnezia_b_priv_b64}")" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${MULTI_WGO_TUN_HOST}" "${amnezia_b_device_lines}"$'\n'
+	configure_wgo_peer "${MULTI_AMNEZIA_B_CONT}" "${MULTI_DIR}/amnezia-b-uapi.log" "$(b64_to_hex "${amnezia_b_priv_b64}")" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${MULTI_WGO_TUN_HOST}" "${amnezia_b_device_lines}"$'\n' "${amnezia_b_peer_lines}"
 
-	log "multi-peer case: configuring one wgo node with vanilla plus two peer-local amnezia profiles"
+	log "multi-peer case: configuring one wgo node with vanilla and v2 peer-local profiles"
 	uapi_set "${MULTI_WGO_CONT}" "$(cat <<EOF
 set=1
 private_key=${wgo_priv_hex}
@@ -644,9 +1223,22 @@ $(printf '%s\n' "${amnezia_a_device_lines}")
 replace_allowed_ips=true
 allowed_ip=${MULTI_AMNEZIA_A_TUN_HOST}/32
 endpoint=${amnezia_a_outer_ip}:${WG_PORT_A}
+EOF
+)" "${MULTI_DIR}/wgo-uapi.log"
+
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_KERNEL_TUN_HOST}"
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_A_TUN_HOST}"
+	expect_ping_success "${MULTI_KERNEL_CONT}" "${MULTI_WGO_TUN_HOST}"
+	expect_ping_success "${MULTI_AMNEZIA_A_CONT}" "${MULTI_WGO_TUN_HOST}"
+	expect_ping_failure "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_B_TUN_HOST}"
+
+	log "multi-peer case: adding v3.1 peer-local profile without replacing existing peers"
+	uapi_set "${MULTI_WGO_CONT}" "$(cat <<EOF
+set=1
 public_key=${amnezia_b_pub_hex}
 protocol_version=1
 $(printf '%s\n' "${amnezia_b_device_lines}")
+${amnezia_b_peer_lines}
 replace_allowed_ips=true
 allowed_ip=${MULTI_AMNEZIA_B_TUN_HOST}/32
 endpoint=${amnezia_b_outer_ip}:${WG_PORT_A}
@@ -662,6 +1254,51 @@ EOF
 	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_KERNEL_TUN_HOST}"
 	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_A_TUN_HOST}"
 	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_B_TUN_HOST}"
+
+	log "multi-peer v3.1 case: reconfiguring one peer to a second protected profile"
+	configure_wgo_peer "${MULTI_AMNEZIA_A_CONT}" "${MULTI_DIR}/amnezia-a-uapi.log" "$(b64_to_hex "${amnezia_a_priv_b64}")" "${WG_PORT_A}" "$(b64_to_hex "${wgo_pub_b64}")" "${wgo_outer_ip}" "${WG_PORT_A}" "${MULTI_WGO_TUN_HOST}" "${amnezia_a_v31_device_lines}"$'\n' "${amnezia_a_v31_peer_lines}"
+	uapi_set "${MULTI_WGO_CONT}" "$(cat <<EOF
+set=1
+public_key=${amnezia_a_pub_hex}
+protocol_version=1
+$(printf '%s\n' "${amnezia_a_v31_device_lines}")
+${amnezia_a_v31_peer_lines}
+replace_allowed_ips=true
+allowed_ip=${MULTI_AMNEZIA_A_TUN_HOST}/32
+endpoint=${amnezia_a_outer_ip}:${WG_PORT_A}
+EOF
+)" "${MULTI_DIR}/wgo-uapi.log"
+
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_KERNEL_TUN_HOST}"
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_A_TUN_HOST}"
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_B_TUN_HOST}"
+	expect_ping_success "${MULTI_KERNEL_CONT}" "${MULTI_WGO_TUN_HOST}"
+	expect_ping_success "${MULTI_AMNEZIA_A_CONT}" "${MULTI_WGO_TUN_HOST}"
+	expect_ping_success "${MULTI_AMNEZIA_B_CONT}" "${MULTI_WGO_TUN_HOST}"
+
+	log "multi-peer v3.1 case: wrong peer-local header key affects only one peer"
+	uapi_set "${MULTI_WGO_CONT}" "$(cat <<EOF
+set=1
+public_key=${amnezia_a_pub_hex}
+$(printf '%s\n' "${amnezia_a_v31_device_lines}")
+header_protection_key=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+EOF
+)" "${MULTI_DIR}/wgo-uapi.log"
+
+	expect_ping_failure "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_A_TUN_HOST}"
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_KERNEL_TUN_HOST}"
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_B_TUN_HOST}"
+
+	log "multi-peer v3.1 case: restoring peer-local header key"
+	uapi_set "${MULTI_WGO_CONT}" "$(cat <<EOF
+set=1
+public_key=${amnezia_a_pub_hex}
+$(printf '%s\n' "${amnezia_a_v31_device_lines}")
+EOF
+)" "${MULTI_DIR}/wgo-uapi.log"
+
+	expect_ping_success "${MULTI_WGO_CONT}" "${MULTI_AMNEZIA_A_TUN_HOST}"
+	expect_ping_success "${MULTI_AMNEZIA_A_CONT}" "${MULTI_WGO_TUN_HOST}"
 }
 
 main() {
@@ -675,6 +1312,8 @@ main() {
 
 	run_vanilla_suite
 	run_amnezia_suite
+	run_amnezia_cookie_suite
+	run_amnezia_v31_multi_peer_suite
 	run_multi_peer_suite
 
 	log "compatibility suite passed"

@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"os"
@@ -52,6 +53,7 @@ type QueueOutboundElement struct {
 	nonce   uint64                   // nonce for encryption
 	keypair *Keypair                 // keypair for encryption
 	peer    *Peer                    // related peer
+	amnezia amneziaWGSnapshot        // AWG profile captured for this datagram
 }
 
 type QueueOutboundElementsContainer struct {
@@ -76,6 +78,7 @@ func (elem *QueueOutboundElement) clearPointers() {
 	elem.packet = nil
 	elem.keypair = nil
 	elem.peer = nil
+	elem.amnezia = amneziaWGSnapshot{}
 }
 
 /* Queues a keepalive if no packets are queued for peer
@@ -103,14 +106,14 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	}
 
 	peer.handshake.mutex.RLock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+	if time.Since(peer.handshake.lastSentHandshake) < peer.rekeyTimeout() {
 		peer.handshake.mutex.RUnlock()
 		return nil
 	}
 	peer.handshake.mutex.RUnlock()
 
 	peer.handshake.mutex.Lock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+	if time.Since(peer.handshake.lastSentHandshake) < peer.rekeyTimeout() {
 		peer.handshake.mutex.Unlock()
 		return nil
 	}
@@ -125,6 +128,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		peer.device.log.Errf("%v - Failed to create initiation message: %v", peer, err)
 		return err
 	}
+	msg.Type = amnezia.headers.init.Generate()
 
 	sendBuffer := make([][]byte, 0, amneziaPacketCount+1+amnezia.junk.count)
 	for _, chain := range amnezia.ipackets {
@@ -136,10 +140,15 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		sendBuffer = append(sendBuffer, buf)
 	}
 	for i := 0; i < amnezia.junk.count; i++ {
-		nBig, _ := rand.Int(rand.Reader, big.NewInt(int64(amnezia.junk.max-amnezia.junk.min+1)))
+		nBig, err := rand.Int(rand.Reader, big.NewInt(int64(amnezia.junk.max-amnezia.junk.min+1)))
+		if err != nil {
+			return fmt.Errorf("failed to generate AmneziaWG junk size: %w", err)
+		}
 		n := int(nBig.Int64()) + amnezia.junk.min
 		buf := make([]byte, n)
-		_, _ = rand.Read(buf)
+		if _, err := rand.Read(buf); err != nil {
+			return fmt.Errorf("failed to generate AmneziaWG junk bytes: %w", err)
+		}
 		sendBuffer = append(sendBuffer, buf)
 	}
 
@@ -152,10 +161,14 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	if padding := amnezia.paddings.init; padding > 0 {
 		buf := make([]byte, padding+len(packet))
-		_, _ = rand.Read(buf[:padding])
+		if _, err := rand.Read(buf[:padding]); err != nil {
+			return fmt.Errorf("failed to generate AmneziaWG initiation padding: %w", err)
+		}
 		copy(buf[padding:], packet)
 		packet = buf
 	}
+	amneziaWGProtectInPlace(amnezia, packet, amnezia.paddings.init, MessageInitiationSize)
+	packet = amneziaWGAppendRandomTrailer(amnezia, packet)
 
 	sendBuffer = append(sendBuffer, packet)
 	err = peer.SendBuffers(sendBuffer)
@@ -180,6 +193,7 @@ func (peer *Peer) SendHandshakeResponse() error {
 		peer.device.log.Errf("%v - Failed to create response message: %v", peer, err)
 		return err
 	}
+	response.Type = amnezia.headers.response.Generate()
 
 	packet := make([]byte, MessageResponseSize)
 	_ = response.marshal(packet)
@@ -197,10 +211,14 @@ func (peer *Peer) SendHandshakeResponse() error {
 
 	if padding := amnezia.paddings.response; padding > 0 {
 		buf := make([]byte, padding+len(packet))
-		_, _ = rand.Read(buf[:padding])
+		if _, err := rand.Read(buf[:padding]); err != nil {
+			return fmt.Errorf("failed to generate AmneziaWG response padding: %w", err)
+		}
 		copy(buf[padding:], packet)
 		packet = buf
 	}
+	amneziaWGProtectInPlace(amnezia, packet, amnezia.paddings.response, MessageResponseSize)
+	packet = amneziaWGAppendRandomTrailer(amnezia, packet)
 
 	// TODO: allocation could be avoided
 	err = peer.SendBuffers([][]byte{packet})
@@ -233,10 +251,14 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 	_ = reply.marshal(packet)
 	if padding := amnezia.paddings.cookie; padding > 0 {
 		buf := make([]byte, padding+len(packet))
-		_, _ = rand.Read(buf[:padding])
+		if _, err := rand.Read(buf[:padding]); err != nil {
+			return fmt.Errorf("failed to generate AmneziaWG cookie padding: %w", err)
+		}
 		copy(buf[padding:], packet)
 		packet = buf
 	}
+	amneziaWGProtectInPlace(amnezia, packet, amnezia.paddings.cookie, MessageCookieReplySize)
+	packet = amneziaWGAppendRandomTrailer(amnezia, packet)
 	device.net.RLock()
 	bind, bindErr := device.transportBindLocked(initiatingElem.transportID)
 	device.net.RUnlock()
@@ -254,7 +276,7 @@ func (peer *Peer) keepKeyFreshSending() {
 		return
 	}
 	nonce := keypair.sendNonce.Load()
-	if nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > RekeyAfterTime) {
+	if nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > peer.rekeyAfterTime()) {
 		if err := peer.SendHandshakeInitiation(false); err != nil {
 			peer.device.log.Debugf("%v - Failed to send handshake initiation: %v", peer, err)
 		}
@@ -437,7 +459,8 @@ top:
 	}
 
 	keypair := peer.keypairs.Current()
-	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
+	amnezia := peer.amneziaWGSnapshot()
+	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= peer.rejectAfterTimeMax() {
 		if err := peer.SendHandshakeInitiation(false); err != nil {
 			peer.device.log.Debugf("%v - Failed to send handshake initiation: %v", peer, err)
 		}
@@ -465,6 +488,7 @@ top:
 				}
 
 				elem.keypair = keypair
+				elem.amnezia = amnezia
 			}
 			elemsContainer.Lock()
 			elemsContainer.elems = elemsContainer.elems[:i]
@@ -529,6 +553,84 @@ func calculatePaddingSize(packetSize, mtu int) int {
 	return paddedSize - lastUnit
 }
 
+func calculateAmneziaWGContentPaddingSize(packetSize, mtu, transportPadding, requested int) int {
+	if requested <= 0 {
+		return 0
+	}
+	maxSegmentContent := MaxMessageSize - MessageTransportSize - transportPadding
+	if maxSegmentContent <= packetSize {
+		return 0
+	}
+	upper := packetSize + requested
+	if mtu > 0 && upper > mtu {
+		upper = mtu
+	}
+	if upper > maxSegmentContent {
+		upper = maxSegmentContent
+	}
+	if upper <= packetSize {
+		return 0
+	}
+
+	// Choose the largest requested addition that still leaves room for normal
+	// WireGuard content padding and the AWG transport S-prefix in one datagram.
+	low := packetSize
+	high := upper
+	best := packetSize
+	for low <= high {
+		mid := low + (high-low)/2
+		wireGuardPadding := calculatePaddingSize(mid, mtu)
+		if mid+wireGuardPadding <= maxSegmentContent {
+			best = mid
+			low = mid + 1
+			continue
+		}
+		high = mid - 1
+	}
+	return best - packetSize
+}
+
+func calculateAmneziaWGTransportContentPaddingSize(packetSize, mtu, transportPadding int) int {
+	paddingSize := calculatePaddingSize(packetSize, mtu)
+	if paddingSize <= 0 || transportPadding <= 0 {
+		return paddingSize
+	}
+	maxSegmentContent := MaxMessageSize - MessageTransportSize - transportPadding
+	if maxSegmentContent <= packetSize {
+		return 0
+	}
+	if packetSize+paddingSize > maxSegmentContent {
+		return maxSegmentContent - packetSize
+	}
+	return paddingSize
+}
+
+func calculateAmneziaWGRandomTrailerContentPaddingSize(packetSize, mtu, transportPadding int) int {
+	maxPadding := calculateAmneziaWGContentPaddingSize(packetSize, mtu, transportPadding, MaxMessageSize)
+	if maxPadding <= 0 {
+		return 0
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(maxPadding+1)))
+	if err != nil {
+		return 0
+	}
+	return int(n.Int64())
+}
+
+func prependAmneziaWGTransportPadding(buffer *[MessageBufferSize]byte, packet []byte, padding int) ([]byte, error) {
+	if padding <= 0 {
+		return packet, nil
+	}
+	if len(packet)+padding > MaxMessageSize || len(packet)+padding > len(buffer) {
+		return packet, errors.New("packet exceeds AmneziaWG transport padding limit")
+	}
+	copy(buffer[padding:], packet)
+	if _, err := rand.Read(buffer[:padding]); err != nil {
+		return packet, fmt.Errorf("failed to generate AmneziaWG transport padding: %w", err)
+	}
+	return buffer[:padding+len(packet)], nil
+}
+
 /* Encrypts the elements in the queue
  * and marks them for sequential consumption (by releasing the mutex)
  *
@@ -543,7 +645,7 @@ func (device *Device) RoutineEncryption(id int) {
 
 	for elemsContainer := range device.queue.encryption.c {
 		for _, elem := range elemsContainer.elems {
-			amnezia := elem.peer.amneziaWGSnapshot()
+			amnezia := elem.amnezia
 			// populate header fields
 			header := elem.buffer[:MessageTransportHeaderSize]
 
@@ -555,8 +657,40 @@ func (device *Device) RoutineEncryption(id int) {
 			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
 			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
 
-			// pad content to multiple of 16
-			paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
+			isKeepalive := len(elem.packet) == 0
+			if !isKeepalive && (amnezia.contentPadding.Set || amnezia.randomTrailers) {
+				paddingSize := 0
+				if amnezia.contentPadding.Set {
+					paddingSize = calculateAmneziaWGContentPaddingSize(
+						len(elem.packet),
+						int(device.tun.mtu.Load()),
+						amnezia.paddings.transport,
+						int(amnezia.contentPadding.Generate()),
+					)
+				} else {
+					paddingSize = calculateAmneziaWGRandomTrailerContentPaddingSize(
+						len(elem.packet),
+						int(device.tun.mtu.Load()),
+						amnezia.paddings.transport,
+					)
+				}
+				for paddingSize > 0 {
+					n := paddingSize
+					if n > len(paddingZeros) {
+						n = len(paddingZeros)
+					}
+					elem.packet = append(elem.packet, paddingZeros[:n]...)
+					paddingSize -= n
+				}
+			}
+
+			// Pad the encrypted content while reserving room for the AWG S4
+			// prefix that the sequential sender adds to this same datagram.
+			paddingSize := calculateAmneziaWGTransportContentPaddingSize(
+				len(elem.packet),
+				int(device.tun.mtu.Load()),
+				amnezia.paddings.transport,
+			)
 			elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
 
 			// encrypt content and release to consumer
@@ -584,7 +718,6 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	bufs := make([][]byte, 0, maxBatchSize)
 
 	for elemsContainer := range peer.queue.outbound.c {
-		amnezia := peer.amneziaWGSnapshot()
 		bufs = bufs[:0]
 		if elemsContainer == nil {
 			return
@@ -607,16 +740,19 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		dataSent := false
 		elemsContainer.Lock()
 		for _, elem := range elemsContainer.elems {
+			amnezia := elem.amnezia
 			if len(elem.packet) != MessageKeepaliveSize {
 				dataSent = true
-				if padding := amnezia.paddings.transport; padding > 0 {
-					for i := len(elem.packet) - 1; i >= 0; i-- {
-						elem.buffer[i+padding] = elem.buffer[i]
-					}
-					_, _ = rand.Read(elem.buffer[:padding])
-					elem.packet = elem.buffer[:padding+len(elem.packet)]
-				}
 			}
+			if padding := amnezia.paddings.transport; padding > 0 && (len(elem.packet) != MessageKeepaliveSize || amnezia.hasHeaderProtection) {
+				packet, err := prependAmneziaWGTransportPadding(elem.buffer, elem.packet, padding)
+				if err != nil {
+					device.log.Debugf("%v - Dropping AmneziaWG transport packet: %v", peer, err)
+					continue
+				}
+				elem.packet = packet
+			}
+			amneziaWGProtectInPlace(amnezia, elem.packet, amnezia.paddings.transport, MessageTransportHeaderSize)
 			bufs = append(bufs, elem.packet)
 		}
 

@@ -23,6 +23,7 @@ type Timer struct {
 	modifyingLock sync.RWMutex
 	runningLock   sync.Mutex
 	isPending     bool
+	duration      time.Duration
 }
 
 func (peer *Peer) NewTimer(expirationFunction func(*Peer)) *Timer {
@@ -37,6 +38,7 @@ func (peer *Peer) NewTimer(expirationFunction func(*Peer)) *Timer {
 			return
 		}
 		timer.isPending = false
+		timer.duration = 0
 		timer.modifyingLock.Unlock()
 
 		expirationFunction(peer)
@@ -48,6 +50,7 @@ func (peer *Peer) NewTimer(expirationFunction func(*Peer)) *Timer {
 func (timer *Timer) Mod(d time.Duration) {
 	timer.modifyingLock.Lock()
 	timer.isPending = true
+	timer.duration = d
 	timer.Reset(d)
 	timer.modifyingLock.Unlock()
 }
@@ -55,6 +58,7 @@ func (timer *Timer) Mod(d time.Duration) {
 func (timer *Timer) Del() {
 	timer.modifyingLock.Lock()
 	timer.isPending = false
+	timer.duration = 0
 	timer.Stop()
 	timer.modifyingLock.Unlock()
 }
@@ -72,13 +76,24 @@ func (timer *Timer) IsPending() bool {
 	return timer.isPending
 }
 
+func (timer *Timer) pendingDuration() (time.Duration, bool) {
+	timer.modifyingLock.RLock()
+	defer timer.modifyingLock.RUnlock()
+	return timer.duration, timer.isPending
+}
+
 func (peer *Peer) timersActive() bool {
 	return peer.isRunning.Load() && peer.device != nil && peer.device.isUp()
 }
 
 func expiredRetransmitHandshake(peer *Peer) {
-	if peer.timers.handshakeAttempts.Load() > MaxTimerHandshakes {
-		peer.device.log.Debugf("%s - Handshake did not complete after %d attempts, giving up", peer, MaxTimerHandshakes+2)
+	maxAttempts := peer.timers.maxHandshakeAttempts.Load()
+	if maxAttempts == 0 {
+		maxAttempts = peer.sampleMaxHandshakeAttempts()
+		peer.timers.maxHandshakeAttempts.Store(maxAttempts)
+	}
+	if peer.timers.handshakeAttempts.Load() > maxAttempts {
+		peer.device.log.Debugf("%s - Handshake did not complete after %d attempts, giving up", peer, maxAttempts+2)
 
 		if peer.timersActive() {
 			peer.timers.sendKeepalive.Del()
@@ -93,11 +108,11 @@ func expiredRetransmitHandshake(peer *Peer) {
 		 * of a partial exchange.
 		 */
 		if peer.timersActive() && !peer.timers.zeroKeyMaterial.IsPending() {
-			peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
+			peer.timers.zeroKeyMaterial.Mod(peer.rejectAfterTimeMax() * 3)
 		}
 	} else {
 		peer.timers.handshakeAttempts.Add(1)
-		peer.device.log.Debugf("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(RekeyTimeout.Seconds()), peer.timers.handshakeAttempts.Load()+1)
+		peer.device.log.Debugf("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(peer.rekeyTimeout().Seconds()), peer.timers.handshakeAttempts.Load()+1)
 
 		/* We clear the endpoint address src address, in case this is the cause of trouble. */
 		peer.markEndpointSrcForClearing()
@@ -113,13 +128,13 @@ func expiredSendKeepalive(peer *Peer) {
 	if peer.timers.needAnotherKeepalive.Load() {
 		peer.timers.needAnotherKeepalive.Store(false)
 		if peer.timersActive() {
-			peer.timers.sendKeepalive.Mod(KeepaliveTimeout)
+			peer.timers.sendKeepalive.Mod(peer.sendKeepaliveTimeout())
 		}
 	}
 }
 
 func expiredNewHandshake(peer *Peer) {
-	peer.device.log.Debugf("%s - Retrying handshake because we stopped hearing back after %d seconds", peer, int((KeepaliveTimeout + RekeyTimeout).Seconds()))
+	peer.device.log.Debugf("%s - Retrying handshake because we stopped hearing back after %d seconds", peer, int(peer.newHandshakeTimeout().Seconds()))
 	/* We clear the endpoint address src address, in case this is the cause of trouble. */
 	peer.markEndpointSrcForClearing()
 	if err := peer.SendHandshakeInitiation(false); err != nil {
@@ -128,12 +143,12 @@ func expiredNewHandshake(peer *Peer) {
 }
 
 func expiredZeroKeyMaterial(peer *Peer) {
-	peer.device.log.Debugf("%s - Removing all keys, since we haven't received a new one in %d seconds", peer, int((RejectAfterTime * 3).Seconds()))
+	peer.device.log.Debugf("%s - Removing all keys, since we haven't received a new one in %d seconds", peer, int((peer.rejectAfterTimeMax() * 3).Seconds()))
 	peer.ZeroAndFlushAll()
 }
 
 func expiredPersistentKeepalive(peer *Peer) {
-	if peer.persistentKeepaliveInterval.Load() > 0 {
+	if peer.persistentKeepaliveRange.Load() != 0 {
 		peer.SendKeepalive()
 	}
 }
@@ -141,7 +156,7 @@ func expiredPersistentKeepalive(peer *Peer) {
 /* Should be called after an authenticated data packet is sent. */
 func (peer *Peer) timersDataSent() {
 	if peer.timersActive() && !peer.timers.newHandshake.IsPending() {
-		peer.timers.newHandshake.Mod(KeepaliveTimeout + RekeyTimeout + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
+		peer.timers.newHandshake.Mod(peer.newHandshakeTimeout() + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
 	}
 }
 
@@ -149,7 +164,7 @@ func (peer *Peer) timersDataSent() {
 func (peer *Peer) timersDataReceived() {
 	if peer.timersActive() {
 		if !peer.timers.sendKeepalive.IsPending() {
-			peer.timers.sendKeepalive.Mod(KeepaliveTimeout)
+			peer.timers.sendKeepalive.Mod(peer.sendKeepaliveTimeout())
 		} else {
 			peer.timers.needAnotherKeepalive.Store(true)
 		}
@@ -173,7 +188,7 @@ func (peer *Peer) timersAnyAuthenticatedPacketReceived() {
 /* Should be called after a handshake initiation message is sent. */
 func (peer *Peer) timersHandshakeInitiated() {
 	if peer.timersActive() {
-		peer.timers.retransmitHandshake.Mod(RekeyTimeout + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
+		peer.timers.retransmitHandshake.Mod(peer.retransmitHandshakeTimeout() + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
 	}
 }
 
@@ -183,25 +198,123 @@ func (peer *Peer) timersHandshakeComplete() {
 		peer.timers.retransmitHandshake.Del()
 	}
 	peer.timers.handshakeAttempts.Store(0)
+	peer.timers.maxHandshakeAttempts.Store(peer.sampleMaxHandshakeAttempts())
 	peer.timers.sentLastMinuteHandshake.Store(false)
 	peer.lastHandshakeNano.Store(time.Now().UnixNano())
 	peer.device.signalRuntimeStats()
-	time.AfterFunc(RejectAfterTime+time.Millisecond, peer.device.signalRuntimeStats)
+	time.AfterFunc(peer.rejectAfterTimeMax()+time.Millisecond, peer.device.signalRuntimeStats)
 }
 
 /* Should be called after an ephemeral key is created, which is before sending a handshake response or after receiving a handshake response. */
 func (peer *Peer) timersSessionDerived() {
 	if peer.timersActive() {
-		peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
+		peer.timers.zeroKeyMaterial.Mod(peer.rejectAfterTimeMax() * 3)
 	}
 }
 
 /* Should be called before a packet with authentication -- keepalive, data, or handshake -- is sent, or after one is received. */
 func (peer *Peer) timersAnyAuthenticatedPacketTraversal() {
-	keepalive := peer.persistentKeepaliveInterval.Load()
-	if keepalive > 0 && peer.timersActive() {
-		peer.timers.persistentKeepalive.Mod(time.Duration(keepalive) * time.Second)
+	keepalive := unpackAmneziaWGRange(peer.persistentKeepaliveRange.Load())
+	if keepalive.Set && peer.timersActive() {
+		peer.timers.persistentKeepalive.Mod(time.Duration(amneziaWGTimerRangeValue(keepalive)) * time.Second)
 	}
+}
+
+// amneziaWGTimerRangeValue follows official amneziawg-go timer semantics:
+// timer ranges are sampled with runtime.fastrandn from an inclusive uint32
+// range. Other AWG range users can still use AmneziaWGRange.Generate.
+func amneziaWGTimerRangeValue(r AmneziaWGRange) uint32 {
+	if !r.Set || r.Min == r.Max {
+		return r.Min
+	}
+	span := amneziaWGInclusiveRangeSize(r.Min, r.Max)
+	if span > uint64(^uint32(0)) {
+		high := fastrandn(1 << 16)
+		low := fastrandn(1 << 16)
+		return high<<16 | low
+	}
+	return r.Min + fastrandn(uint32(span))
+}
+
+func amneziaWGRangeDuration(r AmneziaWGRange, fallback time.Duration) time.Duration {
+	if !r.Set {
+		return fallback
+	}
+	return time.Duration(amneziaWGTimerRangeValue(r)) * time.Second
+}
+
+func amneziaWGRangeDurationMax(r AmneziaWGRange, fallback time.Duration) time.Duration {
+	if !r.Set {
+		return fallback
+	}
+	return time.Duration(r.Max) * time.Second
+}
+
+func amneziaWGRangeDurationMin(r AmneziaWGRange, fallback time.Duration) time.Duration {
+	if !r.Set {
+		return fallback
+	}
+	return time.Duration(r.Min) * time.Second
+}
+
+func (peer *Peer) rekeyAfterTime() time.Duration {
+	return amneziaWGRangeDuration(peer.amneziaWGSnapshot().rekeyAfterTime, RekeyAfterTime)
+}
+
+func (peer *Peer) rekeyTimeout() time.Duration {
+	return amneziaWGRangeDuration(peer.amneziaWGSnapshot().rekeyTimeout, RekeyTimeout)
+}
+
+func (peer *Peer) rekeyTimeoutMin() time.Duration {
+	return amneziaWGRangeDurationMin(peer.amneziaWGSnapshot().rekeyTimeout, RekeyTimeout)
+}
+
+func (peer *Peer) retransmitHandshakeTimeout() time.Duration {
+	return peer.rekeyTimeout()
+}
+
+func (peer *Peer) rejectAfterTimeMax() time.Duration {
+	return amneziaWGRangeDurationMax(peer.amneziaWGSnapshot().rejectAfterTime, RejectAfterTime)
+}
+
+func (peer *Peer) rejectAfterTime() time.Duration {
+	return amneziaWGRangeDuration(peer.amneziaWGSnapshot().rejectAfterTime, RejectAfterTime)
+}
+
+func (peer *Peer) keepaliveTimeout() time.Duration {
+	return amneziaWGRangeDuration(peer.amneziaWGSnapshot().keepaliveTimeout, KeepaliveTimeout)
+}
+
+func (peer *Peer) sendKeepaliveTimeout() time.Duration {
+	return peer.keepaliveTimeout()
+}
+
+func (peer *Peer) keepaliveTimeoutMax() time.Duration {
+	return amneziaWGRangeDurationMax(peer.amneziaWGSnapshot().keepaliveTimeout, KeepaliveTimeout)
+}
+
+func (peer *Peer) keepaliveTimeoutMin() time.Duration {
+	return amneziaWGRangeDurationMin(peer.amneziaWGSnapshot().keepaliveTimeout, KeepaliveTimeout)
+}
+
+func (peer *Peer) newHandshakeTimeout() time.Duration {
+	return peer.keepaliveTimeoutMax() + peer.rekeyTimeout()
+}
+
+func (peer *Peer) keyRefreshTimeoutReceiving() time.Duration {
+	d := peer.rejectAfterTime() - peer.keepaliveTimeoutMin() - peer.rekeyTimeoutMin()
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+func (peer *Peer) sampleMaxHandshakeAttempts() uint32 {
+	r := peer.amneziaWGSnapshot().maxHandshakeAttempts
+	if !r.Set {
+		return MaxTimerHandshakes
+	}
+	return amneziaWGTimerRangeValue(r)
 }
 
 func (peer *Peer) timersInit() {
@@ -214,6 +327,7 @@ func (peer *Peer) timersInit() {
 
 func (peer *Peer) timersStart() {
 	peer.timers.handshakeAttempts.Store(0)
+	peer.timers.maxHandshakeAttempts.Store(peer.sampleMaxHandshakeAttempts())
 	peer.timers.sentLastMinuteHandshake.Store(false)
 	peer.timers.needAnotherKeepalive.Store(false)
 }

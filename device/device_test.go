@@ -157,6 +157,15 @@ func TestNewDeviceExplicitWorkerCount(t *testing.T) {
 	}
 }
 
+func TestDeviceOptionsForceHandshakeCookies(t *testing.T) {
+	dev := NewDevice(nil, nil, NewLogger(LogLevelError, ""), nil, DeviceOptions{ForceHandshakeCookies: true})
+	defer dev.Close()
+
+	if !dev.IsUnderLoad() {
+		t.Fatal("IsUnderLoad() = false, want true when ForceHandshakeCookies is set")
+	}
+}
+
 // genConfigs generates a pair of configs that connect to each other.
 // The configs use distinct, probably-usable ports.
 func genConfigs(tb testing.TB) (cfgs, endpointCfgs [2]string) {

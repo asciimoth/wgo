@@ -15,4 +15,5 @@ var (
 	ErrActivePeerLimit      = errors.New("active peer limit reached")
 	ErrDeviceClosed         = errors.New("device closed")
 	ErrBatchSizeTooLarge    = errors.New("batch size too large")
+	ErrPacketTooLarge       = errors.New("packet too large")
 )

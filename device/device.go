@@ -145,8 +145,64 @@ type Device struct {
 
 	ipackets [amneziaPacketCount]*obfChain
 
+	amneziaVersion AmneziaWGVersion
+	amneziaV3      struct {
+		headerProtectionKey  AmneziaWGHeaderProtectionKey
+		contentPadding       AmneziaWGRange
+		rekeyAfterTime       AmneziaWGRange
+		rekeyTimeout         AmneziaWGRange
+		rejectAfterTime      AmneziaWGRange
+		keepaliveTimeout     AmneziaWGRange
+		maxHandshakeAttempts AmneziaWGRange
+		randomTrailers       bool
+		disableCookies       bool
+	}
+
 	amneziaSnapshot          atomic.Pointer[amneziaWGSnapshot]
 	amneziaReceiveClassifier atomic.Pointer[amneziaWGReceiveClassifier]
+	amneziaReceiveProfileMax int
+	forceHandshakeCookies    bool
+	amneziaReceiveCounters   struct {
+		candidatesTried        atomic.Uint64
+		headerDecryptFailures  atomic.Uint64
+		profileMismatches      atomic.Uint64
+		unknownPackets         atomic.Uint64
+		profileLimitRejections atomic.Uint64
+	}
+}
+
+type AmneziaWGReceiveCounters struct {
+	// CandidatesTried counts receive classifier candidates examined before
+	// Noise or keypair authentication. It does not include key bytes.
+	CandidatesTried uint64
+
+	// HeaderDecryptFailures counts protected-header candidates that could not
+	// be decoded, usually because the packet did not contain the 12-byte nonce
+	// prefix required by AWG 3.1 header protection.
+	HeaderDecryptFailures uint64
+
+	// ProfileMismatches counts decoded packets that authenticated or indexed to
+	// a peer with a different effective receive profile.
+	ProfileMismatches uint64
+
+	// UnknownPackets counts datagrams that did not match any receive profile.
+	UnknownPackets uint64
+
+	// ProfileLimitRejections counts peer receive profiles that were not added
+	// to the classifier because DeviceOptions.MaxAmneziaWGReceiveProfiles was
+	// reached. Normal configuration paths reject this before publishing state;
+	// this counter is for defensive classifier skips in inconsistent state.
+	ProfileLimitRejections uint64
+}
+
+func (device *Device) AmneziaWGReceiveCounters() AmneziaWGReceiveCounters {
+	return AmneziaWGReceiveCounters{
+		CandidatesTried:        device.amneziaReceiveCounters.candidatesTried.Load(),
+		HeaderDecryptFailures:  device.amneziaReceiveCounters.headerDecryptFailures.Load(),
+		ProfileMismatches:      device.amneziaReceiveCounters.profileMismatches.Load(),
+		UnknownPackets:         device.amneziaReceiveCounters.unknownPackets.Load(),
+		ProfileLimitRejections: device.amneziaReceiveCounters.profileLimitRejections.Load(),
+	}
 }
 
 const defaultDeviceBatchSize = 256
@@ -174,6 +230,16 @@ type DeviceOptions struct {
 	// MaxPeers. This implementation still stores configured peers as Peer
 	// objects, so the limit applies when on-demand peers are activated.
 	MaxActivePeers int
+
+	// MaxAmneziaWGReceiveProfiles bounds distinct receive profiles that can be
+	// tried before a peer is authenticated. Configuration that exceeds this
+	// bound is rejected. Values less than 1 use MaxPeers+1.
+	MaxAmneziaWGReceiveProfiles int
+
+	// ForceHandshakeCookies makes the device behave as if it is under handshake
+	// load. This is mainly useful for deterministic compatibility tests that
+	// must exercise cookie replies without packet-flood timing.
+	ForceHandshakeCookies bool
 }
 
 type tunState struct {
@@ -299,7 +365,7 @@ func (device *Device) upLocked() error {
 	device.peers.RUnlock()
 
 	for _, peer := range peers {
-		keepalive := peer.persistentKeepaliveInterval.Load() > 0
+		keepalive := peer.persistentKeepaliveRange.Load() != 0
 		if peer.activation != PeerActivationEager && !keepalive {
 			continue
 		}
@@ -378,6 +444,10 @@ func (device *Device) Down() error {
 }
 
 func (device *Device) IsUnderLoad() bool {
+	if device.forceHandshakeCookies {
+		return true
+	}
+
 	// check if currently under load
 	now := time.Now()
 	underLoad := len(device.queue.handshake.c) >= QueueHandshakeSize/8
@@ -543,6 +613,11 @@ func NewDevice(tunDevice gtun.Tun, bind conn.Bind, logger Logger, spawner gonnec
 	device.initTransports(bind)
 	device.batchSize = effectiveDeviceBatchSize(tunDevice, bind, options)
 	device.maxActivePeers = options.MaxActivePeers
+	device.amneziaReceiveProfileMax = options.MaxAmneziaWGReceiveProfiles
+	device.forceHandshakeCookies = options.ForceHandshakeCookies
+	if device.amneziaReceiveProfileMax < 1 {
+		device.amneziaReceiveProfileMax = MaxPeers + 1
+	}
 	if tunDevice != nil {
 		device.tun.device.Store(tunState)
 		mtu, err := tunDevice.MTU()
@@ -698,7 +773,7 @@ func (device *Device) SendKeepalivesToPeersWithCurrentKeypair() {
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
 		peer.keypairs.RLock()
-		sendKeepalive := peer.keypairs.current != nil && !peer.keypairs.current.created.Add(RejectAfterTime).Before(time.Now())
+		sendKeepalive := peer.keypairs.current != nil && !peer.keypairs.current.created.Add(peer.rejectAfterTimeMax()).Before(time.Now())
 		peer.keypairs.RUnlock()
 		if sendKeepalive {
 			peer.SendKeepalive()

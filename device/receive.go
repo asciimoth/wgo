@@ -12,22 +12,25 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
 	conn "github.com/asciimoth/batchudp"
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
 
 type QueueHandshakeElement struct {
-	msgType     uint32
-	amnezia     amneziaWGSnapshot
-	packet      []byte
-	endpoint    conn.Endpoint
-	transportID TransportID
-	buffer      *[MessageBufferSize]byte
+	msgType           uint32
+	amnezia           amneziaWGSnapshot
+	packet            []byte
+	decodedCandidates []decodedAmneziaPacket
+	endpoint          conn.Endpoint
+	transportID       TransportID
+	buffer            *[MessageBufferSize]byte
 }
 
 type QueueInboundElement struct {
@@ -35,6 +38,7 @@ type QueueInboundElement struct {
 	packet      []byte
 	counter     uint64
 	keypair     *Keypair
+	amnezia     amneziaWGSnapshot
 	endpoint    conn.Endpoint
 	transportID TransportID
 }
@@ -172,6 +176,7 @@ func (elem *QueueInboundElement) clearPointers() {
 	elem.buffer = nil
 	elem.packet = nil
 	elem.keypair = nil
+	elem.amnezia = amneziaWGSnapshot{}
 	elem.endpoint = nil
 	elem.transportID = DefaultTransportID
 }
@@ -185,7 +190,7 @@ func (peer *Peer) keepKeyFreshReceiving() {
 		return
 	}
 	keypair := peer.keypairs.Current()
-	if keypair != nil && keypair.isInitiator && time.Since(keypair.created) > (RejectAfterTime-KeepaliveTimeout-RekeyTimeout) {
+	if keypair != nil && keypair.isInitiator && time.Since(keypair.created) > peer.keyRefreshTimeoutReceiving() {
 		peer.timers.sentLastMinuteHandshake.Store(true)
 		if err := peer.SendHandshakeInitiation(false); err != nil {
 			peer.device.log.Debugf("%v - Failed to send handshake initiation: %v", peer, err)
@@ -273,92 +278,135 @@ func (device *Device) routineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			}
 
 			packet := bufsArrs[i][:size]
-			msgType, padding, amnezia := device.determinePacketTypeAndPadding(packet, MessageUnknownType)
-			if padding > 0 {
-				copy(packet, packet[padding:])
-				packet = packet[:len(packet)-padding]
-			}
-
-			switch msgType {
-
-			// check if transport
-
-			case MessageTransportType:
-
-				// check size
-
-				if len(packet) < MessageTransportSize {
-					continue
-				}
-
-				// lookup key pair
-
-				receiver := binary.LittleEndian.Uint32(
-					packet[MessageTransportOffsetReceiver:MessageTransportOffsetCounter],
-				)
-				value := device.indexTable.Lookup(receiver)
-				keypair := value.keypair
-				if keypair == nil {
-					continue
-				}
-
-				// check keypair expiry
-
-				if keypair.created.Add(RejectAfterTime).Before(time.Now()) {
-					continue
-				}
-
-				// create work element
-				peer := value.peer
-				elem := device.GetInboundElement()
-				elem.packet = packet
-				elem.buffer = bufsArrs[i]
-				elem.keypair = keypair
-				elem.endpoint = endpoints[i]
-				elem.transportID = transportID
-				elem.counter = 0
-
-				elemsForPeer, ok := elemsByPeer[peer]
-				if !ok {
-					elemsForPeer = device.GetInboundElementsContainer()
-					elemsForPeer.Lock()
-					elemsByPeer[peer] = elemsForPeer
-				}
-				elemsForPeer.elems = append(elemsForPeer.elems, elem)
-				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
-				continue
-
-			// otherwise it is a fixed size & handshake related packet
-
-			case MessageInitiationType:
-				if len(packet) != MessageInitiationSize {
-					continue
-				}
-
-			case MessageResponseType:
-				if len(packet) != MessageResponseSize {
-					continue
-				}
-
-			case MessageCookieReplyType:
-				if len(packet) != MessageCookieReplySize {
-					continue
-				}
-
-			default:
+			decodedCandidates := device.decodeAmneziaWGPacketCandidates(packet, MessageUnknownType)
+			if len(decodedCandidates) == 0 {
 				device.log.Debugf("Received message with unknown type")
 				continue
+			}
+			var selected decodedAmneziaPacket
+			var selectedCandidates []decodedAmneziaPacket
+			selectedOK := false
+
+			for _, decoded := range decodedCandidates {
+				msgType := decoded.messageType()
+				amnezia := decoded.amnezia()
+
+				switch msgType {
+
+				// check if transport
+
+				case MessageTransportType:
+
+					// check size
+
+					if len(packet)-decoded.padding() < MessageTransportSize {
+						continue
+					}
+
+					// lookup key pair
+
+					receiver, _ := decoded.receiverIndex()
+					value := device.indexTable.Lookup(receiver)
+					keypair := value.keypair
+					peer := value.peer
+					if keypair == nil || peer == nil {
+						continue
+					}
+
+					// check keypair expiry
+
+					if keypair.created.Add(peer.rejectAfterTimeMax()).Before(time.Now()) {
+						continue
+					}
+
+					// create work element
+					if !amneziaWGReceiveProfileEqual(peer.amneziaWGSnapshot(), amnezia) {
+						device.amneziaReceiveCounters.profileMismatches.Add(1)
+						continue
+					}
+					packet = decoded.materialize(packet)
+					elem := device.GetInboundElement()
+					elem.packet = packet
+					elem.buffer = bufsArrs[i]
+					elem.keypair = keypair
+					elem.amnezia = amnezia
+					elem.endpoint = endpoints[i]
+					elem.transportID = transportID
+					elem.counter = 0
+
+					elemsForPeer, ok := elemsByPeer[peer]
+					if !ok {
+						elemsForPeer = device.GetInboundElementsContainer()
+						elemsForPeer.Lock()
+						elemsByPeer[peer] = elemsForPeer
+					}
+					elemsForPeer.elems = append(elemsForPeer.elems, elem)
+					bufsArrs[i] = device.GetMessageBuffer()
+					bufs[i] = bufsArrs[i][:]
+					selected = decoded
+					selectedOK = true
+
+					// otherwise it is a fixed size & handshake related packet
+
+				case MessageInitiationType:
+					if len(packet)-decoded.padding() < MessageInitiationSize {
+						continue
+					}
+					selected = decoded
+					selectedCandidates = selectedCandidates[:0]
+					selectedOK = true
+					for _, candidate := range decodedCandidates {
+						if candidate.messageType() == MessageInitiationType {
+							selectedCandidates = append(selectedCandidates, candidate)
+						}
+					}
+
+				case MessageResponseType:
+					receiver, _ := decoded.receiverIndex()
+					entry := device.indexTable.Lookup(receiver)
+					if entry.peer == nil || !amneziaWGReceiveProfileEqual(entry.peer.amneziaWGSnapshot(), amnezia) {
+						device.amneziaReceiveCounters.profileMismatches.Add(1)
+						continue
+					}
+					selected = decoded
+					selectedOK = true
+
+				case MessageCookieReplyType:
+					receiver, _ := decoded.receiverIndex()
+					entry := device.indexTable.Lookup(receiver)
+					if entry.peer == nil || !amneziaWGReceiveProfileEqual(entry.peer.amneziaWGSnapshot(), amnezia) {
+						device.amneziaReceiveCounters.profileMismatches.Add(1)
+						continue
+					}
+					selected = decoded
+					selectedOK = true
+
+				default:
+					continue
+				}
+				if selectedOK {
+					break
+				}
+			}
+			if !selectedOK {
+				continue
+			}
+			if selected.messageType() == MessageTransportType {
+				continue
+			}
+			if selected.messageType() != MessageInitiationType {
+				packet = selected.materialize(packet)
 			}
 
 			select {
 			case device.queue.handshake.c <- QueueHandshakeElement{
-				msgType:     msgType,
-				amnezia:     amnezia,
-				buffer:      bufsArrs[i],
-				packet:      packet,
-				endpoint:    endpoints[i],
-				transportID: transportID,
+				msgType:           selected.messageType(),
+				amnezia:           selected.amnezia(),
+				buffer:            bufsArrs[i],
+				packet:            packet,
+				decodedCandidates: selectedCandidates,
+				endpoint:          endpoints[i],
+				transportID:       transportID,
 			}:
 				bufsArrs[i] = device.GetMessageBuffer()
 				bufs[i] = bufsArrs[i][:]
@@ -379,6 +427,72 @@ func (device *Device) routineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			delete(elemsByPeer, peer)
 		}
 	}
+}
+
+func (device *Device) consumeInitiationCandidates(elem *QueueHandshakeElement) (*Peer, []byte, bool) {
+	candidates := elem.decodedCandidates
+	if len(candidates) == 0 {
+		candidates = []decodedAmneziaPacket{{
+			candidate: amneziaWGReceiveCandidate{
+				msgType:    MessageInitiationType,
+				padding:    0,
+				coreLength: MessageInitiationSize,
+				amnezia:    elem.amnezia,
+			},
+		}}
+		copy(candidates[0].core[:], elem.packet)
+	}
+
+	for _, candidate := range candidates {
+		if len(elem.packet) < candidate.padding()+candidate.coreLength() {
+			continue
+		}
+		packet := append([]byte(nil), elem.packet...)
+		packet = candidate.materialize(packet)
+		if len(packet) != MessageInitiationSize {
+			continue
+		}
+		if !device.cookieChecker.CheckMAC1(packet) {
+			device.log.Debugf("Received packet with invalid mac1")
+			continue
+		}
+		if device.IsUnderLoad() {
+			if !device.cookieChecker.CheckMAC2(packet, elem.endpoint.DstToBytes()) {
+				if !candidate.amnezia().disableCookies {
+					cookieElem := *elem
+					cookieElem.amnezia = candidate.amnezia()
+					cookieElem.packet = packet
+					if err := device.SendHandshakeCookie(&cookieElem); err != nil {
+						device.log.Debugf("Failed to send handshake cookie: %v", err)
+					}
+				}
+				continue
+			}
+			if !device.rate.limiter.Allow(elem.endpoint.DstIP()) {
+				continue
+			}
+		}
+
+		var msg MessageInitiation
+		if err := msg.unmarshal(packet); err != nil {
+			device.log.Errf("Failed to decode initiation message")
+			continue
+		}
+		msg.Type = MessageInitiationType
+
+		peer, result := device.ConsumeMessageInitiationWithProfile(&msg, candidate.amnezia())
+		switch result {
+		case consumeInitiationOK:
+			return peer, packet, true
+		case consumeInitiationProfileMismatch:
+			device.amneziaReceiveCounters.profileMismatches.Add(1)
+			continue
+		default:
+			continue
+		}
+	}
+	device.log.Debugf("Received invalid initiation message from %s", elem.endpoint.DstToString())
+	return nil, nil, false
 }
 
 func validateReceiveBatch(count, maxBatchSize int, sizes []int, endpoints []conn.Endpoint, bufs [][]byte) error {
@@ -463,6 +577,9 @@ func (device *Device) RoutineHandshake(id int) {
 			if entry.peer == nil {
 				goto skip
 			}
+			if !amneziaWGReceiveProfileEqual(entry.peer.amneziaWGSnapshot(), elem.amnezia) {
+				goto skip
+			}
 
 			// consume reply
 
@@ -475,7 +592,10 @@ func (device *Device) RoutineHandshake(id int) {
 
 			goto skip
 
-		case MessageInitiationType, MessageResponseType:
+		case MessageInitiationType:
+			goto handleContent
+
+		case MessageResponseType:
 
 			// check mac fields and maybe ratelimit
 
@@ -491,8 +611,10 @@ func (device *Device) RoutineHandshake(id int) {
 				// verify MAC2 field
 
 				if !device.cookieChecker.CheckMAC2(elem.packet, elem.endpoint.DstToBytes()) {
-					if err := device.SendHandshakeCookie(&elem); err != nil {
-						device.log.Debugf("Failed to send handshake cookie: %v", err)
+					if !elem.amnezia.disableCookies {
+						if err := device.SendHandshakeCookie(&elem); err != nil {
+							device.log.Debugf("Failed to send handshake cookie: %v", err)
+						}
 					}
 					goto skip
 				}
@@ -509,26 +631,13 @@ func (device *Device) RoutineHandshake(id int) {
 			goto skip
 		}
 
+	handleContent:
 		// handle handshake initiation/response content
 
 		switch elem.msgType {
 		case MessageInitiationType:
-
-			// unmarshal
-
-			var msg MessageInitiation
-			err := msg.unmarshal(elem.packet)
-			if err != nil {
-				device.log.Errf("Failed to decode initiation message")
-				goto skip
-			}
-			msg.Type = elem.msgType
-
-			// consume initiation
-
-			peer := device.ConsumeMessageInitiation(&msg)
-			if peer == nil {
-				device.log.Debugf("Received invalid initiation message from %s", elem.endpoint.DstToString())
+			peer, packet, ok := device.consumeInitiationCandidates(&elem)
+			if !ok {
 				goto skip
 			}
 			if !peer.isRunning.Load() {
@@ -547,8 +656,8 @@ func (device *Device) RoutineHandshake(id int) {
 			peer.SetEndpointFromPacket(elem.endpoint, elem.transportID)
 
 			device.log.Debugf("%v - Received handshake initiation", peer)
-			peer.rxBytes.Add(uint64(len(elem.packet)))
-			peer.device.accountRuntimeStatsRx(uint64(len(elem.packet)), 1)
+			peer.rxBytes.Add(uint64(len(packet)))
+			peer.device.accountRuntimeStatsRx(uint64(len(packet)), 1)
 
 			if err := peer.SendHandshakeResponse(); err != nil {
 				device.log.Debugf("%v - Failed to send handshake response: %v", peer, err)
@@ -565,6 +674,10 @@ func (device *Device) RoutineHandshake(id int) {
 				goto skip
 			}
 			msg.Type = elem.msgType
+			entry := device.indexTable.Lookup(msg.Receiver)
+			if entry.peer == nil || !amneziaWGReceiveProfileEqual(entry.peer.amneziaWGSnapshot(), elem.amnezia) {
+				goto skip
+			}
 
 			// consume response
 
@@ -737,34 +850,56 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 }
 
 func (device *Device) DeterminePacketTypeAndPadding(packet []byte, expectedType uint32) (uint32, int) {
-	msgType, padding, _ := device.determinePacketTypeAndPadding(packet, expectedType)
-	return msgType, padding
+	decoded := device.decodeAmneziaWGPacket(packet, expectedType)
+	if decoded.messageType() == MessageUnknownType {
+		return MessageUnknownType, 0
+	}
+	return decoded.messageType(), decoded.padding()
 }
 
-func (device *Device) determinePacketTypeAndPadding(packet []byte, expectedType uint32) (uint32, int, amneziaWGSnapshot) {
+func (device *Device) decodeAmneziaWGPacket(packet []byte, expectedType uint32) decodedAmneziaPacket {
+	decodedCandidates := device.decodeAmneziaWGPacketCandidates(packet, expectedType)
+	if len(decodedCandidates) == 0 {
+		return decodedAmneziaPacket{}
+	}
+	return decodedCandidates[0]
+}
+
+func (device *Device) decodeAmneziaWGPacketCandidates(packet []byte, expectedType uint32) []decodedAmneziaPacket {
 	size := len(packet)
 	classifier := device.amneziaReceiveClassifier.Load()
 	if classifier == nil {
 		amnezia := device.amneziaWGSnapshot()
-		if msgType, padding, ok := classifyAmneziaWGPacket(packet, size, expectedType, amnezia); ok {
-			return msgType, padding, amnezia
+		if candidate, ok := classifyAmneziaWGPacket(packet, size, expectedType, amnezia); ok {
+			if decoded, ok := decodeAmneziaWGReceiveCandidate(packet, candidate); ok {
+				device.amneziaReceiveCounters.candidatesTried.Add(1)
+				return []decodedAmneziaPacket{decoded}
+			}
+			device.amneziaReceiveCounters.candidatesTried.Add(1)
 		}
-		return MessageUnknownType, 0, amneziaWGSnapshot{}
+		device.amneziaReceiveCounters.unknownPackets.Add(1)
+		return nil
 	}
 
-	if candidate, ok := classifier.classify(packet, expectedType); ok {
-		return candidate.msgType, candidate.padding, candidate.amnezia
+	candidates, tried, headerFailures := classifier.classify(packet, expectedType)
+	device.amneziaReceiveCounters.headerDecryptFailures.Add(headerFailures)
+	if len(candidates) > 0 {
+		device.amneziaReceiveCounters.candidatesTried.Add(tried)
+		return candidates
 	}
-	return MessageUnknownType, 0, amneziaWGSnapshot{}
+	device.amneziaReceiveCounters.candidatesTried.Add(tried)
+	device.amneziaReceiveCounters.unknownPackets.Add(1)
+	return nil
 }
 
 // classify checks only candidates that can match the packet size and header
 // value. The work per unauthenticated datagram stays bounded by the number of
 // valid header offsets, not by the number of configured peer profiles.
-func (classifier *amneziaWGReceiveClassifier) classify(packet []byte, expectedType uint32) (amneziaWGReceiveCandidate, bool) {
+func (classifier *amneziaWGReceiveClassifier) classify(packet []byte, expectedType uint32) ([]decodedAmneziaPacket, uint64, uint64) {
 	size := len(packet)
-	var best amneziaWGReceiveCandidate
-	found := false
+	var decoded []decodedAmneziaPacket
+	var tried uint64
+	var headerFailures uint64
 
 	if expectedType == MessageUnknownType ||
 		expectedType == MessageInitiationType ||
@@ -774,12 +909,49 @@ func (classifier *amneziaWGReceiveClassifier) classify(packet []byte, expectedTy
 			if padding+4 > size {
 				continue
 			}
-			header := binary.LittleEndian.Uint32(packet[padding:])
-			candidate, ok := index.lookup(header, expectedType)
-			if ok && (!found || candidate.order < best.order) {
-				best = candidate
-				found = true
+			for _, profile := range index.profiles() {
+				tried++
+				header, ok := amneziaWGProtectedHeader(profile, packet, padding)
+				if !ok {
+					if profile.hasHeaderProtection {
+						headerFailures++
+					}
+					continue
+				}
+				candidates := index.lookupAllForProfile(header, expectedType, profile)
+				for _, candidate := range candidates {
+					if candidate, ok := decodeAmneziaWGReceiveCandidate(packet, candidate); ok {
+						decoded = append(decoded, candidate)
+					}
+				}
 			}
+		}
+		for _, trailer := range classifier.fixedWithTrailers {
+			tried++
+			if expectedType != MessageUnknownType && expectedType != trailer.msgType {
+				continue
+			}
+			if size < trailer.padding+trailer.coreLength || size > MaxMessageSize {
+				continue
+			}
+			header, ok := amneziaWGProtectedHeader(trailer.amnezia, packet, trailer.padding)
+			if !ok || !trailer.header.Validate(header) {
+				if !ok && trailer.amnezia.hasHeaderProtection {
+					headerFailures++
+				}
+				continue
+			}
+			candidate, ok := decodeAmneziaWGReceiveCandidate(packet, amneziaWGReceiveCandidate{
+				msgType:    trailer.msgType,
+				padding:    trailer.padding,
+				coreLength: trailer.coreLength,
+				order:      trailer.order,
+				amnezia:    trailer.amnezia,
+			})
+			if !ok {
+				continue
+			}
+			decoded = append(decoded, candidate)
 		}
 	}
 
@@ -793,45 +965,87 @@ func (classifier *amneziaWGReceiveClassifier) classify(packet []byte, expectedTy
 			if index.empty() {
 				continue
 			}
-			header := binary.LittleEndian.Uint32(packet[padding:])
-			candidate, ok := index.lookup(header, expectedType)
-			if ok && (!found || candidate.order < best.order) {
-				best = candidate
-				found = true
+			for _, profile := range index.profiles() {
+				tried++
+				header, ok := amneziaWGProtectedHeader(profile, packet, padding)
+				if !ok {
+					if profile.hasHeaderProtection {
+						headerFailures++
+					}
+					continue
+				}
+				candidates := index.lookupAllForProfile(header, expectedType, profile)
+				for _, candidate := range candidates {
+					if candidate, ok := decodeAmneziaWGReceiveCandidate(packet, candidate); ok {
+						decoded = append(decoded, candidate)
+					}
+				}
 			}
 		}
 	}
 
-	return best, found
+	sort.SliceStable(decoded, func(i, j int) bool {
+		return decoded[i].candidate.order < decoded[j].candidate.order
+	})
+	return decoded, tried, headerFailures
 }
 
-func classifyAmneziaWGPacket(packet []byte, size int, expectedType uint32, amnezia amneziaWGSnapshot) (uint32, int, bool) {
+func classifyAmneziaWGPacket(packet []byte, size int, expectedType uint32, amnezia amneziaWGSnapshot) (amneziaWGReceiveCandidate, bool) {
 	if expectedType == MessageUnknownType || expectedType == MessageInitiationType {
 		padding := amnezia.paddings.init
-		if amnezia.headers.init != nil && size == padding+MessageInitiationSize && size >= padding+4 && amnezia.headers.init.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-			return MessageInitiationType, padding, true
+		header, ok := amneziaWGProtectedHeader(amnezia, packet, padding)
+		if ok && amnezia.headers.init != nil && amneziaWGFixedMessageSizeOK(size, padding, MessageInitiationSize, amnezia) && amnezia.headers.init.Validate(header) {
+			return amneziaWGReceiveCandidate{msgType: MessageInitiationType, padding: padding, coreLength: MessageInitiationSize, amnezia: amnezia}, true
 		}
 	}
 	if expectedType == MessageUnknownType || expectedType == MessageResponseType {
 		padding := amnezia.paddings.response
-		if amnezia.headers.response != nil && size == padding+MessageResponseSize && size >= padding+4 && amnezia.headers.response.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-			return MessageResponseType, padding, true
+		header, ok := amneziaWGProtectedHeader(amnezia, packet, padding)
+		if ok && amnezia.headers.response != nil && amneziaWGFixedMessageSizeOK(size, padding, MessageResponseSize, amnezia) && amnezia.headers.response.Validate(header) {
+			return amneziaWGReceiveCandidate{msgType: MessageResponseType, padding: padding, coreLength: MessageResponseSize, amnezia: amnezia}, true
 		}
 	}
 	if expectedType == MessageUnknownType || expectedType == MessageCookieReplyType {
 		padding := amnezia.paddings.cookie
-		if amnezia.headers.cookie != nil && size == padding+MessageCookieReplySize && size >= padding+4 && amnezia.headers.cookie.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-			return MessageCookieReplyType, padding, true
+		header, ok := amneziaWGProtectedHeader(amnezia, packet, padding)
+		if ok && amnezia.headers.cookie != nil && amneziaWGFixedMessageSizeOK(size, padding, MessageCookieReplySize, amnezia) && amnezia.headers.cookie.Validate(header) {
+			return amneziaWGReceiveCandidate{msgType: MessageCookieReplyType, padding: padding, coreLength: MessageCookieReplySize, amnezia: amnezia}, true
 		}
 	}
 	if expectedType == MessageUnknownType || expectedType == MessageTransportType {
 		padding := amnezia.paddings.transport
-		if amnezia.headers.transport != nil && size >= padding+MessageTransportHeaderSize && size >= padding+4 && amnezia.headers.transport.Validate(binary.LittleEndian.Uint32(packet[padding:])) {
-			return MessageTransportType, padding, true
+		header, ok := amneziaWGProtectedHeader(amnezia, packet, padding)
+		if ok && amnezia.headers.transport != nil && size >= padding+MessageTransportHeaderSize && amnezia.headers.transport.Validate(header) {
+			return amneziaWGReceiveCandidate{msgType: MessageTransportType, padding: padding, coreLength: MessageTransportHeaderSize, amnezia: amnezia}, true
 		}
-		if padding > 0 && amnezia.headers.transport != nil && size >= MessageTransportHeaderSize && amnezia.headers.transport.Validate(binary.LittleEndian.Uint32(packet)) {
-			return MessageTransportType, 0, true
+		if padding > 0 && !amnezia.hasHeaderProtection && amnezia.headers.transport != nil && size >= MessageTransportHeaderSize && amnezia.headers.transport.Validate(binary.LittleEndian.Uint32(packet)) {
+			return amneziaWGReceiveCandidate{msgType: MessageTransportType, padding: 0, coreLength: MessageTransportHeaderSize, amnezia: amnezia}, true
 		}
 	}
-	return MessageUnknownType, 0, false
+	return amneziaWGReceiveCandidate{}, false
+}
+
+func amneziaWGFixedMessageSizeOK(size, padding, coreLength int, amnezia amneziaWGSnapshot) bool {
+	if size == padding+coreLength {
+		return true
+	}
+	return amnezia.randomTrailers && size >= padding+coreLength && size <= MaxMessageSize
+}
+
+func decodeAmneziaWGReceiveCandidate(packet []byte, candidate amneziaWGReceiveCandidate) (decodedAmneziaPacket, bool) {
+	padding := candidate.padding
+	coreLength := candidate.coreLength
+	if coreLength <= 0 || coreLength > MessageHandshakeSize || padding < 0 || len(packet) < padding+coreLength {
+		return decodedAmneziaPacket{}, false
+	}
+	var decoded decodedAmneziaPacket
+	decoded.candidate = candidate
+	copy(decoded.core[:coreLength], packet[padding:padding+coreLength])
+	if candidate.amnezia.hasHeaderProtection {
+		if padding < chacha20.NonceSize {
+			return decodedAmneziaPacket{}, false
+		}
+		amneziaWGMaskHeaderProtection(candidate.amnezia.headerProtectionKey, packet[:chacha20.NonceSize], decoded.core[:coreLength])
+	}
+	return decoded, true
 }

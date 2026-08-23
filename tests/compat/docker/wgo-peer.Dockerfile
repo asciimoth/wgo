@@ -7,6 +7,7 @@ RUN go mod download
 
 COPY . .
 RUN CGO_ENABLED=1 GOOS=linux go build -o /out/compat-wgo-peer ./cmd/compat_wgo_peer
+RUN CGO_ENABLED=1 GOOS=linux go build -o /out/awg-malformed-sender ./tests/compat/cmd/awg_malformed_sender
 
 FROM debian:bookworm-slim
 
@@ -20,5 +21,6 @@ RUN apt-get update \
 	&& rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/compat-wgo-peer /usr/local/bin/compat-wgo-peer
+COPY --from=build /out/awg-malformed-sender /usr/local/bin/awg-malformed-sender
 
 ENTRYPOINT ["/usr/local/bin/compat-wgo-peer"]

@@ -43,6 +43,7 @@ type Peer struct {
 		zeroKeyMaterial         *Timer
 		persistentKeepalive     *Timer
 		handshakeAttempts       atomic.Uint32
+		maxHandshakeAttempts    atomic.Uint32
 		needAnotherKeepalive    atomic.Bool
 		sentLastMinuteHandshake atomic.Bool
 	}
@@ -60,6 +61,8 @@ type Peer struct {
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
 	persistentKeepaliveInterval atomic.Uint32
+	persistentKeepaliveRange    atomic.Uint64
+	persistentKeepaliveIsRange  atomic.Bool
 	activation                  PeerActivationMode
 	revision                    atomic.Uint64
 	amnezia                     struct {
@@ -130,6 +133,12 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 }
 
 func (peer *Peer) SendBuffers(buffers [][]byte) error {
+	for i, buffer := range buffers {
+		if len(buffer) > MaxMessageSize {
+			return fmt.Errorf("%w: packet %d length %d exceeds maximum %d", ErrPacketTooLarge, i, len(buffer), MaxMessageSize)
+		}
+	}
+
 	peer.device.net.RLock()
 	defer peer.device.net.RUnlock()
 

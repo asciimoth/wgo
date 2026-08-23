@@ -16,6 +16,7 @@ import (
 	"time"
 
 	conn "github.com/asciimoth/batchudp"
+	"golang.org/x/crypto/chacha20"
 )
 
 // DeviceConfig is a complete device configuration snapshot.
@@ -46,8 +47,12 @@ type PeerConfig struct {
 	TxBytes                     uint64
 	RxBytes                     uint64
 	PersistentKeepaliveInterval uint16
-	AllowedIPs                  []netip.Prefix
-	AmneziaWG                   *AmneziaWGConfig
+	// PersistentKeepaliveRange, when non-nil, overrides
+	// PersistentKeepaliveInterval and can represent the AWG 3.1 "a-b" UAPI
+	// persistent_keepalive_interval form.
+	PersistentKeepaliveRange *AmneziaWGRange
+	AllowedIPs               []netip.Prefix
+	AmneziaWG                *AmneziaWGConfig
 }
 
 // ApplyConfigOptions controls how ApplyConfig reconciles peers and endpoints.
@@ -66,6 +71,8 @@ type ApplyConfigOptions struct {
 // Nil fields mean "leave unchanged". A nil InitiationPackets entry leaves that
 // packet spec unchanged. A non-nil empty string clears that packet spec.
 type AmneziaWGConfigPatch struct {
+	Version *AmneziaWGVersion
+
 	JunkCount         *int
 	JunkMin           *int
 	JunkMax           *int
@@ -78,6 +85,16 @@ type AmneziaWGConfigPatch struct {
 	CookiePadding     *int
 	TransportPadding  *int
 	InitiationPackets [amneziaPacketCount]*string
+
+	HeaderProtectionKey  *AmneziaWGHeaderProtectionKey
+	ContentPadding       *AmneziaWGRange
+	RekeyAfterTime       *AmneziaWGRange
+	RekeyTimeout         *AmneziaWGRange
+	RejectAfterTime      *AmneziaWGRange
+	KeepaliveTimeout     *AmneziaWGRange
+	MaxHandshakeAttempts *AmneziaWGRange
+	RandomTrailers       *bool
+	DisableCookies       *bool
 }
 
 // EndpointParser validates endpoint strings using bind-specific endpoint parsing.
@@ -112,6 +129,13 @@ func ValidateConfigWithOptions(cfg DeviceConfig, opts ValidationOptions) error {
 		seen[peer.PublicKey] = struct{}{}
 
 		if err := validatePeerConfig(peer, opts); err != nil {
+			return fmt.Errorf("peer %s: %w", validationPeerName(peer.PublicKey), err)
+		}
+		effectiveAmnezia := cfg.AmneziaWG
+		if peer.AmneziaWG != nil {
+			effectiveAmnezia = *peer.AmneziaWG
+		}
+		if err := validatePeerPersistentKeepaliveForAmneziaWGVersion(peer.PersistentKeepaliveRange, effectiveAmnezia); err != nil {
 			return fmt.Errorf("peer %s: %w", validationPeerName(peer.PublicKey), err)
 		}
 	}
@@ -157,7 +181,24 @@ func validatePeerConfig(peer PeerConfig, opts ValidationOptions) error {
 			return fmt.Errorf("amneziawg: %w", err)
 		}
 	}
+	if peer.PersistentKeepaliveRange != nil {
+		if err := peer.PersistentKeepaliveRange.Validate("persistent keepalive interval", uint32(^uint16(0))); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func validatePeerPersistentKeepaliveForAmneziaWGVersion(keepalive *AmneziaWGRange, awg AmneziaWGConfig) error {
+	if keepalive == nil || !keepalive.Set || keepalive.Min == keepalive.Max {
+		return nil
+	}
+	switch awg.Version {
+	case AmneziaWGDisabled, AmneziaWGV1_5, AmneziaWGV2:
+		return fmt.Errorf("persistent keepalive range requires AWG 3.1 or auto version")
+	default:
+		return nil
+	}
 }
 
 func validateEndpoint(endpoint string, parser EndpointParser) error {
@@ -264,6 +305,30 @@ func validateAmneziaWGConfigPatch(patch ipcSetAmneziaWG) error {
 		if chain.ObfuscatedLen() > maxAmneziaWGInitiationPacketSize {
 			return fmt.Errorf("initiation packet %d length must be <= %d", i+1, maxAmneziaWGInitiationPacketSize)
 		}
+	}
+	for _, field := range []struct {
+		name  string
+		value *AmneziaWGRange
+		max   uint32
+	}{
+		{"content padding", patch.contentPadding, uint32(MaxMessageSize)},
+		{"rekey after time", patch.rekeyAfterTime, maxAmneziaWGTimerRangeSeconds},
+		{"rekey timeout", patch.rekeyTimeout, maxAmneziaWGTimerRangeSeconds},
+		{"reject after time", patch.rejectAfterTime, maxAmneziaWGTimerRangeSeconds},
+		{"keepalive timeout", patch.keepaliveTimeout, maxAmneziaWGTimerRangeSeconds},
+		{"max handshake attempts", patch.maxHandshakeAttempts, maxAmneziaWGHandshakeAttempts},
+	} {
+		if field.value != nil {
+			if err := field.value.Validate(field.name, field.max); err != nil {
+				return err
+			}
+		}
+	}
+	if patch.maxHandshakeAttempts != nil && patch.maxHandshakeAttempts.Set && patch.maxHandshakeAttempts.Min == 0 {
+		return fmt.Errorf("max handshake attempts minimum must be positive")
+	}
+	if patch.rejectAfterTime != nil && patch.rejectAfterTime.Set && patch.rejectAfterTime.Max > maxAmneziaWGRejectAfterTimeMax {
+		return fmt.Errorf("reject after time maximum must be <= %d", maxAmneziaWGRejectAfterTimeMax)
 	}
 	return nil
 }
@@ -485,6 +550,35 @@ func (device *Device) SetPeerPersistentKeepaliveInterval(publicKey NoisePublicKe
 	return err
 }
 
+func (device *Device) SetPeerPersistentKeepaliveRange(publicKey NoisePublicKey, keepalive AmneziaWGRange) error {
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
+	_, err := device.setPeerPersistentKeepaliveRangeLocked(publicKey, keepalive, true)
+	return err
+}
+
+func (device *Device) PeerPersistentKeepaliveRange(publicKey NoisePublicKey) (AmneziaWGRange, bool) {
+	device.ipcMutex.RLock()
+	defer device.ipcMutex.RUnlock()
+	peer := device.lookupPeerLocked(publicKey)
+	if peer == nil {
+		return AmneziaWGRange{}, false
+	}
+	keepalive := unpackAmneziaWGRange(peer.persistentKeepaliveRange.Load())
+	if !keepalive.Set {
+		return AmneziaWGRange{}, false
+	}
+	return keepalive, true
+}
+
+func (device *Device) SetAmneziaWGVersion(version AmneziaWGVersion) error {
+	return device.SetAmneziaWGConfigPatch(AmneziaWGConfigPatch{Version: &version})
+}
+
+func (device *Device) SetPeerAmneziaWGVersion(publicKey NoisePublicKey, version AmneziaWGVersion) error {
+	return device.SetPeerAmneziaWGConfigPatch(publicKey, AmneziaWGConfigPatch{Version: &version})
+}
+
 func (device *Device) SetPeerProtocolVersion(publicKey NoisePublicKey, version int) error {
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
@@ -594,7 +688,11 @@ func (device *Device) applyPeerConfigLocked(cfg PeerConfig, opts ApplyConfigOpti
 	if err := device.replacePeerAllowedIPsLocked(cfg.PublicKey, cfg.AllowedIPs); err != nil {
 		return fmt.Errorf("allowed IPs: %w", err)
 	}
-	if _, err := device.setPeerPersistentKeepaliveIntervalLocked(cfg.PublicKey, cfg.PersistentKeepaliveInterval, false); err != nil {
+	if cfg.PersistentKeepaliveRange != nil {
+		if _, err := device.setPeerPersistentKeepaliveRangeLocked(cfg.PublicKey, *cfg.PersistentKeepaliveRange, false); err != nil {
+			return fmt.Errorf("persistent keepalive interval: %w", err)
+		}
+	} else if _, err := device.setPeerPersistentKeepaliveIntervalLocked(cfg.PublicKey, cfg.PersistentKeepaliveInterval, false); err != nil {
 		return fmt.Errorf("persistent keepalive interval: %w", err)
 	}
 	if err := device.setPeerAmneziaWGConfigLocked(cfg.PublicKey, cfg.AmneziaWG); err != nil {
@@ -623,7 +721,7 @@ func (device *Device) activatePeerLocked(peer *Peer) {
 		return
 	}
 	peer.Start()
-	if peer.persistentKeepaliveInterval.Load() > 0 {
+	if peer.persistentKeepaliveRange.Load() != 0 {
 		peer.SendKeepalive()
 	}
 	peer.SendStagedPackets()
@@ -645,6 +743,7 @@ func (device *Device) setFwmarkLocked(mark uint32) error {
 
 func (device *Device) amneziaWGConfigLocked() AmneziaWGConfig {
 	cfg := DefaultAmneziaWGConfig()
+	cfg.Version = device.amneziaVersion
 	cfg.JunkCount = device.junk.count
 	cfg.JunkMin = device.junk.min
 	cfg.JunkMax = device.junk.max
@@ -661,11 +760,21 @@ func (device *Device) amneziaWGConfigLocked() AmneziaWGConfig {
 			cfg.InitiationPackets[i] = chain.Spec
 		}
 	}
+	cfg.HeaderProtectionKey = device.amneziaV3.headerProtectionKey
+	cfg.ContentPadding = device.amneziaV3.contentPadding
+	cfg.RekeyAfterTime = device.amneziaV3.rekeyAfterTime
+	cfg.RekeyTimeout = device.amneziaV3.rekeyTimeout
+	cfg.RejectAfterTime = device.amneziaV3.rejectAfterTime
+	cfg.KeepaliveTimeout = device.amneziaV3.keepaliveTimeout
+	cfg.MaxHandshakeAttempts = device.amneziaV3.maxHandshakeAttempts
+	cfg.RandomTrailers = device.amneziaV3.randomTrailers
+	cfg.DisableCookies = device.amneziaV3.disableCookies
 	return cfg
 }
 
 func (patch AmneziaWGConfigPatch) toIPC() (ipcSetAmneziaWG, error) {
 	override := ipcSetAmneziaWG{
+		version:          patch.Version,
 		junkCount:        patch.JunkCount,
 		junkMin:          patch.JunkMin,
 		junkMax:          patch.JunkMax,
@@ -673,6 +782,16 @@ func (patch AmneziaWGConfigPatch) toIPC() (ipcSetAmneziaWG, error) {
 		responsePadding:  patch.ResponsePadding,
 		cookiePadding:    patch.CookiePadding,
 		transportPadding: patch.TransportPadding,
+
+		headerProtectionKey:  patch.HeaderProtectionKey,
+		contentPadding:       patch.ContentPadding,
+		rekeyAfterTime:       patch.RekeyAfterTime,
+		rekeyTimeout:         patch.RekeyTimeout,
+		rejectAfterTime:      patch.RejectAfterTime,
+		keepaliveTimeout:     patch.KeepaliveTimeout,
+		maxHandshakeAttempts: patch.MaxHandshakeAttempts,
+		randomTrailers:       patch.RandomTrailers,
+		disableCookies:       patch.DisableCookies,
 	}
 	if patch.InitHeader != nil {
 		override.initHeader = &magicHeader{start: patch.InitHeader.Start, end: patch.InitHeader.End}
@@ -705,6 +824,7 @@ func (patch AmneziaWGConfigPatch) toIPC() (ipcSetAmneziaWG, error) {
 
 func amneziaWGConfigPatchFromIPC(override ipcSetAmneziaWG) AmneziaWGConfigPatch {
 	patch := AmneziaWGConfigPatch{
+		Version:          override.version,
 		JunkCount:        override.junkCount,
 		JunkMin:          override.junkMin,
 		JunkMax:          override.junkMax,
@@ -712,6 +832,16 @@ func amneziaWGConfigPatchFromIPC(override ipcSetAmneziaWG) AmneziaWGConfigPatch 
 		ResponsePadding:  override.responsePadding,
 		CookiePadding:    override.cookiePadding,
 		TransportPadding: override.transportPadding,
+
+		HeaderProtectionKey:  override.headerProtectionKey,
+		ContentPadding:       override.contentPadding,
+		RekeyAfterTime:       override.rekeyAfterTime,
+		RekeyTimeout:         override.rekeyTimeout,
+		RejectAfterTime:      override.rejectAfterTime,
+		KeepaliveTimeout:     override.keepaliveTimeout,
+		MaxHandshakeAttempts: override.maxHandshakeAttempts,
+		RandomTrailers:       override.randomTrailers,
+		DisableCookies:       override.disableCookies,
 	}
 	if override.initHeader != nil {
 		header := override.initHeader.toConfig()
@@ -751,6 +881,7 @@ func (device *Device) setAmneziaWGConfigLocked(cfg AmneziaWGConfig) error {
 	}
 
 	device.junk.count = cfg.JunkCount
+	device.amneziaVersion = cfg.Version
 	device.junk.min = cfg.JunkMin
 	device.junk.max = cfg.JunkMax
 	device.headers.init = &magicHeader{start: cfg.InitHeader.Start, end: cfg.InitHeader.End}
@@ -772,6 +903,15 @@ func (device *Device) setAmneziaWGConfigLocked(cfg AmneziaWGConfig) error {
 		}
 		device.ipackets[i] = chain
 	}
+	device.amneziaV3.headerProtectionKey = cfg.HeaderProtectionKey
+	device.amneziaV3.contentPadding = cfg.ContentPadding
+	device.amneziaV3.rekeyAfterTime = cfg.RekeyAfterTime
+	device.amneziaV3.rekeyTimeout = cfg.RekeyTimeout
+	device.amneziaV3.rejectAfterTime = cfg.RejectAfterTime
+	device.amneziaV3.keepaliveTimeout = cfg.KeepaliveTimeout
+	device.amneziaV3.maxHandshakeAttempts = cfg.MaxHandshakeAttempts
+	device.amneziaV3.randomTrailers = cfg.RandomTrailers
+	device.amneziaV3.disableCookies = cfg.DisableCookies
 	device.storeAmneziaWGSnapshot()
 	device.refreshPeerAmneziaWGSnapshotsLocked()
 	device.storeAmneziaWGReceiveClassifier()
@@ -779,6 +919,9 @@ func (device *Device) setAmneziaWGConfigLocked(cfg AmneziaWGConfig) error {
 }
 
 func validateAmneziaWGConfig(cfg AmneziaWGConfig) error {
+	if cfg.Version > AmneziaWGV3_1 {
+		return fmt.Errorf("version: invalid AmneziaWG version %d", cfg.Version)
+	}
 	if err := validateAmneziaWGNonNegativeField("junk count", cfg.JunkCount, maxAmneziaWGJunkCount); err != nil {
 		return err
 	}
@@ -840,7 +983,122 @@ func validateAmneziaWGConfig(cfg AmneziaWGConfig) error {
 			return fmt.Errorf("initiation packet %d length must be <= %d", i+1, maxAmneziaWGInitiationPacketSize)
 		}
 	}
+	if err := validateAmneziaWGV3Fields(cfg); err != nil {
+		return err
+	}
+	if err := validateAmneziaWGExplicitVersion(cfg); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateAmneziaWGV3Fields(cfg AmneziaWGConfig) error {
+	for _, field := range []struct {
+		name string
+		rng  AmneziaWGRange
+		max  uint32
+	}{
+		{"content padding", cfg.ContentPadding, uint32(MaxMessageSize)},
+		{"rekey after time", cfg.RekeyAfterTime, maxAmneziaWGTimerRangeSeconds},
+		{"rekey timeout", cfg.RekeyTimeout, maxAmneziaWGTimerRangeSeconds},
+		{"reject after time", cfg.RejectAfterTime, maxAmneziaWGTimerRangeSeconds},
+		{"keepalive timeout", cfg.KeepaliveTimeout, maxAmneziaWGTimerRangeSeconds},
+		{"max handshake attempts", cfg.MaxHandshakeAttempts, maxAmneziaWGHandshakeAttempts},
+	} {
+		if err := field.rng.Validate(field.name, field.max); err != nil {
+			return err
+		}
+	}
+	if !cfg.HeaderProtectionKey.IsZero() {
+		for _, field := range []struct {
+			name  string
+			value int
+		}{
+			{"init padding", cfg.InitPadding},
+			{"response padding", cfg.ResponsePadding},
+			{"cookie padding", cfg.CookiePadding},
+			{"transport padding", cfg.TransportPadding},
+		} {
+			if field.value < chacha20.NonceSize {
+				return fmt.Errorf("%s must be >= %d when header protection is enabled", field.name, chacha20.NonceSize)
+			}
+		}
+	}
+	if cfg.MaxHandshakeAttempts.Set && cfg.MaxHandshakeAttempts.Min == 0 {
+		return fmt.Errorf("max handshake attempts minimum must be positive")
+	}
+	if cfg.RejectAfterTime.Set && cfg.RejectAfterTime.Max > maxAmneziaWGRejectAfterTimeMax {
+		return fmt.Errorf("reject after time maximum must be <= %d", maxAmneziaWGRejectAfterTimeMax)
+	}
+	rejectMin := cfg.RejectAfterTime.Min
+	if !cfg.RejectAfterTime.Set {
+		rejectMin = uint32(RejectAfterTime / time.Second)
+	}
+	keepaliveMax := cfg.KeepaliveTimeout.Max
+	if !cfg.KeepaliveTimeout.Set {
+		keepaliveMax = uint32(KeepaliveTimeout / time.Second)
+	}
+	rekeyMax := cfg.RekeyTimeout.Max
+	if !cfg.RekeyTimeout.Set {
+		rekeyMax = uint32(RekeyTimeout / time.Second)
+	}
+	if rejectMin < keepaliveMax || rejectMin-keepaliveMax < rekeyMax {
+		return fmt.Errorf("timing ranges must satisfy reject_after_time minimum >= keepalive_timeout maximum + rekey_timeout maximum")
+	}
+	return nil
+}
+
+func validateAmneziaWGExplicitVersion(cfg AmneziaWGConfig) error {
+	effective := inferAmneziaWGVersion(cfg)
+	switch cfg.Version {
+	case AmneziaWGVersionAuto:
+		return nil
+	case AmneziaWGDisabled:
+		if effective != AmneziaWGDisabled {
+			return fmt.Errorf("disabled version requires a canonical WireGuard profile")
+		}
+	case AmneziaWGV1_5, AmneziaWGV2:
+		if hasAmneziaWGV3Fields(cfg) {
+			return fmt.Errorf("version %d rejects AWG 3.1 fields", cfg.Version)
+		}
+	case AmneziaWGV3_1:
+		return nil
+	}
+	return nil
+}
+
+func inferAmneziaWGVersion(cfg AmneziaWGConfig) AmneziaWGVersion {
+	if hasAmneziaWGV3Fields(cfg) {
+		return AmneziaWGV3_1
+	}
+	if cfg.InitPadding != 0 || cfg.ResponsePadding != 0 || cfg.CookiePadding != 0 || cfg.TransportPadding != 0 ||
+		cfg.InitHeader != DefaultAmneziaWGHeaderRange(MessageInitiationType) ||
+		cfg.ResponseHeader != DefaultAmneziaWGHeaderRange(MessageResponseType) ||
+		cfg.CookieHeader != DefaultAmneziaWGHeaderRange(MessageCookieReplyType) ||
+		cfg.TransportHeader != DefaultAmneziaWGHeaderRange(MessageTransportType) {
+		return AmneziaWGV2
+	}
+	for _, spec := range cfg.InitiationPackets {
+		if spec != "" {
+			return AmneziaWGV1_5
+		}
+	}
+	if cfg.JunkCount != 0 || cfg.JunkMin != 0 || cfg.JunkMax != 0 {
+		return AmneziaWGV2
+	}
+	return AmneziaWGDisabled
+}
+
+func hasAmneziaWGV3Fields(cfg AmneziaWGConfig) bool {
+	return !cfg.HeaderProtectionKey.IsZero() ||
+		cfg.ContentPadding.Set ||
+		cfg.RekeyAfterTime.Set ||
+		cfg.RekeyTimeout.Set ||
+		cfg.RejectAfterTime.Set ||
+		cfg.KeepaliveTimeout.Set ||
+		cfg.MaxHandshakeAttempts.Set ||
+		cfg.RandomTrailers ||
+		cfg.DisableCookies
 }
 
 func validateAmneziaWGGeneratedLength(length int) error {
@@ -855,6 +1113,24 @@ func validateAmneziaWGNonNegativeField(name string, value, max int) error {
 		return fmt.Errorf("%s must be <= %d", name, max)
 	}
 	return nil
+}
+
+func packAmneziaWGRange(r AmneziaWGRange) uint64 {
+	if !r.Set {
+		return 0
+	}
+	return 1<<63 | uint64(r.Min)<<32 | uint64(r.Max)
+}
+
+func unpackAmneziaWGRange(packed uint64) AmneziaWGRange {
+	if packed&(1<<63) == 0 {
+		return AmneziaWGRange{}
+	}
+	return AmneziaWGRange{
+		Min: uint32((packed >> 32) & 0x7fffffff),
+		Max: uint32(packed),
+		Set: true,
+	}
 }
 
 func (device *Device) setPeerPresharedKeyLocked(publicKey NoisePublicKey, presharedKey NoisePresharedKey) error {
@@ -874,45 +1150,85 @@ func (device *Device) setPeerEndpointLocked(publicKey NoisePublicKey, endpoint s
 }
 
 func (device *Device) setPeerEndpointForTransportLocked(publicKey NoisePublicKey, transportID TransportID, endpoint string) error {
-	peer, err := device.requirePeerLocked(publicKey)
+	peer, parsed, err := device.preparePeerEndpointForTransportLocked(publicKey, transportID, endpoint)
 	if err != nil {
 		return err
 	}
+	applyPeerEndpoint(peer, parsed, transportID, endpoint)
+	return nil
+}
 
+func (device *Device) preparePeerEndpointForTransportLocked(publicKey NoisePublicKey, transportID TransportID, endpoint string) (*Peer, conn.Endpoint, error) {
+	peer, err := device.requirePeerLocked(publicKey)
+	if err != nil {
+		return nil, nil, err
+	}
 	device.net.RLock()
 	st := device.net.transports[transportID]
 	device.net.RUnlock()
 	if st == nil || st.bind == nil {
 		if transportID == DefaultTransportID {
-			return fmt.Errorf("failed to set endpoint %v: no bind attached", endpoint)
+			return nil, nil, fmt.Errorf("failed to set endpoint %v: no bind attached", endpoint)
 		}
-		return fmt.Errorf("%w: %q", ErrTransportNotFound, transportID)
+		return nil, nil, fmt.Errorf("%w: %q", ErrTransportNotFound, transportID)
 	}
 
 	parsed, err := st.bind.ParseEndpoint(endpoint)
 	if err != nil {
-		return fmt.Errorf("failed to set endpoint %v: %w", endpoint, err)
+		return nil, nil, fmt.Errorf("failed to set endpoint %v: %w", endpoint, err)
 	}
+	return peer, parsed, nil
+}
 
+func applyPeerEndpoint(peer *Peer, parsed conn.Endpoint, transportID TransportID, endpoint string) {
 	peer.endpoint.Lock()
 	peer.endpoint.val = parsed
 	peer.endpoint.transport = transportID
 	peer.endpoint.address = endpoint
 	peer.endpoint.Unlock()
-	return nil
 }
 
 func (device *Device) setPeerPersistentKeepaliveIntervalLocked(publicKey NoisePublicKey, seconds uint16, sendImmediate bool) (uint32, error) {
+	return device.setPeerPersistentKeepaliveLocked(publicKey, AmneziaWGRange{Min: uint32(seconds), Max: uint32(seconds), Set: seconds != 0}, false, sendImmediate)
+}
+
+func (device *Device) setPeerPersistentKeepaliveRangeLocked(publicKey NoisePublicKey, keepalive AmneziaWGRange, sendImmediate bool) (uint32, error) {
+	return device.setPeerPersistentKeepaliveLocked(publicKey, keepalive, keepalive.Set, sendImmediate)
+}
+
+func (device *Device) setPeerPersistentKeepaliveLocked(publicKey NoisePublicKey, keepalive AmneziaWGRange, isRange bool, sendImmediate bool) (uint32, error) {
 	peer, err := device.requirePeerLocked(publicKey)
 	if err != nil {
 		return 0, err
 	}
+	if err := keepalive.Validate("persistent keepalive interval", uint32(^uint16(0))); err != nil {
+		return 0, err
+	}
+	if keepalive.Set && keepalive.Min != keepalive.Max {
+		awg, err := device.peerAmneziaWGConfigLocked(peer)
+		if err != nil {
+			return 0, err
+		}
+		if err := validatePeerPersistentKeepaliveForAmneziaWGVersion(&keepalive, awg); err != nil {
+			return 0, err
+		}
+	}
 
-	old := peer.persistentKeepaliveInterval.Swap(uint32(seconds))
-	if sendImmediate && old == 0 && seconds != 0 && device.isUp() {
+	oldPacked := peer.persistentKeepaliveRange.Swap(packAmneziaWGRange(keepalive))
+	old := unpackAmneziaWGRange(oldPacked)
+	peer.persistentKeepaliveIsRange.Store(isRange)
+	if keepalive.Set && keepalive.Min == keepalive.Max && keepalive.Max <= uint32(^uint16(0)) {
+		peer.persistentKeepaliveInterval.Store(keepalive.Min)
+	} else {
+		peer.persistentKeepaliveInterval.Store(0)
+	}
+	if sendImmediate && !old.Set && keepalive.Set && device.isUp() {
 		peer.SendKeepalive()
 	}
-	return old, nil
+	if !old.Set {
+		return 0, nil
+	}
+	return old.Min, nil
 }
 
 func (device *Device) setPeerProtocolVersionLocked(publicKey NoisePublicKey, version int) error {
@@ -946,6 +1262,7 @@ func (device *Device) setPeerAmneziaWGConfigLocked(publicKey NoisePublicKey, cfg
 	}
 
 	override := ipcSetAmneziaWG{
+		version:          &cfg.Version,
 		junkCount:        &cfg.JunkCount,
 		junkMin:          &cfg.JunkMin,
 		junkMax:          &cfg.JunkMax,
@@ -957,6 +1274,16 @@ func (device *Device) setPeerAmneziaWGConfigLocked(publicKey NoisePublicKey, cfg
 		responsePadding:  &cfg.ResponsePadding,
 		cookiePadding:    &cfg.CookiePadding,
 		transportPadding: &cfg.TransportPadding,
+
+		headerProtectionKey:  &cfg.HeaderProtectionKey,
+		contentPadding:       &cfg.ContentPadding,
+		rekeyAfterTime:       &cfg.RekeyAfterTime,
+		rekeyTimeout:         &cfg.RekeyTimeout,
+		rejectAfterTime:      &cfg.RejectAfterTime,
+		keepaliveTimeout:     &cfg.KeepaliveTimeout,
+		maxHandshakeAttempts: &cfg.MaxHandshakeAttempts,
+		randomTrailers:       &cfg.RandomTrailers,
+		disableCookies:       &cfg.DisableCookies,
 	}
 	for i, spec := range cfg.InitiationPackets {
 		override.packetSet[i] = true
@@ -1082,7 +1409,16 @@ func (device *Device) peerConfigLocked(peer *Peer) PeerConfig {
 	}
 	cfg.TxBytes = peer.txBytes.Load()
 	cfg.RxBytes = peer.rxBytes.Load()
-	cfg.PersistentKeepaliveInterval = uint16(peer.persistentKeepaliveInterval.Load())
+	keepalive := unpackAmneziaWGRange(peer.persistentKeepaliveRange.Load())
+	if keepalive.Set {
+		if peer.persistentKeepaliveIsRange.Load() || keepalive.Min != keepalive.Max || keepalive.Max > uint32(^uint16(0)) {
+			rangeCopy := keepalive
+			cfg.PersistentKeepaliveRange = &rangeCopy
+		}
+		if keepalive.Min == keepalive.Max && keepalive.Max <= uint32(^uint16(0)) {
+			cfg.PersistentKeepaliveInterval = uint16(keepalive.Min)
+		}
+	}
 
 	device.allowedips.EntriesForPeer(peer, func(prefix netip.Prefix) bool {
 		cfg.AllowedIPs = append(cfg.AllowedIPs, prefix)
@@ -1129,6 +1465,7 @@ func (device *Device) refreshPeerAmneziaWGSnapshotLocked(peer *Peer) error {
 	}
 
 	var snapshot amneziaWGSnapshot
+	snapshot.version = cfg.Version
 	snapshot.junk.count = cfg.JunkCount
 	snapshot.junk.min = cfg.JunkMin
 	snapshot.junk.max = cfg.JunkMax
@@ -1150,6 +1487,16 @@ func (device *Device) refreshPeerAmneziaWGSnapshotLocked(peer *Peer) error {
 		}
 		snapshot.ipackets[i] = chain
 	}
+	snapshot.headerProtectionKey = cfg.HeaderProtectionKey
+	snapshot.hasHeaderProtection = !cfg.HeaderProtectionKey.IsZero()
+	snapshot.contentPadding = cfg.ContentPadding
+	snapshot.rekeyAfterTime = cfg.RekeyAfterTime
+	snapshot.rekeyTimeout = cfg.RekeyTimeout
+	snapshot.rejectAfterTime = cfg.RejectAfterTime
+	snapshot.keepaliveTimeout = cfg.KeepaliveTimeout
+	snapshot.maxHandshakeAttempts = cfg.MaxHandshakeAttempts
+	snapshot.randomTrailers = cfg.RandomTrailers
+	snapshot.disableCookies = cfg.DisableCookies
 	peer.amnezia.snapshot.Store(&snapshot)
 	return nil
 }
@@ -1180,7 +1527,7 @@ func (device *Device) validateAmneziaWGReceiveProfilesForBaseLocked(cfg AmneziaW
 		}
 		profiles = append(profiles, amneziaWGSnapshotFromConfig(effective))
 	}
-	return validateAmneziaWGReceiveProfiles(profiles)
+	return device.validateAmneziaWGReceiveProfiles(profiles)
 }
 
 func (device *Device) validateAmneziaWGReceiveProfilesForPeerConfigLocked(target *Peer, cfg AmneziaWGConfig) error {
@@ -1197,7 +1544,7 @@ func (device *Device) validateAmneziaWGReceiveProfilesForPeerConfigLocked(target
 			profiles = append(profiles, *snapshot)
 		}
 	}
-	return validateAmneziaWGReceiveProfiles(profiles)
+	return device.validateAmneziaWGReceiveProfiles(profiles)
 }
 
 func (device *Device) validateCurrentAmneziaWGReceiveProfilesLocked() error {
@@ -1210,11 +1557,26 @@ func (device *Device) validateCurrentAmneziaWGReceiveProfilesLocked() error {
 			profiles = append(profiles, *snapshot)
 		}
 	}
-	return validateAmneziaWGReceiveProfiles(profiles)
+	return device.validateAmneziaWGReceiveProfiles(profiles)
+}
+
+func (device *Device) validateAmneziaWGReceiveProfiles(profiles []amneziaWGSnapshot) error {
+	unique := make([]amneziaWGSnapshot, 0, len(profiles))
+	for _, profile := range profiles {
+		if amneziaWGReceiveProfilesContain(unique, profile) {
+			continue
+		}
+		unique = append(unique, profile)
+	}
+	if device.amneziaReceiveProfileMax > 0 && len(unique) > device.amneziaReceiveProfileMax {
+		return fmt.Errorf("amneziawg receive profiles: %d unique profiles exceeds limit %d", len(unique), device.amneziaReceiveProfileMax)
+	}
+	return validateAmneziaWGReceiveProfiles(unique)
 }
 
 func amneziaWGSnapshotFromConfig(cfg AmneziaWGConfig) amneziaWGSnapshot {
 	var snapshot amneziaWGSnapshot
+	snapshot.version = cfg.Version
 	snapshot.junk.count = cfg.JunkCount
 	snapshot.junk.min = cfg.JunkMin
 	snapshot.junk.max = cfg.JunkMax
@@ -1235,5 +1597,15 @@ func amneziaWGSnapshotFromConfig(cfg AmneziaWGConfig) amneziaWGSnapshot {
 			snapshot.ipackets[i] = chain
 		}
 	}
+	snapshot.headerProtectionKey = cfg.HeaderProtectionKey
+	snapshot.hasHeaderProtection = !cfg.HeaderProtectionKey.IsZero()
+	snapshot.contentPadding = cfg.ContentPadding
+	snapshot.rekeyAfterTime = cfg.RekeyAfterTime
+	snapshot.rekeyTimeout = cfg.RekeyTimeout
+	snapshot.rejectAfterTime = cfg.RejectAfterTime
+	snapshot.keepaliveTimeout = cfg.KeepaliveTimeout
+	snapshot.maxHandshakeAttempts = cfg.MaxHandshakeAttempts
+	snapshot.randomTrailers = cfg.RandomTrailers
+	snapshot.disableCookies = cfg.DisableCookies
 	return snapshot
 }
