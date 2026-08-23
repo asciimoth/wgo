@@ -5,6 +5,9 @@ This repository has multiple test layers:
 - Fast package tests with `go test -race ./...`
 - A Linux compatibility suite that runs this library against kernel-space WireGuard and upstream `amneziawg-go` in Docker
 - A Linux obfuscation-signature suite that captures Docker traffic and checks standard WireGuard packet signatures with `tshark`
+- A Linux Amnezia import suite that parses self-hosted WireGuard/AmneziaWG
+  `vpn://` and `.conf` guest inputs with `wgo/amnesia`, configures a `wgo`
+  client, and verifies tunnel access to an upstream `amneziawg-go` server
 - A Linux performance suite that benchmarks this library, upstream `wireguard-go`, upstream `amneziawg-go`, and kernel-space WireGuard with `iperf3`
 
 ## Standard Checks
@@ -152,6 +155,28 @@ Each run stores:
 - UAPI request/response logs
 - The raw packet capture (`pcapng`)
 - A signature-analysis summary with captured packet counts and counts of standard WireGuard packet signatures
+
+## Amnezia Import Suite
+
+Run the self-hosted Amnezia import suite with:
+
+```bash
+just test-amnesia-e2e
+```
+
+Like the other Docker E2E suites, this target uses `sudo` because it starts
+privileged containers with TUN devices.
+
+The runner is [tests/amnesia/run.sh](tests/amnesia/run.sh). It builds a `wgo`
+client image with the `amnesia` import helper and a self-host test server
+image that runs the pinned upstream `amneziawg-go` data plane. The server
+container generates guest WireGuard and AmneziaWG inputs in both `vpn://` and
+native `.conf` formats, serves the `vpn://` guest URL over HTTP, and the client
+container fetches that URL with `curl`. The imported profile is applied to
+`wgo` through UAPI. The suite verifies ping in both directions, `curl` from the
+client to an HTTP endpoint on the server through the VPN tunnel, and an HTTP
+client request from the server to an endpoint on the client through the same
+tunnel.
 
 ## Performance Suite
 

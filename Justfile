@@ -24,8 +24,11 @@ test-compat:
 test-obfuscation:
 	sudo ./tests/obfuscation/run.sh
 
+test-amnesia-e2e:
+	sudo ./tests/amnesia/run.sh
+
 test-performance:
 	sudo ./tests/perf/run.sh
 
 # Stress tests + compat tests.
-test-total: test-stress test-compat test-obfuscation
+test-total: test-stress test-compat test-obfuscation test-amnesia-e2e

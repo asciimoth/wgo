@@ -1,0 +1,2 @@
+/testdata/private/*
+!/testdata/private/.gitkeep

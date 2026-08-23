@@ -16,7 +16,13 @@
 - added leveled logging
 - implemented [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go)-compatible obfuscation, including typed AWG 3.1 configuration fields
     - added support for per-peer obfuscation options, migration notes, and receive-profile guidance in [ARCHITECTURE.md](./ARCHITECTURE.md#amneziawg-extension)
+- added [`amnesia`](./amnesia), a `wgo` subpackage that imports Amnezia service
+  keys, self-hosted guest `vpn://` keys, and native WireGuard/AmneziaWG configs
+  into backend-neutral profiles for `device`
 - added more end-to-end and [compatibility](./tests/compat) tests with other WireGuard implementations
+- added [self-hosted Amnezia import e2e tests](./tests/amnesia) that parse
+  server-exported WireGuard and AmneziaWG `vpn://`/`.conf` guest inputs and
+  verify ping and HTTP tunnel access through `wgo`
 - added [performance tests](./tests/perf) with a [comparison](./performance-log.md) against other WireGuard implementations
 - [WASM builds supported](https://asciimoth.github.io/wg-web-demo/)
 

@@ -7,6 +7,8 @@
 Unlike the upstream project, this repository is structured as a reusable library rather than an executable tool. The main architectural boundary is:
 
 - `device`: protocol engine and runtime orchestration
+- `amnesia`: Amnezia import and API-client helpers that turn service keys,
+  self-hosted guest keys, and native configs into backend-neutral profiles
 - `ipc`: WireGuard UAPI transport helpers
 - helper packages: small protocol/runtime utilities used by `device`
 - external transport dependencies: `github.com/asciimoth/batchudp` for UDP bind/endpoint abstractions and `github.com/asciimoth/gonnect` for network providers
@@ -65,6 +67,22 @@ Important internal structures:
 - `Peer` in [device/peer.go](device/peer.go)
 - `AllowedIPs` trie in [device/allowedips.go](device/allowedips.go)
 - queue definitions in [device/channels.go](device/channels.go)
+
+### `amnesia`
+
+`amnesia` is the Amnezia control-plane/import package. It does not create a
+TUN device, open UDP sockets, or start a WireGuard tunnel. It parses Amnezia
+API-v2 service keys, self-hosted guest `vpn://` keys, and native
+WireGuard/AmneziaWG `.conf` files into a validated `Profile`.
+
+Host applications can translate that `Profile` into `device` typed calls or
+UAPI configuration. Static self-hosted and native inputs complete offline.
+Service keys use a caller-supplied `http.Client` and can pause for CAPTCHA or
+other recognized interactions.
+
+The package keeps imported native text as untrusted secret input and renders
+only the validated WireGuard/AWG subset. This prevents `wg-quick` shell hooks
+and unknown directives from being replayed by default.
 
 ### UDP Transport
 

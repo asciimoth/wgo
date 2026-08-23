@@ -38,9 +38,21 @@
               ''; in builtins.toString script;
               stages = [ "commit-msg" ];
             };
-            govet.enable = true;
+            govet = {
+              enable = true;
+              pass_filenames = false;
+              entry = let script = pkgs.writeShellScript "govethook" ''
+                go vet ./...
+              ''; in builtins.toString script;
+            };
             gofmt.enable = true;
-            golangci-lint.enable = true;
+            golangci-lint = {
+              enable = true;
+              pass_filenames = false;
+              entry = let script = pkgs.writeShellScript "golangci-lint-hook" ''
+                golangci-lint run ./...
+              ''; in builtins.toString script;
+            };
             gotidy = {
               enable = true;
               description = "Makes sure go.mod matches the source code";
