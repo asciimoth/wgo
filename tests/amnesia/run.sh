@@ -211,6 +211,21 @@ expect_ping_success() {
 	return 1
 }
 
+expect_ping_failure() {
+	local cont="$1"
+	local addr="$2"
+	local attempts="${3:-3}"
+	local i
+	for ((i = 0; i < attempts; i++)); do
+		if docker_shell "${cont}" "ping -c 1 -W 1 ${addr}" >/dev/null 2>&1; then
+			echo "expected ping from ${cont} to ${addr} to fail" >&2
+			return 1
+		fi
+		sleep 1
+	done
+	return 0
+}
+
 expect_http_text() {
 	local cont="$1"
 	local url="$2"
@@ -229,6 +244,23 @@ expect_http_text() {
 		echo "last reply: ${reply}" >&2
 	fi
 	return 1
+}
+
+expect_http_unreachable() {
+	local cont="$1"
+	local url="$2"
+	local attempts="${3:-3}"
+	local reply
+	local i
+	for ((i = 0; i < attempts; i++)); do
+		if reply="$(docker_shell "${cont}" "curl -fsS --connect-timeout 1 --max-time 2 ${url}" 2>/dev/null)"; then
+			echo "expected HTTP GET from ${cont} to ${url} to fail" >&2
+			echo "unexpected reply: ${reply}" >&2
+			return 1
+		fi
+		sleep 1
+	done
+	return 0
 }
 
 configure_userspace_interface() {
@@ -338,6 +370,37 @@ EOF
 )" "${log_file}"
 }
 
+configure_server_two_peers() {
+	local cont="$1"
+	local log_file="$2"
+	local private_key_hex="$3"
+	local peer1_pub_hex="$4"
+	local peer1_outer_ip="$5"
+	local peer1_tun_host="$6"
+	local peer2_pub_hex="$7"
+	local peer2_outer_ip="$8"
+	local peer2_tun_host="$9"
+
+	uapi_set_text "${cont}" "$(cat <<EOF
+set=1
+private_key=${private_key_hex}
+listen_port=${SERVER_PORT}
+$(amnezia_device_config_payload)
+replace_peers=true
+public_key=${peer1_pub_hex}
+protocol_version=1
+replace_allowed_ips=true
+allowed_ip=${peer1_tun_host}/32
+endpoint=${peer1_outer_ip}:${CLIENT_PORT}
+public_key=${peer2_pub_hex}
+protocol_version=1
+replace_allowed_ips=true
+allowed_ip=${peer2_tun_host}/32
+endpoint=${peer2_outer_ip}:${CLIENT_PORT}
+EOF
+)" "${log_file}"
+}
+
 make_server_guest_input() {
 	local cont="$1"
 	local protocol="$2"
@@ -347,7 +410,7 @@ make_server_guest_input() {
 	local client_public="$6"
 	local server_public="$7"
 	local client_tun_ip="$8"
-	local server_tun_host="$9"
+	local allowed_ips="$9"
 	local output_file="${10}"
 
 	docker exec \
@@ -358,7 +421,7 @@ make_server_guest_input() {
 		-e CLIENT_PUBLIC="${client_public}" \
 		-e SERVER_PUBLIC="${server_public}" \
 		-e CLIENT_ADDRESS="${client_tun_ip}" \
-		-e ALLOWED_IP="${server_tun_host}/32" \
+		-e ALLOWED_IP="${allowed_ips}" \
 		-e HEADER_PROTECTION_KEY="${AMNEZIA_HEADER_KEY}" \
 		-e MTU="${MTU}" \
 		-e OUTPUT_FILE="${output_file}" \
@@ -421,6 +484,30 @@ render_client_uapi() {
 		-v "$(dirname "${input_file}"):/case:ro" \
 		"${WGO_IMAGE}" render-uapi \
 			-input "/case/$(basename "${input_file}")" >"${output_file}"
+	printf '\n' >>"${output_file}"
+}
+
+combine_client_uapi() {
+	local first_file="$1"
+	local second_file="$2"
+	local output_file="$3"
+
+	awk '
+		FNR == 1 {
+			file_index++
+			in_peer = 0
+		}
+		file_index == 1 && NF > 0 {
+			print
+			next
+		}
+		/^public_key=/ {
+			in_peer = 1
+		}
+		file_index > 1 && in_peer && NF > 0 {
+			print
+		}
+	' "${first_file}" "${second_file}" >"${output_file}"
 	printf '\n' >>"${output_file}"
 }
 
@@ -581,7 +668,7 @@ run_case() {
 	fi
 
 	key_file="${case_dir}/profile.${format}"
-	make_server_guest_input "${server_cont}" "${protocol}" "${format}" "${server_outer_ip}:${SERVER_PORT}" "${client_private_b64}" "${client_public_b64}" "${server_public_b64}" "${client_tun_ip}" "${server_tun_host}" "${server_guest_file}"
+	make_server_guest_input "${server_cont}" "${protocol}" "${format}" "${server_outer_ip}:${SERVER_PORT}" "${client_private_b64}" "${client_public_b64}" "${server_public_b64}" "${client_tun_ip}" "${server_tun_host}/32" "${server_guest_file}"
 	start_selfhost_http "${server_cont}" "${server_guest_file}" "${case_name}-server-ok"
 	wait_for_cmd "${client_cont}" "curl -fsS http://amnesia-server:${SELFHOST_HTTP_PORT}/health"
 	if [ "${format}" = "vpn" ]; then
@@ -688,6 +775,161 @@ run_gateway_case() {
 	log "${case_name} negotiated import case passed"
 }
 
+run_complex_case() {
+	local case_name="awg-complex"
+	local case_dir="${TMP_DIR}/${case_name}"
+	local network="${RUN_ID}-${case_name}-net"
+	local s1_cont="${RUN_ID}-${case_name}-s1"
+	local s2_cont="${RUN_ID}-${case_name}-s2"
+	local a_cont="${RUN_ID}-${case_name}-a"
+	local b_cont="${RUN_ID}-${case_name}-b"
+	local c_cont="${RUN_ID}-${case_name}-c"
+	local s1_tun_ip="10.151.0.1/32"
+	local a_tun_ip="10.151.0.2/32"
+	local c_s1_tun_ip="10.151.0.3/32"
+	local s2_tun_ip="10.152.0.1/32"
+	local b_tun_ip="10.152.0.2/32"
+	local c_s2_tun_ip="10.152.0.3/32"
+	local s1_tun_host="${s1_tun_ip%/*}"
+	local a_tun_host="${a_tun_ip%/*}"
+	local c_s1_tun_host="${c_s1_tun_ip%/*}"
+	local s2_tun_host="${s2_tun_ip%/*}"
+	local b_tun_host="${b_tun_ip%/*}"
+	local c_s2_tun_host="${c_s2_tun_ip%/*}"
+	local s1_outer_ip s2_outer_ip a_outer_ip b_outer_ip c_outer_ip
+	local s1_private_b64 s1_public_b64 s2_private_b64 s2_public_b64
+	local a_private_b64 a_public_b64 b_private_b64 b_public_b64 c_private_b64 c_public_b64
+	local s1_private_hex s2_private_hex a_public_hex b_public_hex c_public_hex
+
+	log "starting ${case_name} multi-controller routing case"
+	mkdir -p "${case_dir}"
+	run docker network create "${network}"
+	remember_network "${network}"
+
+	run docker run -d --name "${s1_cont}" --hostname "${case_name}-s1" --network "${network}" --network-alias amnesia-s1 --privileged "${SELFHOST_IMAGE}" wg0
+	remember_container "${s1_cont}"
+	run docker run -d --name "${s2_cont}" --hostname "${case_name}-s2" --network "${network}" --network-alias amnesia-s2 --privileged "${SELFHOST_IMAGE}" wg0
+	remember_container "${s2_cont}"
+
+	run docker run -d \
+		--name "${a_cont}" \
+		--hostname "${case_name}-a" \
+		--network "${network}" \
+		--network-alias client-a \
+		--privileged \
+		"${WGO_IMAGE}" \
+		-iface wg0 \
+		-tun-local "${a_tun_ip}" \
+		-peer-route "${c_s1_tun_host}/32" \
+		-listen-port "${CLIENT_PORT}" \
+		-mtu "${MTU}" \
+		-log-level debug
+	remember_container "${a_cont}"
+	run docker run -d \
+		--name "${b_cont}" \
+		--hostname "${case_name}-b" \
+		--network "${network}" \
+		--network-alias client-b \
+		--privileged \
+		"${WGO_IMAGE}" \
+		-iface wg0 \
+		-tun-local "${b_tun_ip}" \
+		-peer-route "${c_s2_tun_host}/32" \
+		-listen-port "${CLIENT_PORT}" \
+		-mtu "${MTU}" \
+		-log-level debug
+	remember_container "${b_cont}"
+	run docker run -d \
+		--name "${c_cont}" \
+		--hostname "${case_name}-c" \
+		--network "${network}" \
+		--network-alias client-c \
+		--privileged \
+		"${WGO_IMAGE}" \
+		-iface wg0 \
+		-tun-local "${c_s1_tun_ip}" \
+		-peer-route "${a_tun_host}/32" \
+		-listen-port "${CLIENT_PORT}" \
+		-mtu "${MTU}" \
+		-log-level debug
+	remember_container "${c_cont}"
+
+	wait_for_cmd "${s1_cont}" "test -S /var/run/amneziawg/wg0.sock"
+	wait_for_cmd "${s2_cont}" "test -S /var/run/amneziawg/wg0.sock"
+	wait_for_cmd "${a_cont}" "test -S /var/run/wireguard/wg0.sock"
+	wait_for_cmd "${b_cont}" "test -S /var/run/wireguard/wg0.sock"
+	wait_for_cmd "${c_cont}" "test -S /var/run/wireguard/wg0.sock"
+
+	s1_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${s1_cont}")"
+	s2_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${s2_cont}")"
+	a_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${a_cont}")"
+	b_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${b_cont}")"
+	c_outer_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${c_cont}")"
+
+	read -r s1_private_b64 s1_public_b64 <<<"$(new_key_pair "${s1_cont}")"
+	read -r s2_private_b64 s2_public_b64 <<<"$(new_key_pair "${s2_cont}")"
+	read -r a_private_b64 a_public_b64 <<<"$(new_key_pair "${s1_cont}")"
+	read -r b_private_b64 b_public_b64 <<<"$(new_key_pair "${s2_cont}")"
+	read -r c_private_b64 c_public_b64 <<<"$(new_key_pair "${s1_cont}")"
+	s1_private_hex="$(b64_to_hex "${s1_private_b64}")"
+	s2_private_hex="$(b64_to_hex "${s2_private_b64}")"
+	a_public_hex="$(b64_to_hex "${a_public_b64}")"
+	b_public_hex="$(b64_to_hex "${b_public_b64}")"
+	c_public_hex="$(b64_to_hex "${c_public_b64}")"
+
+	configure_userspace_interface "${s1_cont}" "${s1_tun_ip}" "${a_tun_host}"
+	docker_shell "${s1_cont}" "ip route replace ${c_s1_tun_host}/32 dev wg0; echo 1 >/proc/sys/net/ipv4/ip_forward"
+	configure_server_two_peers "${s1_cont}" "${case_dir}/s1-uapi.log" "${s1_private_hex}" "${a_public_hex}" "${a_outer_ip}" "${a_tun_host}" "${c_public_hex}" "${c_outer_ip}" "${c_s1_tun_host}"
+
+	configure_userspace_interface "${s2_cont}" "${s2_tun_ip}" "${b_tun_host}"
+	docker_shell "${s2_cont}" "ip route replace ${c_s2_tun_host}/32 dev wg0; echo 1 >/proc/sys/net/ipv4/ip_forward"
+	configure_server_two_peers "${s2_cont}" "${case_dir}/s2-uapi.log" "${s2_private_hex}" "${b_public_hex}" "${b_outer_ip}" "${b_tun_host}" "${c_public_hex}" "${c_outer_ip}" "${c_s2_tun_host}"
+
+	docker_shell "${c_cont}" "ip addr replace ${c_s1_tun_ip} dev wg0; ip addr add ${c_s2_tun_ip} dev wg0; ip route replace ${a_tun_host}/32 dev wg0 src ${c_s1_tun_host}; ip route replace ${b_tun_host}/32 dev wg0 src ${c_s2_tun_host}"
+
+	make_server_guest_input "${s1_cont}" awg vpn "${s1_outer_ip}:${SERVER_PORT}" "${a_private_b64}" "${a_public_b64}" "${s1_public_b64}" "${a_tun_ip}" "${s1_tun_host}/32, ${c_s1_tun_host}/32" /tmp/a-s1.vpn
+	make_server_guest_input "${s2_cont}" awg vpn "${s2_outer_ip}:${SERVER_PORT}" "${b_private_b64}" "${b_public_b64}" "${s2_public_b64}" "${b_tun_ip}" "${s2_tun_host}/32, ${c_s2_tun_host}/32" /tmp/b-s2.vpn
+	make_server_guest_input "${s1_cont}" awg vpn "${s1_outer_ip}:${SERVER_PORT}" "${c_private_b64}" "${c_public_b64}" "${s1_public_b64}" "${c_s1_tun_ip}" "${s1_tun_host}/32, ${a_tun_host}/32" /tmp/c-s1.vpn
+	make_server_guest_input "${s2_cont}" awg vpn "${s2_outer_ip}:${SERVER_PORT}" "${c_private_b64}" "${c_public_b64}" "${s2_public_b64}" "${c_s2_tun_ip}" "${s2_tun_host}/32, ${b_tun_host}/32" /tmp/c-s2.vpn
+	docker cp "${s1_cont}:/tmp/a-s1.vpn" "${case_dir}/a-s1.vpn"
+	docker cp "${s2_cont}:/tmp/b-s2.vpn" "${case_dir}/b-s2.vpn"
+	docker cp "${s1_cont}:/tmp/c-s1.vpn" "${case_dir}/c-s1.vpn"
+	docker cp "${s2_cont}:/tmp/c-s2.vpn" "${case_dir}/c-s2.vpn"
+
+	render_client_uapi "${case_dir}/a-s1.vpn" "${case_dir}/a.uapi"
+	render_client_uapi "${case_dir}/b-s2.vpn" "${case_dir}/b.uapi"
+	render_client_uapi "${case_dir}/c-s1.vpn" "${case_dir}/c-s1.uapi"
+	render_client_uapi "${case_dir}/c-s2.vpn" "${case_dir}/c-s2.uapi"
+	combine_client_uapi "${case_dir}/c-s1.uapi" "${case_dir}/c-s2.uapi" "${case_dir}/c-both.uapi"
+
+	uapi_set_file "${a_cont}" "${case_dir}/a.uapi" "${case_dir}/a-uapi.log"
+	uapi_set_file "${b_cont}" "${case_dir}/b.uapi" "${case_dir}/b-uapi.log"
+	start_probe_http "${a_cont}" "${CLIENT_HTTP_PORT}" "${case_name}-a-ok"
+	start_probe_http "${b_cont}" "${CLIENT_HTTP_PORT}" "${case_name}-b-ok"
+	wait_for_cmd "${a_cont}" "curl -fsS http://127.0.0.1:${CLIENT_HTTP_PORT}/health"
+	wait_for_cmd "${b_cont}" "curl -fsS http://127.0.0.1:${CLIENT_HTTP_PORT}/health"
+
+	uapi_set_file "${c_cont}" "${case_dir}/c-s1.uapi" "${case_dir}/c-uapi.log"
+	expect_ping_success "${c_cont}" "${a_tun_host}"
+	expect_http_text "${c_cont}" "http://${a_tun_host}:${CLIENT_HTTP_PORT}/" "${case_name}-a-ok"
+	expect_ping_failure "${c_cont}" "${b_tun_host}"
+	expect_http_unreachable "${c_cont}" "http://${b_tun_host}:${CLIENT_HTTP_PORT}/"
+
+	uapi_set_file "${c_cont}" "${case_dir}/c-s2.uapi" "${case_dir}/c-uapi.log"
+	expect_ping_success "${c_cont}" "${b_tun_host}"
+	expect_http_text "${c_cont}" "http://${b_tun_host}:${CLIENT_HTTP_PORT}/" "${case_name}-b-ok"
+	expect_ping_failure "${c_cont}" "${a_tun_host}"
+	expect_http_unreachable "${c_cont}" "http://${a_tun_host}:${CLIENT_HTTP_PORT}/"
+
+	uapi_set_file "${c_cont}" "${case_dir}/c-both.uapi" "${case_dir}/c-uapi.log"
+	expect_ping_success "${c_cont}" "${a_tun_host}"
+	expect_ping_success "${c_cont}" "${b_tun_host}"
+	expect_http_text "${c_cont}" "http://${a_tun_host}:${CLIENT_HTTP_PORT}/" "${case_name}-a-ok"
+	expect_http_text "${c_cont}" "http://${b_tun_host}:${CLIENT_HTTP_PORT}/" "${case_name}-b-ok"
+
+	log "${case_name} multi-controller routing case passed"
+}
+
 main() {
 	require_cmd docker
 	require_cmd base64
@@ -704,6 +946,7 @@ main() {
 	run_case awg vpn 3
 	run_case awg conf 4
 	run_gateway_case
+	run_complex_case
 
 	log "amnesia self-hosted e2e suite passed"
 	log "artifacts: ${TMP_DIR}"

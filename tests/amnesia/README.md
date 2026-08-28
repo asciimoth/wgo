@@ -31,6 +31,12 @@ the `vpn://` guest URL over HTTP, and runs the real WireGuard or AmneziaWG data
 plane. The client fetches the `vpn://` URL with `curl`, imports it through
 `wgo/amnesia`, renders UAPI, and applies it to the running `wgo` node.
 
+The suite also has a multi-controller AmneziaWG topology with two self-host
+servers, S1 and S2. Client A imports only the S1 guest profile, client B imports
+only the S2 guest profile, and client C imports either profile alone or both
+profiles merged into one `wgo` device. S1 routes between A and C, while S2
+routes between B and C.
+
 The suite also starts a mock encrypted Amnezia gateway that returns an AWG
 profile pointing at the same real server. The client imports a service
 activation key through the negotiation API and applies the resulting UAPI to
@@ -43,6 +49,7 @@ The covered inputs are:
 - AmneziaWG guest `vpn://`;
 - AmneziaWG native `.conf`;
 - AmneziaWG service-key negotiation through a mock gateway.
+- AmneziaWG multi-controller routing through two self-host servers.
 
 ## Expected Behaviour
 
@@ -53,6 +60,10 @@ Each case must:
 - pass `curl` from the client to an HTTP endpoint on the server tunnel IP;
 - pass an HTTP client request from the server to an HTTP endpoint on the client
   tunnel IP.
+
+The multi-controller case must also let C ping and fetch HTTP from A when only
+the S1 profile is applied, from B when only the S2 profile is applied, and from
+both A and B when both S1 and S2 profiles are applied to the same `wgo` device.
 
 The suite writes logs, UAPI requests, and interface state under
 `.tmp/amnesia-e2e/<run-id>/`. Temporary containers, networks, and images are
