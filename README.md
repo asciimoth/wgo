@@ -7,6 +7,11 @@
 > with some modifications.
 > All credit goes to the original wireguard-go authors.
 
+> [!WARNING]
+> Code added in this fork on top of the original wireguard-go project has not
+> been reviewed by a third party yet.
+> The [Amnesia](./amnesia) client is currently experimental.
+
 ## Things done
 - replaced the built-in TUN and conn implementations with reusable [gonnect/tun](https://github.com/asciimoth/gonnect/tree/master/tun) and [batchudp](https://github.com/asciimoth/batchudp) libraries
 - support on-the-fly attach/detach/swap operations for `Bind` and `Tun` instances
