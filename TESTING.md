@@ -8,6 +8,8 @@ This repository has multiple test layers:
 - A Linux Amnezia import suite that parses self-hosted WireGuard/AmneziaWG
   `vpn://` and `.conf` guest inputs with `wgo/amnesia`, configures a `wgo`
   client, and verifies tunnel access to an upstream `amneziawg-go` server
+- An opt-in Amnezia live service E2E command that contacts a real gateway with
+  private local credentials
 - A Linux performance suite that benchmarks this library, upstream `wireguard-go`, upstream `amneziawg-go`, and kernel-space WireGuard with `iperf3`
 
 ## Standard Checks
@@ -177,6 +179,48 @@ container fetches that URL with `curl`. The imported profile is applied to
 client to an HTTP endpoint on the server through the VPN tunnel, and an HTTP
 client request from the server to an endpoint on the client through the same
 tunnel.
+
+## Amnezia Live Service E2E
+
+Run the real-service Amnezia E2E command with:
+
+```bash
+just test-amnesia-live
+```
+
+This command is separate from `go test`, `just test-total`, and `just check`.
+It uses private local fixtures under `amnesia/testdata/private` by default,
+performs a non-interactive service-key negotiation against a real gateway, and
+checks that the returned profile is complete enough to configure a tunnel. It
+then builds a userspace `VTun`, applies the received profile to
+`device.Device`, starts WireGuard/AmneziaWG, compares the visible public IP from
+external services outside the tunnel and through `VTun.Dial`, prints GeoIP
+location fields when a service returns them, resolves and pings `example.com`,
+and sends HTTP requests to `http://example.com/` through `VTun.Dial`.
+
+The command prints colored terminal output: grey for minor traces, normal text
+for regular progress, cyan for important profile and public-IP highlights,
+green for success, and red for failure. It prints config loading, client setup,
+effective client metadata including `installation_uuid` and `cli_name`,
+activation-key display name and service selectors, each HTTP request and
+response status, interaction-required handling, pre-connect destinations and
+byte counts, VTun setup, visible public IP and GeoIP results, ping attempts,
+WGO device logs as grey minor traces, and a redacted profile summary. It must
+not print activation keys, request bodies, pre-connect payload bytes, CAPTCHA
+images, WireGuard private keys, native configs, or raw gateway configs.
+
+For live runs, a missing or empty `metadata.installation_uuid` is generated and
+saved back to `live_api.json` before the gateway request. An empty
+`metadata.os_version` uses a descriptive local default instead of only `linux`,
+for example the Linux distribution name plus `GOOS/GOARCH`.
+
+Use `-traffic-host`, `-traffic-http-url`, `-ip-check-urls`, `-ping-count`,
+`-http-count`, and `-traffic-timeout` to change traffic checks. Set
+`-ip-check-urls ""` to disable only the visible-IP check. Use `-skip-traffic`
+only when you need the earlier profile-only behavior.
+
+Fixture format and alternate command flags are documented in
+[amnesia/testdata/PRIVATE_TESTS.md](amnesia/testdata/PRIVATE_TESTS.md).
 
 ## Performance Suite
 

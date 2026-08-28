@@ -798,7 +798,8 @@ The hermetic suite provides:
 - race-detector coverage of concurrent-safe code paths.
 
 `testdata/private/activation_keys.txt` and `testdata/private/inputs/` add real
-parse fixtures. An explicitly enabled `testdata/private/live_api.json` plus a
-separate secret key file adds a live no-interrupt query. The entire
-`testdata/private` payload is gitignored, and missing files cause `t.Skip`
-rather than failure.
+parse fixtures. Missing parse fixture files cause `t.Skip` rather than failure.
+The live real-service query moved out of the package suite to
+`cmd/amnesia_live_e2e`; run it with `just test-amnesia-live` only when private
+credentials are available and a real gateway request is intended. The entire
+`testdata/private` payload is gitignored.

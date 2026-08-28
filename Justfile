@@ -27,6 +27,9 @@ test-obfuscation:
 test-amnesia-e2e:
 	sudo ./tests/amnesia/run.sh
 
+test-amnesia-live:
+	go run ./cmd/amnesia_live_e2e
+
 test-performance:
 	sudo ./tests/perf/run.sh
 
