@@ -20,8 +20,8 @@ The `amnesia` subpackage owns:
 1. bounded `vpn://` framing and input-format detection;
 2. API activation-key and self-hosted guest-profile validation;
 3. native WireGuard/AWG client-config parsing;
-4. caller-owned WireGuard public-key selection, with local X25519 key
-   generation as a fallback for service negotiation;
+4. caller-owned WireGuard public-key selection from an explicit option or an
+   attached `device.DeviceAPI`, with local X25519 key generation as a fallback;
 5. gateway request encryption and response decryption;
 6. direct-gateway and proxy failover;
 7. CAPTCHA negotiation state;
@@ -32,7 +32,8 @@ It does not own a default network path. `NewClient` requires a caller-supplied
 S3-compatible discovery, proxy health checks, and redirects performed by that
 client all remain on the caller-selected transport.
 
-It intentionally does not own:
+It can control a caller-attached `device.DeviceAPI`, but it never closes that
+implementation implicitly. It intentionally does not own:
 
 - a WireGuard/AWG tunnel implementation, which is provided by `wgo/device` in
   this repository;
@@ -67,8 +68,9 @@ returns locally without a network request or interaction.
 The caller drives every transition. There is no background negotiation and no
 goroutine waiting for user input. The same selected public key is kept across
 `AwaitingInput`, failed network attempts, and CAPTCHA retries. The preferred
-path takes the public key of an existing caller-owned WireGuard node. If none
-is supplied, the library generates and retains a fallback keypair.
+path takes an explicit public key or the public identity of the attached
+device API. If neither is available, the library generates and retains a
+fallback keypair.
 
 The official client follows the same pattern: it generates protocol data once,
 returns it with the CAPTCHA challenge, and supplies it again during the retry
@@ -216,14 +218,46 @@ The completed `Profile.Interface.PrivateKey` is empty; the caller configures
 its existing node with the matching private key. This ownership assertion is a
 caller responsibility.
 
-If `WireGuardPublicKey` is empty, `Start` / `StartKey` generate a fresh X25519
-private key using `crypto/ecdh`. WireGuard uses the same Curve25519 key
+If `WireGuardPublicKey` is empty, `Start` / `StartKey` first read the nonzero
+private-key identity from the currently attached `device.DeviceAPI`. Only the
+derived public key enters the negotiation. The private key remains in the
+implementation, and the completed profile has no private key.
+
+If neither source gives an identity, `Start` / `StartKey` generate a fresh
+X25519 private key using `crypto/ecdh`. WireGuard uses the same Curve25519 key
 representation. Both generated 32-byte values use standard padded Base64. The
 private value remains in the negotiation and is inserted into the returned
 profile in place of `$WIREGUARD_CLIENT_PRIVATE_KEY`.
 
 Starting a second fallback negotiation creates a second keypair. Resuming one
 negotiation never changes either a provided public key or a fallback keypair.
+
+### 4.1.1 Device attachment lifecycle
+
+`ClientOptions.Device` sets an optional initial `device.DeviceAPI`.
+`Client.AttachDevice` requires an empty or closed attachment.
+`Client.DetachDevice` clears and returns the current implementation.
+`Client.ReplaceDevice` changes the attachment atomically and returns the
+previous implementation. Detach and replace never close an implementation.
+Thus, the caller can detach and attach the exact same wrapper again, replace
+one middleware instance with another one around the same base device, or
+attach a new working implementation after the current one closes.
+
+Attachment changes and `Client.ApplyProfile` are synchronized. Replacement
+waits for a current application to finish, and each profile application uses
+only one implementation. The package-level `ApplyProfile` function provides
+the same conversion for any directly supplied `device.DeviceAPI`.
+
+Profile application uses `UpsertTrackedPeer`. A middleware owns the peer that
+it adds and must release it when the middleware closes, as required by the
+`device.DeviceAPI` contract. `DetachedDevice` provides this behavior through
+single wrappers and wrapper chains. Closing it does not close the wrapped
+implementation. Device-global configuration is not a tracked resource and
+remains on the underlying device.
+
+Each negotiation captures its selected identity during `Start` / `StartKey`.
+Later attachment changes do not alter that negotiation. A new negotiation sees
+the new attachment.
 
 ### 4.2 Plain API payload
 
@@ -241,7 +275,7 @@ The request target is `POST {gateway-base}/v1/config`. The JSON object contains:
 | `server_country_code` | negotiation options | when selecting a server country |
 | `service_type` | activation key | always |
 | `service_protocol` | activation key | always (`awg`) |
-| `public_key` | caller option, otherwise generated keypair | always |
+| `public_key` | caller option, attached device identity, or generated keypair | always |
 | `auth_data` | activation key | always, as a JSON object |
 | `is_connect_event` | options | only when true |
 | `captcha_id` | paused challenge | CAPTCHA retry only |
@@ -726,6 +760,9 @@ ambiguous, and `String` methods are deliberately redacted.
 | API | Use |
 |---|---|
 | `NewClient` | create a reusable client with a mandatory caller-owned HTTP transport |
+| `Client.Device` / `AttachDevice` | inspect or set an optional `device.DeviceAPI` attachment |
+| `Client.DetachDevice` / `ReplaceDevice` | change the attachment without closing either implementation |
+| `Client.ApplyProfile` / `ApplyProfile` | apply a profile with tracked peer ownership through a device API |
 | `ParseInput` / `ParseInputBytes` | offline detect and parse any supported input |
 | `ParseSelfHostedProfile` | parse a ready self-hosted WG/AWG guest key offline |
 | `ParseWireGuardConfig` | parse native single-peer WG/AWG contents offline |

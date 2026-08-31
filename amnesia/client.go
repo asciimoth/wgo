@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/asciimoth/wgo/device"
 )
 
 const defaultMaxResponseBytes int64 = 8 << 20
@@ -38,7 +40,10 @@ type ClientMetadata struct {
 // auth_data, WireGuard private keys, and any private deployment credentials are
 // secrets and must be injected at runtime rather than committed to source.
 type ClientOptions struct {
-	HTTPClient          *http.Client
+	HTTPClient *http.Client
+	// Device is an optional WireGuard control implementation. The client does
+	// not close it. It can be detached or replaced after construction.
+	Device              device.DeviceAPI
 	GatewayURL          string
 	GatewayPublicKeyPEM []byte
 	PrimaryS3URLs       []string
@@ -68,6 +73,9 @@ type Client struct {
 	randomMu         sync.Mutex
 	maxResponseBytes int64
 
+	deviceMu  sync.RWMutex
+	deviceAPI device.DeviceAPI
+
 	preferredMu    sync.RWMutex
 	preferredProxy string
 }
@@ -80,6 +88,11 @@ func NewClient(options ClientOptions) (*Client, error) {
 	}
 	if nilRoundTripper(options.HTTPClient.Transport) {
 		return nil, ErrHTTPTransportRequired
+	}
+	if nilDeviceAPI(options.Device) {
+		options.Device = nil
+	} else if err := validateDeviceAPI(options.Device); err != nil {
+		return nil, err
 	}
 	if transport, ok := options.HTTPClient.Transport.(*http.Transport); ok {
 		if defaultTransport, defaultOK := http.DefaultTransport.(*http.Transport); defaultOK && transport == defaultTransport {
@@ -152,6 +165,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		metadata:         metadata,
 		random:           options.Random,
 		maxResponseBytes: options.MaxResponseBytes,
+		deviceAPI:        options.Device,
 	}, nil
 }
 

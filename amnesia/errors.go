@@ -38,6 +38,12 @@ var (
 	// caller-owned public key cannot be rendered as a standalone configuration
 	// until the caller supplies the matching private key.
 	ErrWireGuardPrivateKeyRequired = errors.New("amnezia: WireGuard private key required")
+	// ErrDeviceRequired means an operation needs an attached device.DeviceAPI,
+	// or an attach/replace call received a nil implementation.
+	ErrDeviceRequired = errors.New("amnezia: device API required")
+	// ErrDeviceAlreadyAttached means AttachDevice was called while the client
+	// already had an open attached device API. Use ReplaceDevice for that case.
+	ErrDeviceAlreadyAttached = errors.New("amnezia: device API already attached")
 )
 
 // ErrorCode classifies gateway domain failures without exposing response or

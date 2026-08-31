@@ -175,6 +175,9 @@ func (device *Device) rebindPeerEndpointsForTransportLocked(id TransportID, st *
 }
 
 func (device *Device) AddTransport(id TransportID, cfg TransportConfig) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	if err := validateTransportConfig(device, id, cfg); err != nil {
 		return err
 	}
@@ -211,6 +214,9 @@ func (device *Device) AddTransport(id TransportID, cfg TransportConfig) error {
 }
 
 func (device *Device) ReplaceTransport(id TransportID, cfg TransportConfig) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	if id == DefaultTransportID {
 		if cfg.Bind == nil {
 			return device.DetachBind()
@@ -273,6 +279,9 @@ func (device *Device) ReplaceTransport(id TransportID, cfg TransportConfig) erro
 }
 
 func (device *Device) RemoveTransport(id TransportID) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	if id == DefaultTransportID {
 		return device.DetachBind()
 	}
@@ -295,6 +304,30 @@ func (device *Device) RemoveTransport(id TransportID) error {
 	device.net.Unlock()
 	st.stopping.Wait()
 	return err
+}
+
+// AddTrackedTransport calls AddTransport.
+//
+// Device owns every transport for its full lifetime. The tracked distinction
+// is useful to middleware with a shorter lifetime.
+func (device *Device) AddTrackedTransport(id TransportID, cfg TransportConfig) error {
+	return device.AddTransport(id, cfg)
+}
+
+// ReplaceTrackedTransport calls ReplaceTransport.
+//
+// Device owns every transport for its full lifetime. The tracked distinction
+// is useful to middleware with a shorter lifetime.
+func (device *Device) ReplaceTrackedTransport(id TransportID, cfg TransportConfig) error {
+	return device.ReplaceTransport(id, cfg)
+}
+
+// RemoveTrackedTransport calls RemoveTransport.
+//
+// Device owns every transport for its full lifetime. The tracked distinction
+// is useful to middleware with a shorter lifetime.
+func (device *Device) RemoveTrackedTransport(id TransportID) error {
+	return device.RemoveTransport(id)
 }
 
 func (device *Device) TransportInfo(id TransportID) (TransportInfo, bool) {

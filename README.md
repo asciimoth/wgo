@@ -18,6 +18,7 @@
 - added usage [examples](./examples)
 - added `Device` configuration methods matching UAPI get/set options
 - added multi-controller peer and transport APIs with a [guide](./docs/multi-controller-guide.md)
+- added the `device.DeviceAPI` interface and independently closable wrappers with tracked resource ownership
 - added leveled logging
 - implemented [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go)-compatible obfuscation, including typed AWG 3.1 configuration fields
     - added support for per-peer obfuscation options, migration notes, and receive-profile guidance in [ARCHITECTURE.md](./ARCHITECTURE.md#amneziawg-extension)

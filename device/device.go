@@ -444,6 +444,9 @@ func (device *Device) Down() error {
 }
 
 func (device *Device) IsUnderLoad() bool {
+	if device.isClosed() {
+		return false
+	}
 	if device.forceHandshakeCookies {
 		return true
 	}
@@ -460,6 +463,10 @@ func (device *Device) IsUnderLoad() bool {
 }
 
 func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
+
 	// lock required resources
 
 	device.staticIdentity.Lock()
@@ -1002,6 +1009,12 @@ func (device *Device) currentTUN() *tunState {
 // The new TUN becomes active before the old TUN is closed. This lets inbound
 // delivery retry against the new attachment if a write races the swap.
 func (device *Device) ReplaceTUN(tunDevice gtun.Tun) error {
+	if device.isClosed() {
+		if tunDevice != nil {
+			_ = tunDevice.Close()
+		}
+		return ErrDeviceClosed
+	}
 	tunState, err := newTunState(tunDevice)
 	if err != nil {
 		return err
@@ -1019,7 +1032,7 @@ func (device *Device) ReplaceTUN(tunDevice gtun.Tun) error {
 	if device.isClosed() {
 		device.state.Unlock()
 		_ = tunDevice.Close()
-		return fmt.Errorf("device is closed")
+		return ErrDeviceClosed
 	}
 
 	old := device.tun.device.Swap(tunState)
@@ -1034,6 +1047,12 @@ func (device *Device) ReplaceTUN(tunDevice gtun.Tun) error {
 
 // AttachTUN attaches a TUN to a device that is currently detached.
 func (device *Device) AttachTUN(tunDevice gtun.Tun) error {
+	if device.isClosed() {
+		if tunDevice != nil {
+			_ = tunDevice.Close()
+		}
+		return ErrDeviceClosed
+	}
 	tunState, err := newTunState(tunDevice)
 	if err != nil {
 		return err
@@ -1051,7 +1070,7 @@ func (device *Device) AttachTUN(tunDevice gtun.Tun) error {
 	if device.isClosed() {
 		device.state.Unlock()
 		_ = tunDevice.Close()
-		return fmt.Errorf("device is closed")
+		return ErrDeviceClosed
 	}
 	if device.currentTUN() != nil {
 		device.state.Unlock()
@@ -1073,7 +1092,7 @@ func (device *Device) DetachTUN() error {
 	device.state.Lock()
 	if device.isClosed() {
 		device.state.Unlock()
-		return fmt.Errorf("device is closed")
+		return ErrDeviceClosed
 	}
 	old := device.tun.device.Swap(nil)
 	if old == nil {
@@ -1088,9 +1107,36 @@ func (device *Device) DetachTUN() error {
 	return nil
 }
 
+// ReplaceTrackedTUN calls ReplaceTUN.
+//
+// Device owns its TUN for its full lifetime. The tracked distinction is useful
+// to middleware with a shorter lifetime.
+func (device *Device) ReplaceTrackedTUN(tunDevice gtun.Tun) error {
+	return device.ReplaceTUN(tunDevice)
+}
+
+// AttachTrackedTUN calls AttachTUN.
+//
+// Device owns its TUN for its full lifetime. The tracked distinction is useful
+// to middleware with a shorter lifetime.
+func (device *Device) AttachTrackedTUN(tunDevice gtun.Tun) error {
+	return device.AttachTUN(tunDevice)
+}
+
+// DetachTrackedTUN calls DetachTUN.
+//
+// Device owns its TUN for its full lifetime. The tracked distinction is useful
+// to middleware with a shorter lifetime.
+func (device *Device) DetachTrackedTUN() error {
+	return device.DetachTUN()
+}
+
 // ReplaceBind atomically swaps the active bind attachment.
 // If the device is up, active peer sessions are restarted around the transition.
 func (device *Device) ReplaceBind(bind conn.Bind) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	if bind == nil {
 		return device.DetachBind()
 	}
@@ -1101,7 +1147,7 @@ func (device *Device) ReplaceBind(bind conn.Bind) error {
 	device.state.Lock()
 	defer device.state.Unlock()
 	if device.isClosed() {
-		return fmt.Errorf("device is closed")
+		return ErrDeviceClosed
 	}
 
 	wasUp := device.isUp()
@@ -1131,6 +1177,9 @@ func (device *Device) ReplaceBind(bind conn.Bind) error {
 
 // AttachBind attaches a bind to a device that is currently detached.
 func (device *Device) AttachBind(bind conn.Bind) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	if bind == nil {
 		return fmt.Errorf("bind is nil")
 	}
@@ -1141,7 +1190,7 @@ func (device *Device) AttachBind(bind conn.Bind) error {
 	device.state.Lock()
 	defer device.state.Unlock()
 	if device.isClosed() {
-		return fmt.Errorf("device is closed")
+		return ErrDeviceClosed
 	}
 	if device.net.bind != nil {
 		return fmt.Errorf("device already has a bind attached")
@@ -1175,7 +1224,7 @@ func (device *Device) DetachBind() error {
 	device.state.Lock()
 	defer device.state.Unlock()
 	if device.isClosed() {
-		return fmt.Errorf("device is closed")
+		return ErrDeviceClosed
 	}
 
 	if device.isUp() {
@@ -1189,4 +1238,28 @@ func (device *Device) DetachBind() error {
 	device.net.Unlock()
 	device.log.Debugf("Bind detached")
 	return nil
+}
+
+// ReplaceTrackedBind calls ReplaceBind.
+//
+// Device owns its bind for its full lifetime. The tracked distinction is useful
+// to middleware with a shorter lifetime.
+func (device *Device) ReplaceTrackedBind(bind conn.Bind) error {
+	return device.ReplaceBind(bind)
+}
+
+// AttachTrackedBind calls AttachBind.
+//
+// Device owns its bind for its full lifetime. The tracked distinction is useful
+// to middleware with a shorter lifetime.
+func (device *Device) AttachTrackedBind(bind conn.Bind) error {
+	return device.AttachBind(bind)
+}
+
+// DetachTrackedBind calls DetachBind.
+//
+// Device owns its bind for its full lifetime. The tracked distinction is useful
+// to middleware with a shorter lifetime.
+func (device *Device) DetachTrackedBind() error {
+	return device.DetachBind()
 }

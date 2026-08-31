@@ -111,12 +111,12 @@ func (device *Device) validatePeerSpec(spec PeerSpec) error {
 }
 
 func (device *Device) UpsertPeer(spec PeerSpec) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	spec = clonePeerSpec(spec)
 	if err := device.validatePeerSpec(spec); err != nil {
 		return err
-	}
-	if device.isClosed() {
-		return ErrDeviceClosed
 	}
 
 	device.ipcMutex.Lock()
@@ -261,6 +261,22 @@ func (device *Device) DeletePeer(publicKey NoisePublicKey) (bool, error) {
 	removePeerLocked(device, peer, publicKey)
 	device.storeAmneziaWGReceiveClassifierLocked()
 	return true, nil
+}
+
+// UpsertTrackedPeer calls UpsertPeer.
+//
+// Device owns all of its peers for its full lifetime. The tracked distinction
+// is useful to middleware with a shorter lifetime.
+func (device *Device) UpsertTrackedPeer(spec PeerSpec) error {
+	return device.UpsertPeer(spec)
+}
+
+// DeleteTrackedPeer calls DeletePeer.
+//
+// Device owns all of its peers for its full lifetime. The tracked distinction
+// is useful to middleware with a shorter lifetime.
+func (device *Device) DeleteTrackedPeer(publicKey NoisePublicKey) (bool, error) {
+	return device.DeletePeer(publicKey)
 }
 
 func (device *Device) PeerSpec(publicKey NoisePublicKey) (PeerSpec, bool) {

@@ -26,7 +26,7 @@ The live service E2E is an individual command, not a package test. It reads one
 real Amnezia service activation key, creates an `amnesia.Client`, performs a
 non-interactive `v1/config` gateway request, and verifies that the returned
 profile has the minimum fields needed to configure a tunnel. Then it builds a
-userspace `VTun`, applies the returned profile to `device.Device`, starts a
+userspace `VTun`, applies the returned profile to `device.DeviceAPI`, starts a
 real WireGuard/AmneziaWG tunnel, compares the visible public IP outside the
 tunnel and through the VTun dialer, resolves and pings `example.com`, and sends
 HTTP requests to `http://example.com/` through the VTun dialer.

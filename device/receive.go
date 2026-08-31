@@ -57,7 +57,7 @@ type ReceiveError struct {
 // SubscribeReceiveErrors registers cb for receive-loop errors and returns an
 // unsubscribe function. Callbacks are invoked asynchronously.
 func (device *Device) SubscribeReceiveErrors(cb func(ReceiveError)) func() {
-	if cb == nil {
+	if cb == nil || device.isClosed() {
 		return func() {}
 	}
 

@@ -6,8 +6,8 @@
 // Amnezia gateway API and expose CAPTCHA requests as resumable state-machine
 // steps; static inputs complete locally. Every supported path returns the same
 // backend-neutral Profile/config representation. The package does not start a
-// tunnel itself; callers can apply the returned Profile to wgo/device or to
-// another WireGuard backend that supports the returned Amnezia extensions.
+// tunnel itself. A Client can attach a device.DeviceAPI and apply profiles to
+// it, or callers can translate Profile for another WireGuard backend.
 //
 // NewClient requires a caller-supplied HTTP client with an explicit dedicated
 // transport. All gateway, proxy-health, and S3-compatible requests use it; the

@@ -17,14 +17,64 @@ A controller owns only its peers and, optionally, one or more named packet
 transports. It publishes complete desired `PeerSpec` values and removes those
 peers when they leave its control plane.
 
-No `Controller` interface is required by `wgo`:
+Controllers should accept `device.DeviceAPI` instead of the concrete
+`*device.Device` type:
 
 ```go
-go serviceA.Run(ctx, dev)
-go serviceB.Run(ctx, dev)
+func runController(ctx context.Context, dev device.DeviceAPI) error {
+	// Reconcile peers and transports through dev.
+	return nil
+}
 ```
 
-Both functions use the same thread-safe peer and transport APIs.
+The concrete `*device.Device` and `*device.DetachedDevice` types implement this
+interface. Both types provide the same thread-safe peer and transport APIs.
+
+## Give a controller an independent lifecycle
+
+Use `DetachDevice` when a controller needs to close its device handle but does
+not own the shared device:
+
+```go
+controllerDevice := device.DetachDevice(dev)
+go service.Run(ctx, controllerDevice)
+
+// This stops future calls through controllerDevice. It does not stop dev or
+// another detached wrapper around dev.
+controllerDevice.Close()
+```
+
+Each call to `DetachDevice` creates an independent wrapper. `Close` is safe to
+call more than once. A closed wrapper returns `device.ErrDeviceClosed` from
+configuration methods, as a closed concrete device does. Its `Up` and `Down`
+methods are no-ops. If the wrapped device closes first, the wrapper also closes
+and its `Wait` channel becomes ready.
+
+Detached wrappers can form a chain. Closing an outer wrapper does not close an
+inner wrapper or the concrete device. Closing an inner wrapper closes each
+outer wrapper because the outer wrappers observe its `Wait` channel.
+
+Use tracked methods for resources that must end with the controller:
+
+- `UpsertTrackedPeer` and `DeleteTrackedPeer` manage peer ownership;
+- `AddTrackedTransport`, `ReplaceTrackedTransport`, and
+  `RemoveTrackedTransport` manage named `batchudp.Bind` outputs;
+- tracked TUN and bind methods manage the corresponding attachment slot;
+- runtime-stat and receive-error subscriptions are always tracked.
+
+The concrete `Device` implements tracked methods as direct calls to the
+untracked methods. Middleware such as `DetachedDevice` records successful
+tracked changes. Its `Close` releases those resources before its `Wait` channel
+becomes ready. Tracked calls stay tracked through a middleware chain. Thus, an
+inner wrapper can release resources created through an outer wrapper before it
+propagates closure outward.
+
+Tracking identifies peers by public key, transports by ID, and attachments by
+their single slot. It is not access control. Do not assign the same key, ID, or
+slot to independent controllers. Use the matching tracked remove or detach
+method before another owner reuses a resource identity. The untracked methods
+do not change tracked ownership and are suitable for resources that must
+outlive the wrapper.
 
 ## One device means one local key
 
@@ -98,12 +148,12 @@ _ = network.Down() // the host still owns the gonnect network
 
 ## Publish a direct-UDP peer
 
-`UpsertPeer` replaces the complete desired state for one public key. It does
-not affect any other peer.
+`UpsertTrackedPeer` replaces the complete desired state for one public key. It
+does not affect any other peer, and a detached wrapper removes it on `Close`.
 
 ```go
-func applyDirectPeer(dev *device.Device, p controlPeer) error {
-	return dev.UpsertPeer(device.PeerSpec{
+func applyDirectPeer(dev device.DeviceAPI, p controlPeer) error {
+	return dev.UpsertTrackedPeer(device.PeerSpec{
 		PublicKey:       p.PublicKey,
 		PresharedKey:    p.PresharedKey,
 		ProtocolVersion: 1,
@@ -126,7 +176,7 @@ require active state.
 When the control plane removes the peer:
 
 ```go
-_, err := dev.DeletePeer(p.PublicKey)
+_, err := dev.DeleteTrackedPeer(p.PublicKey)
 ```
 
 Deletion removes both its desired configuration and any active session. It
@@ -141,14 +191,14 @@ the shared device.
 
 ```go
 type ServiceController struct {
-	dev   *device.Device
+	dev   device.DeviceAPI
 	peers map[device.NoisePublicKey]device.PeerSpec
 }
 
 func (c *ServiceController) ApplyUpdate(update ServiceUpdate) error {
 	for _, removedKey := range update.Removed {
 		delete(c.peers, removedKey)
-		if _, err := c.dev.DeletePeer(removedKey); err != nil {
+		if _, err := c.dev.DeleteTrackedPeer(removedKey); err != nil {
 			return err
 		}
 	}
@@ -156,7 +206,7 @@ func (c *ServiceController) ApplyUpdate(update ServiceUpdate) error {
 	for _, changed := range update.Changed {
 		spec := makePeerSpec(changed)
 		c.peers[spec.PublicKey] = spec
-		if err := c.dev.UpsertPeer(spec); err != nil {
+		if err := c.dev.UpsertTrackedPeer(spec); err != nil {
 			return err
 		}
 	}
@@ -166,8 +216,8 @@ func (c *ServiceController) ApplyUpdate(update ServiceUpdate) error {
 
 Calls from different controllers may run concurrently. Operations are
 linearized by `wgo`; the last operation to commit wins if two controllers
-accidentally use the same public key or exact prefix. Applications should still
-prevent those conflicts because no ownership or rollback history is retained.
+accidentally use the same public key or exact prefix. Resource tracking does not
+prevent those conflicts and does not retain rollback history.
 
 ## Register a controller-provided transport
 
@@ -179,10 +229,10 @@ packet-processing wrapper.
 const serviceBTLS device.TransportID = "service-b/tls"
 
 func attachServiceBTransport(
-	dev *device.Device,
+	dev device.DeviceAPI,
 	tlsBind batchudp.Bind,
 ) error {
-	return dev.AddTransport(serviceBTLS, device.TransportConfig{
+	return dev.AddTrackedTransport(serviceBTLS, device.TransportConfig{
 		Bind: tlsBind,
 		// A tunnel may ignore ListenPort and Fwmark. UDP binds use them.
 		ListenPort: 0,
@@ -194,8 +244,8 @@ func attachServiceBTransport(
 Peers select it by ID:
 
 ```go
-func applyServiceBPeer(dev *device.Device, p serviceBPeer) error {
-	return dev.UpsertPeer(device.PeerSpec{
+func applyServiceBPeer(dev device.DeviceAPI, p serviceBPeer) error {
+	return dev.UpsertTrackedPeer(device.PeerSpec{
 		PublicKey:       p.PublicKey,
 		PresharedKey:    p.PresharedKey,
 		ProtocolVersion: 1,
@@ -219,7 +269,7 @@ feeds the bind's received datagrams into the normal WireGuard receive path.
 Removing a transport does not silently delete its peers:
 
 ```go
-if err := dev.RemoveTransport(serviceBTLS); err != nil {
+if err := dev.RemoveTrackedTransport(serviceBTLS); err != nil {
 	return err
 }
 ```
@@ -228,10 +278,11 @@ Those peers remain configured but sends fail fast with
 `device.ErrTransportUnavailable`. They recover after the controller adds the
 same transport ID again or publishes specs selecting another transport.
 
-Use `ReplaceTransport` for transport recovery or a new tunnel implementation:
+Use `ReplaceTrackedTransport` for transport recovery or a new tunnel
+implementation:
 
 ```go
-err := dev.ReplaceTransport(serviceBTLS, device.TransportConfig{
+err := dev.ReplaceTrackedTransport(serviceBTLS, device.TransportConfig{
 	Bind: replacement,
 })
 ```
@@ -327,7 +378,7 @@ transport:
 nsNetwork := buildNamespaceBackedNetwork(...)
 nsUDP := batchudp.NewDefaultBind(nsNetwork)
 
-if err := dev.AddTransport("service-c/netns", device.TransportConfig{
+if err := dev.AddTrackedTransport("service-c/netns", device.TransportConfig{
 	Bind:       nsUDP,
 	ListenPort: 0,
 }); err != nil {
@@ -359,8 +410,8 @@ Recommended pattern:
 ```go
 const tailTransport device.TransportID = "example-tailnet/magicsock"
 
-func publishTailPeer(dev *device.Device, n Node) error {
-	return dev.UpsertPeer(device.PeerSpec{
+func publishTailPeer(dev device.DeviceAPI, n Node) error {
+	return dev.UpsertTrackedPeer(device.PeerSpec{
 		PublicKey:       n.NodeKey,
 		ProtocolVersion: 1,
 		Endpoint: &device.PeerEndpoint{
@@ -442,8 +493,8 @@ or changing the peer path is enough to recover.
 
 Third-party controller libraries should follow these rules:
 
-1. Accept an existing `*device.Device`; do not create or close it unless the
-   application explicitly delegates ownership.
+1. Accept a `device.DeviceAPI`. Do not close it unless the application gives
+   the controller ownership or passes a detached wrapper.
 2. Never change the shared private key.
 3. Never use whole-device peer replacement.
 4. Namespace transport IDs, for example `module-name/path-name`.

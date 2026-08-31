@@ -86,8 +86,10 @@ type NegotiationOptions struct {
 	// It must be a standard padded Base64 encoding of exactly 32 bytes. The
 	// matching private key is never requested or transmitted, and the caller is
 	// responsible for configuring the tunnel backend with it. If this field is
-	// empty, the library generates a new keypair as a fallback and returns the
-	// private key in the completed Profile.
+	// empty, the client first uses the nonzero private-key identity of its
+	// attached DeviceAPI. If no usable identity is attached, the library
+	// generates a new keypair and returns the private key in the completed
+	// Profile.
 	WireGuardPublicKey string
 	ExtraPayload       map[string]any
 }
@@ -152,6 +154,15 @@ func (c *Client) StartKey(key ActivationKey, options NegotiationOptions) (*Negot
 			return nil, &ProtocolError{Op: "validate negotiation options", Err: err}
 		}
 	} else {
+		attachedPublic, attached, err := c.attachedDevicePublicKey()
+		if err != nil {
+			return nil, fmt.Errorf("amnezia: read attached device identity: %w", err)
+		}
+		if attached {
+			public = attachedPublic
+		}
+	}
+	if public == "" {
 		if err := c.withRandom(func(reader io.Reader) error {
 			privateKey, err := ecdh.X25519().GenerateKey(reader)
 			if err != nil {

@@ -7,10 +7,11 @@ keys negotiate an AmneziaWG profile and pause cleanly for CAPTCHA input; static
 self-hosted and native inputs complete offline. Every path returns the same
 backend-neutral profile.
 
-The subpackage does **not** start a tunnel. In this repository, callers apply
-the returned `Profile` to `github.com/asciimoth/wgo/device`. The profile model
-also stays backend-neutral, so callers can translate it into another
-WireGuard implementation that supports the returned Amnezia extensions.
+The subpackage does **not** start a tunnel. Callers can attach any
+`device.DeviceAPI` implementation, including `device.DetachedDevice`, and
+apply a returned `Profile` through it. The profile model stays backend-neutral,
+so callers can also translate it into another WireGuard implementation that
+supports the returned Amnezia extensions.
 
 This is a compatibility subpackage and is not an official Amnezia VPN product.
 The bundled production defaults were verified against official
@@ -27,8 +28,9 @@ deployment.
   qCompress/Base64URL representation;
 - native WireGuard/AWG `.conf` parsing with a safe structured renderer that
   drops unrecognized and executable `wg-quick` directives;
-- caller-owned WireGuard public keys for existing nodes, with local keypair
-  generation only when no public key is supplied;
+- caller-owned WireGuard identities selected explicitly or from an attached
+  device API, with local keypair generation only when neither is available;
+- replaceable device API attachment with tracked peer cleanup for middleware;
 - RSA-PKCS#1 v1.5 + AES-256-CBC gateway envelope compatibility;
 - explicit `Next` / `Resume` state machine for CAPTCHA-capable UIs;
 - fail-closed non-interactive mode for daemons and IoT clients;
@@ -161,10 +163,11 @@ already knows that the input is an API service key.
 render it according to the UI platform; do not log it. Invalid or refreshed
 CAPTCHAs may produce another interaction step, so the loop is intentional.
 
-When `WireGuardPublicKey` was supplied, the result deliberately has an empty
-`Profile.Interface.PrivateKey`. Configure a structured backend with the
-existing private key directly. If a standalone configuration is required,
-the caller must first insert the matching private key:
+When `WireGuardPublicKey` was supplied, or when the identity came from an
+attached device API, the result deliberately has an empty
+`Profile.Interface.PrivateKey`. `Client.ApplyProfile` uses the matching key
+that is already in the attached implementation. If a standalone configuration
+is required, the caller must first insert the matching private key:
 
 ```go
 if profile.Interface.PrivateKey == "" {
@@ -187,10 +190,62 @@ Do not apply it blindly. For caller-owned negotiation identities, the library
 sends and validates only the public key; it is the caller's responsibility to
 use its matching private key. `ConfigText` and `RenderConfig` return
 `ErrWireGuardPrivateKeyRequired` while it is absent. If no public key was
-provided, negotiation falls back to generating a keypair and returns its
-private key in the profile. Static imports derive and validate the public key
-from the embedded private key, and self-hosted imports reject a private-key
-mismatch between structured and native representations.
+provided and no attached implementation has a nonzero identity, negotiation
+falls back to generating a keypair and returns its private key in the profile.
+Static imports derive and validate the public key from the embedded private
+key, and self-hosted imports reject a private-key mismatch between structured
+and native representations.
+
+## Device API attachment
+
+`ClientOptions.Device` can set the initial `device.DeviceAPI`. A client can
+also attach, detach, or replace the implementation while it is in use:
+
+```go
+base := device.NewDevice(/* ... */)
+node := device.DetachDevice(base)
+client, err := amnezia.NewClient(amnezia.ClientOptions{
+	HTTPClient: apiHTTPClient,
+	Device:     node,
+})
+if err != nil {
+	return err
+}
+
+if err := client.ApplyProfile(profile); err != nil {
+	return err
+}
+
+sameNode := client.DetachDevice() // Does not close node.
+if err := client.AttachDevice(sameNode); err != nil {
+	return err
+}
+
+replacement := device.DetachDevice(base)
+previous, err := client.ReplaceDevice(replacement)
+if err != nil {
+	return err
+}
+previous.Close() // Explicitly release resources tracked by previous.
+```
+
+`AttachDevice` also accepts a new implementation when the current attachment
+is closed. `DetachDevice` and `ReplaceDevice` never close an implementation.
+The exact same wrapper can be attached again if it was not closed. To start a
+new middleware lifetime around the same base device, close the old wrapper and
+create another `DetachedDevice`.
+
+Replacement waits for a current `Client.ApplyProfile` call to finish, so one
+profile application always uses one implementation. Profile application uses
+`UpsertTrackedPeer`. Closing a detached wrapper therefore removes the peer
+that it owns, including through chains of wrappers. Device-global settings,
+such as the private key and listen port, remain on the wrapped device.
+
+An explicit `NegotiationOptions.WireGuardPublicKey` has first priority. When it
+is empty, a new negotiation uses the nonzero identity of the implementation
+that is attached at that time. When neither exists, it generates a fallback
+keypair. A negotiation keeps its selected identity after it starts; replacing
+the attached implementation does not change an in-progress negotiation.
 
 ## No-interrupt / headless use
 
@@ -396,4 +451,3 @@ from a public key and provides obfuscation, not authenticity. Prefer a custom
 HTTPS gateway where possible, keep TLS verification enabled, and treat every
 decrypted response as untrusted input. See [ARCHITECTURE.md](ARCHITECTURE.md)
 for the complete threat-model notes.
-

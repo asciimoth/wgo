@@ -71,6 +71,9 @@ type RuntimeStatsCallback func(RuntimeStats)
 // SetRuntimeStatsThresholds updates traffic notification thresholds. Peer
 // lifecycle and handshake events still notify subscribers immediately.
 func (device *Device) SetRuntimeStatsThresholds(thresholds RuntimeStatsThresholds) {
+	if device.isClosed() {
+		return
+	}
 	if thresholds.ByteDelta == 0 {
 		thresholds.ByteDelta = DefaultRuntimeStatsByteDelta
 	}
@@ -85,7 +88,7 @@ func (device *Device) SetRuntimeStatsThresholds(thresholds RuntimeStatsThreshold
 // unsubscribe function. The subscriber receives an initial snapshot
 // asynchronously.
 func (device *Device) SubscribeRuntimeStats(cb RuntimeStatsCallback) func() {
-	if cb == nil {
+	if cb == nil || device.isClosed() {
 		return func() {}
 	}
 

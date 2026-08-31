@@ -359,6 +359,9 @@ func (device *Device) ListenPort() uint16 {
 }
 
 func (device *Device) SetListenPort(port uint16) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	return device.setListenPortLocked(port)
@@ -380,12 +383,18 @@ func (device *Device) AmneziaWGConfig() AmneziaWGConfig {
 }
 
 func (device *Device) SetAmneziaWGConfig(cfg AmneziaWGConfig) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	return device.setAmneziaWGConfigLocked(cfg)
 }
 
 func (device *Device) SetAmneziaWGConfigPatch(patch AmneziaWGConfigPatch) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	override, err := patch.toIPC()
@@ -399,6 +408,9 @@ func (device *Device) SetAmneziaWGConfigPatch(patch AmneziaWGConfigPatch) error 
 
 // ApplyConfig reconciles the device with cfg according to opts.
 func (device *Device) ApplyConfig(cfg DeviceConfig, opts ApplyConfigOptions) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	validationOpts := ValidationOptions{}
 	if opts.ApplyEndpoints {
 		device.net.RLock()
@@ -415,9 +427,6 @@ func (device *Device) ApplyConfig(cfg DeviceConfig, opts ApplyConfigOptions) err
 	}
 	if err := ValidateConfigWithOptions(cfg, validationOpts); err != nil {
 		return err
-	}
-	if device.isClosed() {
-		return fmt.Errorf("device is closed")
 	}
 	if err := device.validateApplyPeerCapacity(cfg, opts); err != nil {
 		return err
@@ -486,6 +495,9 @@ func (device *Device) validateApplyPeerCapacity(cfg DeviceConfig, opts ApplyConf
 }
 
 func (device *Device) SetFwmark(mark uint32) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	return device.setFwmarkLocked(mark)
@@ -532,18 +544,27 @@ func (device *Device) PeerConfig(publicKey NoisePublicKey) (PeerConfig, bool) {
 }
 
 func (device *Device) SetPeerPresharedKey(publicKey NoisePublicKey, presharedKey NoisePresharedKey) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	return device.setPeerPresharedKeyLocked(publicKey, presharedKey)
 }
 
 func (device *Device) SetPeerEndpoint(publicKey NoisePublicKey, endpoint string) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	return device.setPeerEndpointLocked(publicKey, endpoint)
 }
 
 func (device *Device) SetPeerPersistentKeepaliveInterval(publicKey NoisePublicKey, seconds uint16) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	_, err := device.setPeerPersistentKeepaliveIntervalLocked(publicKey, seconds, true)
@@ -551,6 +572,9 @@ func (device *Device) SetPeerPersistentKeepaliveInterval(publicKey NoisePublicKe
 }
 
 func (device *Device) SetPeerPersistentKeepaliveRange(publicKey NoisePublicKey, keepalive AmneziaWGRange) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	_, err := device.setPeerPersistentKeepaliveRangeLocked(publicKey, keepalive, true)
@@ -580,12 +604,18 @@ func (device *Device) SetPeerAmneziaWGVersion(publicKey NoisePublicKey, version 
 }
 
 func (device *Device) SetPeerProtocolVersion(publicKey NoisePublicKey, version int) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	return device.setPeerProtocolVersionLocked(publicKey, version)
 }
 
 func (device *Device) SetPeerAmneziaWGConfig(publicKey NoisePublicKey, cfg AmneziaWGConfig) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	return device.setPeerAmneziaWGConfigLocked(publicKey, &cfg)
@@ -603,6 +633,9 @@ func (device *Device) PeerAmneziaWGConfigOverride(publicKey NoisePublicKey) (Amn
 }
 
 func (device *Device) SetPeerAmneziaWGConfigPatch(publicKey NoisePublicKey, patch AmneziaWGConfigPatch) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	override, err := patch.toIPC()
@@ -622,24 +655,36 @@ func (device *Device) SetPeerAmneziaWGConfigPatch(publicKey NoisePublicKey, patc
 }
 
 func (device *Device) ClearPeerAmneziaWGConfig(publicKey NoisePublicKey) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	return device.setPeerAmneziaWGConfigLocked(publicKey, nil)
 }
 
 func (device *Device) ReplacePeerAllowedIPs(publicKey NoisePublicKey, allowedIPs []netip.Prefix) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	return device.replacePeerAllowedIPsLocked(publicKey, allowedIPs)
 }
 
 func (device *Device) AddPeerAllowedIP(publicKey NoisePublicKey, prefix netip.Prefix) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	return device.addPeerAllowedIPLocked(publicKey, prefix)
 }
 
 func (device *Device) RemovePeerAllowedIP(publicKey NoisePublicKey, prefix netip.Prefix) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 	return device.removePeerAllowedIPLocked(publicKey, prefix)
@@ -648,6 +693,9 @@ func (device *Device) RemovePeerAllowedIP(publicKey NoisePublicKey, prefix netip
 // ActivatePeer applies the same post-configuration activation used by UAPI.
 // If the device is up, it starts the peer and flushes any staged packets.
 func (device *Device) ActivatePeer(publicKey NoisePublicKey) error {
+	if device.isClosed() {
+		return ErrDeviceClosed
+	}
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
 
