@@ -3,10 +3,21 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 typos:
   typos
 
-check: tidy typos vet test-total
+check: tidy typos vet test-total fuzz
 
 test:
 	go test -race ./...
+
+# Do not run fuzzing in GitHub Actions.
+fuzz:
+	if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then \
+		echo "Skipping fuzzing in GitHub Actions"; \
+	else \
+		fuzz_time="${FUZZ_TIME:-1m}"; status=0; \
+		go test -race ./amnesia -run='^$' -fuzz='^FuzzAmnesiaUntrustedInput$' -fuzztime="$fuzz_time" & amnesia_pid=$!; \
+		go test -race ./device -run='^$' -fuzz='^FuzzDeviceUntrustedInput$' -fuzztime="$fuzz_time" & device_pid=$!; \
+		wait "$amnesia_pid" || status=$?; wait "$device_pid" || status=$?; exit "$status"; \
+	fi
 
 test-stress:
   go test ./... --race -count=20 -timeout=30m > test.log 2>&1
